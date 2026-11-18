@@ -78,6 +78,7 @@ from roastpilot_agent.models import (
     RoastDetail,
     RoastEventKind,
     RoastPhase,
+    RoastProfile,
     RoastTimeline,
     SseEventType,
 )
@@ -5636,6 +5637,115 @@ async def test_human_health_refuses_unverified_second_active_read(
     assert response.status_code == 503
     assert "active_run_id" not in response.json()
     await service.shutdown()
+
+
+async def test_human_start_storage_refusal_remains_unavailable_after_native_writer_settles(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    recording_number = service._recording_roast_num  # pyright: ignore[reportPrivateUsage]
+    flush_events = RoastRunner._flush_events  # pyright: ignore[reportPrivateUsage]
+    commit = store.connection.commit
+    entered, release = asyncio.Event(), asyncio.Event()
+    background: asyncio.Task[int] | None = None
+    held_tokens: list[int] = []
+    supervised, finish_supervision = asyncio.Event(), asyncio.Event()
+
+    async def supervise(runner: RoastRunner) -> None:
+        assert runner is service.runner
+        assert runner.controller_snapshot().phase is RoastPhase.FAULTED
+        supervised.set()
+        await finish_supervision.wait()
+
+    async def hold_background_commit() -> None:
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == "expire_bean_sourcing_drafts":
+            entered.set()
+            await release.wait()
+        await commit()
+
+    async def admit_writer_after_recording_lookup(profile: RoastProfile) -> int | None:
+        nonlocal background
+        result = await recording_number(profile)
+        background = asyncio.create_task(store.expire_bean_sourcing_drafts())
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not store.human_storage_quiescent
+        return result
+
+    async def settle_writer_before_flushing_fault(runner: RoastRunner) -> bool:
+        assert not store.human_storage_quiescent
+        assert runner.controller_snapshot().phase is RoastPhase.FAULTED
+        assert actuator.commands() == []
+        (pending,) = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind == "expire_bean_sourcing_drafts"
+        ]
+        assert pending.settlement is Settlement.UNRESOLVED and pending.writer_entered is True
+        held_tokens.append(pending.token)
+        assert background is not None
+        release.set()
+        await background
+        assert store.human_storage_quiescent
+        return await flush_events(runner)
+
+    monkeypatch.setattr(service, "_run_loop", True)
+    monkeypatch.setattr(RoastRunner, "run", supervise)
+    monkeypatch.setattr(store.connection, "commit", hold_background_commit)
+    monkeypatch.setattr(service, "_recording_roast_num", admit_writer_after_recording_lookup)
+    monkeypatch.setattr(RoastRunner, "_flush_events", settle_writer_before_flushing_fault)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app(service)), base_url="http://test"
+        ) as client:
+            start = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+            assert start.status_code == 503
+            assert start.json() == {"detail": "HUMAN history is temporarily unavailable"}
+            await asyncio.wait_for(supervised.wait(), 1)
+            active = await store.active_run()
+            assert active is not None and active.run_id == service.active_run_id
+            assert active.agent_phase is RoastPhase.FAULTED
+            detail = await client.get(f"/api/roasts/{active.run_id}")
+            assert detail.status_code == 200 and detail.json()["agent_phase"] == "faulted"
+            retry = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+            assert retry.status_code == 409
+        (token,) = held_tokens
+        (settled,) = [
+            r
+            for r in store.drain_human_storage_receipts()
+            if r.kind == "expire_bean_sourcing_drafts"
+        ]
+        assert settled.token == token and settled.writer_entered is True
+        assert settled.settlement is Settlement.OBSERVED_COMMITTED and settled.timely is True
+        assert actuator.commands() == []
+    finally:
+        release.set()
+        finish_supervision.set()
+        if background is not None:
+            await background
+        await service.shutdown()
+
+
+async def test_automatic_start_keeps_positive_dispatch_without_human_storage_proof(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, authority=ControlAuthority.AUTOMATIC)
+    quiescence = PropertyMock(return_value=False)
+    monkeypatch.setattr(RoastStore, "human_storage_quiescent", quiescence)
+    try:
+        async with AsyncClient(
+            transport=ASGITransport(app=create_app(service)), base_url="http://test"
+        ) as client:
+            start = await client.post("/api/roasts", json=PROFILE.model_dump(mode="json"))
+        assert start.status_code == 201 and start.json()["agent_phase"] == "preheating"
+        assert actuator.commands().count("start_session") == 1
+        quiescence.assert_not_called()
+    finally:
+        await service.shutdown()
 
 
 @pytest.mark.parametrize("write", ["create_run", "record_safety_evaluation", "record_event"])

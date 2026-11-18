@@ -6777,17 +6777,27 @@ class RoastService:
         controller's idle→preheating start runs before returning; the per-tick
         loop runs as a background task when ``run_loop`` is set (tests drive
         ``service.runner.tick_once()`` directly with ``run_loop=False``)."""
+        start_history_refused = False
+
+        def start_write_permitted() -> bool:
+            nonlocal start_history_refused
+            if (
+                self._fault_lease_cache.generation != lease_generation
+                or self._fault_lease_cache.status is not FaultLeaseStatus.CLOSED
+            ):
+                return False
+            if (
+                self._authority is ControlAuthority.HUMAN
+                and not self._store.human_storage_quiescent
+            ):
+                start_history_refused = True
+                return False
+            return True
+
         runner = await self._build_runner(
             run_id,
             profile,
-            start_write_permitted=lambda: (
-                self._fault_lease_cache.generation == lease_generation
-                and self._fault_lease_cache.status is FaultLeaseStatus.CLOSED
-                and (
-                    self._authority is ControlAuthority.AUTOMATIC
-                    or self._store.human_storage_quiescent
-                )
-            ),
+            start_write_permitted=start_write_permitted,
         )
         if runner is None:  # pragma: no cover — guarded by the caller
             return
@@ -6795,6 +6805,10 @@ class RoastService:
         await runner.start(profile, recording_roast_num=recording_roast_num)
         if self._run_loop:
             self._loop_task = asyncio.create_task(runner.run())
+        # A later successful flush records the fault. It cannot confirm a
+        # Start withheld at the controller's dispatch boundary.
+        if start_history_refused:
+            raise HistoryUnavailable("HUMAN Start was withheld while storage was unresolved")
 
     async def _recording_roast_num(self, profile: RoastProfile) -> int | None:
         """The store-derived per-origin recording roast number (#385).
