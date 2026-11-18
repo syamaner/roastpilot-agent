@@ -8213,15 +8213,25 @@ async def test_human_runner_recovered_history_lock_cannot_restart_turn_budget(
         runner._recovered_history_mutation_lock = lock  # pyright: ignore[reportPrivateUsage]
         store.drain_human_storage_receipts()
         original_read = actuator.read_human_evidence
+        turn_budget = ControllerConfig().tick_interval_seconds
+        rejected_acquire = AsyncMock(
+            side_effect=AssertionError("recovered history attempted lock acquisition after expiry")
+        )
 
         async def use_turn_budget() -> HumanReadEvidence:
             evidence = await original_read()
-            clock.advance(1)
+            clock.advance(turn_budget)
             return evidence
 
         monkeypatch.setattr(actuator, "read_human_evidence", use_turn_budget)
         async with lock:
-            assert not await asyncio.wait_for(runner.tick_once(), 2)
+            turn_deadline = clock() + turn_budget
+            turn = runner.current_tick + 1
+            with monkeypatch.context() as injected:
+                injected.setattr(lock, "acquire", rejected_acquire)
+                assert not await asyncio.wait_for(runner.tick_once(), 2)
+            assert clock() == turn_deadline
+            rejected_acquire.assert_not_called()
             assert lock.locked()
         (gap,) = [
             receipt
@@ -8229,6 +8239,8 @@ async def test_human_runner_recovered_history_lock_cannot_restart_turn_budget(
             if receipt.kind == "recovered_history_lock"
         ]
         assert gap.run_id == run.id
+        assert gap.turn == turn
+        assert gap.deadline == turn_deadline
         assert gap.settlement is Settlement.VERIFIED_NO_WRITE
         assert gap.writer_entered is False
     finally:
@@ -8249,7 +8261,7 @@ async def test_exact_fault_audit_cannot_borrow_automatic_runner_identity(store: 
         await service.shutdown()
 
 
-async def test_human_history_http_refusal_downgrades_known_durability(
+async def test_human_history_http_refusal_preserves_internal_durability(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     clock = FakeClock()
@@ -8595,6 +8607,7 @@ async def test_human_drop_refusal_does_not_publish_stale_endpoint_after_emergenc
         assert controller is not None
         emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
         prior_generation = controller.command_generation
+        assert not controller.has_pending_emergency_stop_work()
 
         async def supersede_during_evaluation(**_kwargs: object) -> int:
             controller.admit_emergency_stop()
@@ -8604,6 +8617,7 @@ async def test_human_drop_refusal_does_not_publish_stale_endpoint_after_emergenc
             injected.setattr(store, "record_safety_evaluation", supersede_during_evaluation)
             await controller.operator_drop_beans()
         assert controller.command_generation > prior_generation
+        assert controller.has_pending_emergency_stop_work()
         assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
         assert "drop_beans" not in actuator.commands()
         failed_commands = [

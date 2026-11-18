@@ -2539,8 +2539,12 @@ async def test_human_teardown_parks_for_watchdog_after_repeated_cancellation(
     entered = [asyncio.Event() for _ in range(3)]
     shutdown_steps: list[str] = []
     parking_futures: list[asyncio.Future[None]] = []
+    exit_signal = _ForcedProcessExit(1)
+    closing = False
 
     def park() -> asyncio.Future[None]:
+        if closing:
+            raise exit_signal
         future = asyncio.get_running_loop().create_future()
         entered[len(parking_futures)].set()
         parking_futures.append(future)
@@ -2588,7 +2592,14 @@ async def test_human_teardown_parks_for_watchdog_after_repeated_cancellation(
         assert all(future.cancelled() for future in parking_futures[:2])
         assert shutdown_steps == ["admission-closed", "unresolved-store", "watchdog-armed"]
     finally:
+        closing = True
         if not task.done():
-            parking_futures[-1].set_exception(_ForcedProcessExit(1))
-        with pytest.raises(_ForcedProcessExit):
-            await task
+            live_park = next(
+                (future for future in reversed(parking_futures) if not future.done()), None
+            )
+            if live_park is None:
+                task.cancel()
+            else:
+                live_park.set_exception(exit_signal)
+        (outcome,) = await asyncio.gather(task, return_exceptions=True)
+    assert outcome is exit_signal
