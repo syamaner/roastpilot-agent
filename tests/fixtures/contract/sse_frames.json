@@ -284,6 +284,7 @@
         "emergency_fallback_disclosure": null,
         "human_command_disposition": null,
         "human_endpoint": null,
+        "human_history_durability": null,
         "physical_intervention_required": null,
         "run_id": "contract-run"
       },

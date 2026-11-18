@@ -1694,11 +1694,22 @@ class HumanCommandProjection(Enum):
     UNKNOWN = "unknown"
 
 
+class HumanHistoryDurability(Enum):
+    """Trust and delivery status of the current HUMAN history."""
+
+    COMPLETE = "complete"
+    DELAYED = "delayed"
+    INCOMPLETE = "incomplete"
+    UNKNOWN = "unknown"
+    UNAVAILABLE = "unavailable"
+
+
 class HumanProtectionProjection(BaseModel):
     """Read-only HUMAN disclosure, with nulls when live ownership is absent."""
 
     human_endpoint: HumanEndpointProjection | None = None
     human_command_disposition: HumanCommandProjection | None = None
+    human_history_durability: HumanHistoryDurability | None = None
     physical_intervention_required: bool | None = None
     emergency_fallback_disclosure: str | None = None
 

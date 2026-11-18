@@ -6,12 +6,15 @@ import sys
 from collections.abc import Awaitable
 from importlib.metadata import version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Literal
 
 import pytest
 
+from roastpilot_agent import human_persistence
 from roastpilot_agent.api import RoastRunner, RoastService
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, AppConfig, ControllerConfig, MCPConfig
+from roastpilot_agent.human_persistence import Settlement
 from roastpilot_agent.human_protection import (
     ControlAuthority,
     CounterClass,
@@ -129,6 +132,11 @@ async def _exercise_route(
     producer_config: Path,
 ) -> None:
     clock = FakeClock()
+    # Drive deadline accounting from the case's explicit clock advances so
+    # host/stdio latency cannot choose which side of a barrier wins. Replace
+    # only the deadline module's clock reference; asyncio still bounds waits
+    # on the real event loop, including the held settlement wait in RS6.
+    monkeypatch.setattr(human_persistence, "time", SimpleNamespace(monotonic=clock))
     adapter = RoasterControlAdapter.from_process(child, clock=clock)
     client = adapter._client  # pyright: ignore[reportPrivateUsage]
     info = await client.get_server_info()
@@ -206,8 +214,16 @@ async def _exercise_route(
     evaluation_held, release_evaluation = asyncio.Event(), asyncio.Event()
     reserved, release_proof = asyncio.Event(), asyncio.Event()
     confirmed_before_release = False
+    exhaust_proof_history_budget = interval == "proof" and route == "global"
+    completion_left_before_release = False
+    live_acknowledgements: list[object] = []
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    original_emit = emitter.emit
     registered_evaluations = controller._human_drop_evaluation_tasks  # pyright: ignore[reportPrivateUsage]
     strict_results: list[FaultControlCommandResult] = []
+    acknowledgement_readbacks: list[FaultAcknowledgementState] = []
+    completion: asyncio.Task[bool] | None = None
+    emergency_dispatch_generations: list[int] = []
     unbound_errors: list[MCPToolError] = []
     unbound_attempts: list[str] = []
     strict_tools: list[str] = []
@@ -219,6 +235,11 @@ async def _exercise_route(
     original_settle = controller.settle_human_drop_evaluations
     original_strict = client._execute_fault_control  # pyright: ignore[reportPrivateUsage]
     original_emergency = client.emergency_stop
+
+    def record_live(kind: RoastEventKind, payload: object) -> None:
+        if kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED:
+            live_acknowledgements.append(payload)
+        original_emit(kind, payload)
 
     async def record(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
         if evaluation.rule == "human_recovery_drop":
@@ -256,7 +277,9 @@ async def _exercise_route(
         if interval == "proof" and not reserved.is_set():
             reserved.set()
             await release_proof.wait()
-        return await original_read_ack(session_id)
+        state = await original_read_ack(session_id)
+        acknowledgement_readbacks.append(state)
+        return state
 
     async def settle() -> bool:
         if interval == "barrier":
@@ -268,8 +291,14 @@ async def _exercise_route(
         arguments: dict[str, object],
     ) -> FaultControlCommandResult:
         strict_tools.append(name)
+        if name == "emergency_stop":
+            assert completion is not None and not completion.done(), (
+                "e-stop dispatch must precede completion"
+            )
+            emergency_dispatch_generations.append(controller.command_generation)
         result = await original_strict(name, arguments)
         if name == "emergency_stop":
+            assert any(not evaluation.done() for evaluation in registered_evaluations)
             assert arguments["expected_session_id"] == session
             strict_results.append(result)
         return result
@@ -278,6 +307,9 @@ async def _exercise_route(
         reason: str = "manual emergency stop", *, expected_session_id: str | None = None
     ) -> EventCommandResult:
         assert expected_session_id is None
+        assert completion is not None and not completion.done(), (
+            "e-stop dispatch must precede completion"
+        )
         unbound_attempts.append(reason)
         try:
             return await original_emergency(reason, expected_session_id=expected_session_id)
@@ -288,6 +320,7 @@ async def _exercise_route(
     async def forbid_completion(*_args: object, **_kwargs: object) -> None:
         completion_writes.append("completion")
 
+    monkeypatch.setattr(emitter, "emit", record_live)
     monkeypatch.setattr(store, "record_safety_evaluation", record)
     monkeypatch.setattr(store, "record_command", record_command)
     monkeypatch.setattr(adapter, "read_fault_acknowledgement_state", read_ack)
@@ -319,7 +352,6 @@ async def _exercise_route(
             run.id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
         )
     )
-    completion: asyncio.Task[bool] | None = None
     try:
         await asyncio.wait_for(evaluation_held.wait(), 4)
         if interval == "barrier":
@@ -341,8 +373,16 @@ async def _exercise_route(
         assert acknowledgement.result == "accepted" and acknowledgement.queued
         completion = asyncio.create_task(runner.tick_once())
         await asyncio.wait_for(reserved.wait(), 4)
-        ready = await client.get_roast_state(session)
-        assert ready.cooling_on is (interval == "proof")
+        if interval == "barrier":
+            # D212 already obtained exact-session safe-zero readback before
+            # reaching settlement. Do not spend the held wait on another RPC.
+            pre_stop = acknowledgement_readbacks[-1]
+            assert pre_stop.session_id == session and pre_stop.mcp_phase == "fault"
+            assert not pre_stop.active and not pre_stop.cooling_on
+        else:
+            ready = await client.get_roast_state(session)
+            assert ready.session_id == session and ready.phase == "fault"
+            assert not ready.active and ready.cooling_on
         if route == "global":
             stopped = await asyncio.wait_for(stop_global(), 4)
         else:
@@ -352,11 +392,18 @@ async def _exercise_route(
                 ),
                 4,
             )
-        confirmed_before_release = (
-            not drop.done()
-            and not completion.done()
-            and any(not evaluation.done() for evaluation in registered_evaluations)
+        if fail_audit:
+            # Let the bounded completion waiter expire while its precise
+            # evaluation owner remains held. The real e-stop has already run.
+            assert not await asyncio.wait_for(asyncio.shield(completion), 3)
+        completion_left_before_release = completion.done()
+        if completion_left_before_release:
+            assert completion.result() is False
+        confirmed_before_release = not drop.done() and any(
+            not evaluation.done() for evaluation in registered_evaluations
         )
+        if exhaust_proof_history_budget:
+            clock.advance(1.0)
     finally:
         release_evaluation.set()
         release_proof.set()
@@ -373,6 +420,15 @@ async def _exercise_route(
     dropped, completed = outcomes
     assert isinstance(dropped, OperatorActionResult) and dropped.result == "failed"
     assert completed is False and completion_writes == []
+    receipts = store.drain_human_storage_receipts()
+    if completion_left_before_release:
+        assert any(
+            r.kind == "terminal_evaluation_settlement"
+            and r.run_id == run.id
+            and r.turn == runner.current_tick
+            and r.settlement is Settlement.VERIFIED_NO_WRITE
+            for r in receipts
+        )
     assert "drop_beans" not in strict_tools
     after = await client.get_roast_state(session)
     before_fault_count = sum(event.kind == "fault" for event in before.events)
@@ -401,12 +457,38 @@ async def _exercise_route(
     if interval == "proof":
         assert "stop_cooling" not in strict_tools
         timeline = await store.read_timeline(run.id)
-        assert any(
+        assert {
+            "outcome": "failed",
+            "reason": "superseded_by_emergency_stop",
+        } in live_acknowledgements
+        durable_supersession = any(
             event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
             and event.payload is not None
             and event.payload.get("reason") == "superseded_by_emergency_stop"
             for event in timeline.events
         )
+        assert durable_supersession == (not exhaust_proof_history_budget)
+        if exhaust_proof_history_budget:
+            assert any(
+                r.kind == "record_event"
+                and r.detail == RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value
+                and r.run_id == run.id
+                and r.turn == runner.current_tick
+                and r.settlement is Settlement.VERIFIED_NO_WRITE
+                and r.writer_entered is False
+                for r in receipts
+            )
     if fail_audit:
         assert audit_failures == 1
         assert "could not persist fault-control command outcome" in caplog.messages
+        (missing,) = [
+            r
+            for r in receipts
+            if r.kind == "record_command" and r.detail == RoastCommand.EMERGENCY_STOP.value
+        ]
+        assert missing.run_id == run.id and missing.turn is None
+        assert missing.settlement is Settlement.UNRESOLVED and missing.writer_entered is None
+        assert missing.command is not None
+        assert missing.command.session_id == session
+        assert missing.command.child_generation == child.child_epoch
+        assert emergency_dispatch_generations == [missing.command.command_generation]

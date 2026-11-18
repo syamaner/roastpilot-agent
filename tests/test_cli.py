@@ -8,6 +8,7 @@ driven without binding a socket.
 import asyncio
 import os
 import signal
+import sqlite3
 import threading
 from collections.abc import Callable, Coroutine, Iterator
 from pathlib import Path
@@ -2261,3 +2262,344 @@ def test_replay_passes_saved_config_to_create_replay_app(
     assert captured[0].advisor.model_slug == "openai/gpt-4o-mini", (
         "replay service must use the saved-file config value, not the schema default"
     )
+
+
+@pytest.mark.asyncio
+async def test_human_teardown_dispatches_before_history_and_skips_clean_on_pending_owner() -> None:
+    """The independent controller e-stop and MCP shutdown precede store settlement."""
+    order: list[str] = []
+
+    class Service:
+        def close_human_call_admission(self, reason: AdmissionCloseReason) -> None:
+            assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+
+        async def safe_shutdown_heat_off(self) -> ShutdownHeatOffOutcome:
+            order.append("heat-off")
+            return ShutdownHeatOffOutcome.DISPATCHED
+
+        async def shutdown(self) -> None:
+            order.append("service-stop")
+
+        async def record_child_stop_unconfirmed(self, *, stop_unconfirmed: bool) -> None:
+            order.append(f"child-stop:{stop_unconfirmed}")
+
+        async def mark_process_epoch_clean_after_ordered_teardown(self) -> None:
+            pytest.fail("unresolved native owner cannot establish a clean epoch")
+
+    class MCP:
+        stop_unconfirmed = False
+
+        async def stop(self) -> None:
+            order.append("mcp-stop")
+
+    class Store:
+        human_storage_enabled = True
+
+        async def active_run(self) -> None:
+            pytest.fail("a confirmed heat-off must not await a history lookup")
+
+        async def settle_human_storage_for_teardown(self) -> bool:
+            order.append("settle-storage")
+            return False
+
+        async def close(self) -> None:
+            order.append("store-close-refused")
+            raise RuntimeError("SQLite owner still pending")
+
+    closed = await cli._teardown_live(  # pyright: ignore[reportPrivateUsage]
+        Service(),  # type: ignore[arg-type]
+        MCP(),  # type: ignore[arg-type]
+        Store(),  # type: ignore[arg-type]
+    )
+    assert not closed
+    assert order == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "child-stop:False",
+        "settle-storage",
+        "store-close-refused",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "commit_acknowledgement",
+        "verification_refused",
+        "worker_close",
+        "no_marker",
+        "shared_worker_close",
+    ],
+)
+async def test_human_live_teardown_records_exact_final_marker_settlement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
+) -> None:
+    """The final marker uses a new SQLite worker after the shared worker shuts down."""
+    import aiosqlite
+
+    from roastpilot_agent.api import RoastService
+    from roastpilot_agent.human_persistence import HistoryUnavailable, Settlement
+    from roastpilot_agent.human_protection import ControlAuthority
+    from roastpilot_agent.mcp_client import MCPServerProcess
+    from roastpilot_agent.models import RestartClearanceState
+    from roastpilot_agent.store import RoastStore
+    from tests.conftest import FakeMCPClient
+
+    store = RoastStore(tmp_path / "shutdown.sqlite3")
+    roaster = FakeMCPClient()
+    service = RoastService(
+        store, roaster=roaster, live_serve_mode=True, authority=ControlAuthority.HUMAN
+    )
+    await store.initialize()
+    await service._ensure_restart_epoch()  # pyright: ignore[reportPrivateUsage]
+    if failure != "no_marker":
+        assert await store.confirm_process_restart_clearance(service.instance_id)
+        service._restart_clearance_state = RestartClearanceState.CLEARED  # pyright: ignore[reportPrivateUsage]
+    assert await store.active_run() is None
+    assert store.human_storage_quiescent
+    shared = store.connection
+    order: list[str] = []
+    marker_workers: list[aiosqlite.Connection] = []
+    verify_workers: list[aiosqlite.Connection] = []
+    observed_rows: list[str] = []
+    automatic_markers: list[str] = []
+    real_mark = store.mark_process_epoch_clean
+    real_open = store._open_connection  # pyright: ignore[reportPrivateUsage]
+    real_commit = aiosqlite.Connection.commit
+    real_close = aiosqlite.Connection.close
+
+    class MCP(MCPServerProcess):
+        async def stop(self) -> None:
+            order.append("mcp-stop")
+
+    def refuse_marker_read(
+        action: int,
+        table: str | None,
+        _column: str | None,
+        _database: str | None,
+        _trigger: str | None,
+    ) -> int:
+        if action == sqlite3.SQLITE_READ and table == "process_epoch":
+            order.append("verification-refused")
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    async def opened(*, writer: bool = False) -> aiosqlite.Connection:
+        connection = await real_open(writer=writer)
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == "mark_process_epoch_clean":
+            shared_close = (
+                "shared-close-failed" if failure == "shared_worker_close" else "shared-closed"
+            )
+            assert order[:2] == ["mcp-stop", shared_close]
+            if writer:
+                marker_workers.append(connection)
+                order.append("marker-open")
+            else:
+                verify_workers.append(connection)
+                order.append("verification-open")
+
+                def remember_query(sql: str) -> None:
+                    if sql.startswith("SELECT status FROM process_epoch"):
+                        observed_rows.append(sql)
+
+                await connection.set_trace_callback(remember_query)  # pyright: ignore[reportUnknownMemberType]
+                if failure == "verification_refused":
+                    await connection.set_authorizer(refuse_marker_read)
+        return connection
+
+    async def commit(connection: aiosqlite.Connection) -> None:
+        await real_commit(connection)
+        if connection in marker_workers:
+            order.append("marker-committed")
+            if failure in {"commit_acknowledgement", "verification_refused"}:
+                raise aiosqlite.OperationalError("final marker COMMIT acknowledgement lost")
+
+    async def close(connection: aiosqlite.Connection) -> None:
+        if connection is shared and failure == "shared_worker_close":
+            order.append("shared-close-failed")
+            raise aiosqlite.OperationalError("shared SQLite close failed")
+        if connection in marker_workers and failure == "worker_close":
+            order.append("marker-close-unconfirmed")
+            raise aiosqlite.OperationalError("final marker worker close failed")
+        await real_close(connection)
+        if connection is shared:
+            order.append("shared-closed")
+        elif connection in marker_workers:
+            order.append("marker-closed")
+        elif connection in verify_workers:
+            order.append("verification-closed")
+
+    async def mark(process_id: str) -> bool:
+        automatic_markers.append(process_id)
+        return await real_mark(process_id)
+
+    monkeypatch.setattr(store, "mark_process_epoch_clean", mark)
+    monkeypatch.setattr(store, "_open_connection", opened)
+    monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
+    monkeypatch.setattr(aiosqlite.Connection, "close", close)
+    try:
+        closed = await cli._teardown_live(  # pyright: ignore[reportPrivateUsage]
+            service, MCP(), store
+        )
+        assert roaster.calls == []
+        explicitly_marked = False
+        if failure == "shared_worker_close":
+            assert automatic_markers == []
+            assert order == ["mcp-stop", "shared-close-failed"]
+            try:
+                explicitly_marked = await real_mark(service.instance_id)
+            except HistoryUnavailable:
+                explicitly_marked = False
+        async with (
+            aiosqlite.connect(store.db_path) as independent,
+            independent.execute(
+                "SELECT status FROM process_epoch WHERE process_id = ?", (service.instance_id,)
+            ) as cursor,
+        ):
+            durable = await cursor.fetchone()
+        assert durable is not None
+        if failure == "shared_worker_close":
+            assert (closed, explicitly_marked, durable[0]) == (False, False, "unclean")
+            assert order == ["mcp-stop", "shared-close-failed"]
+            assert not marker_workers and not verify_workers
+            return
+        if failure == "no_marker":
+            assert durable[0] == "unclean"
+            assert closed and store.human_storage_quiescent
+            assert not marker_workers and not verify_workers
+            assert order == ["mcp-stop", "shared-closed"]
+            assert not any(
+                r.kind == "mark_process_epoch_clean" for r in store.drain_human_storage_receipts()
+            )
+            return
+
+        assert durable[0] == "clean"
+        (receipt,) = [
+            r for r in store.drain_human_storage_receipts() if r.kind == "mark_process_epoch_clean"
+        ]
+        (writer,) = marker_workers
+        assert writer is not shared and receipt.writer_connection == id(writer)
+        assert receipt.writer_entered is True
+        if failure in {"commit_acknowledgement", "verification_refused"}:
+            (verification,) = verify_workers
+            assert verification is not writer and verification is not shared
+            expected = [
+                "mcp-stop",
+                "shared-closed",
+                "marker-open",
+                "marker-committed",
+                "marker-closed",
+                "verification-open",
+            ]
+            if failure == "commit_acknowledgement":
+                (selected,) = observed_rows
+                assert service.instance_id in selected
+                assert order == [*expected, "verification-closed"]
+                assert closed and store.human_storage_quiescent
+                assert (
+                    receipt.settlement is Settlement.OBSERVED_COMMITTED and receipt.timely is True
+                )
+            else:
+                assert not observed_rows
+                assert order == [*expected, "verification-refused", "verification-closed"]
+                assert not store.human_storage_quiescent
+                assert receipt.settlement is Settlement.UNRESOLVED
+                assert "could not verify clean process epoch shutdown" in caplog.text
+                assert not closed
+        else:
+            assert not verify_workers
+            assert order == [
+                "mcp-stop",
+                "shared-closed",
+                "marker-open",
+                "marker-committed",
+                "marker-close-unconfirmed",
+            ]
+            assert not closed and not store.human_storage_quiescent
+            assert receipt.settlement is Settlement.UNRESOLVED
+            assert "could not verify clean process epoch shutdown" in caplog.text
+            assert "HUMAN storage connection teardown is unverified" in caplog.text
+    finally:
+        if failure == "shared_worker_close":
+            await real_close(shared)
+        if failure == "worker_close":
+            for worker in marker_workers:
+                await real_close(worker)
+
+
+@pytest.mark.asyncio
+async def test_human_teardown_parks_for_watchdog_after_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    entered = [asyncio.Event() for _ in range(3)]
+    shutdown_steps: list[str] = []
+    parking_futures: list[asyncio.Future[None]] = []
+    exit_signal = _ForcedProcessExit(1)
+    closing = False
+
+    def park() -> asyncio.Future[None]:
+        if closing:
+            raise exit_signal
+        future = asyncio.get_running_loop().create_future()
+        entered[len(parking_futures)].set()
+        parking_futures.append(future)
+        return future
+
+    def close_admission(reason: AdmissionCloseReason) -> None:
+        assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        shutdown_steps.append("admission-closed")
+
+    async def teardown(*_args: object) -> bool:
+        shutdown_steps.append("unresolved-store")
+        return False
+
+    def arm(_labels: tuple[str, ...]) -> None:
+        shutdown_steps.append("watchdog-armed")
+
+    monkeypatch.setattr(cli, "_teardown_live", teardown)
+    monkeypatch.setattr(
+        cli,
+        "asyncio",
+        SimpleNamespace(
+            create_task=asyncio.create_task,
+            shield=asyncio.shield,
+            current_task=asyncio.current_task,
+            all_tasks=asyncio.all_tasks,
+            CancelledError=asyncio.CancelledError,
+            Future={None: park},
+        ),
+    )
+    task = asyncio.create_task(
+        cli._finish_live_teardown(  # pyright: ignore[reportPrivateUsage]
+            SimpleNamespace(close_human_call_admission=close_admission),  # type: ignore[arg-type]
+            SimpleNamespace(),  # type: ignore[arg-type]
+            SimpleNamespace(human_storage_enabled=True),  # type: ignore[arg-type]
+            SimpleNamespace(arm=arm),  # type: ignore[arg-type]
+        )
+    )
+    try:
+        for parked in entered[:2]:
+            await asyncio.wait_for(parked.wait(), 1)
+            assert not task.done()
+            task.cancel()
+        await asyncio.wait_for(entered[2].wait(), 1)
+        assert not task.done()
+        assert all(future.cancelled() for future in parking_futures[:2])
+        assert shutdown_steps == ["admission-closed", "unresolved-store", "watchdog-armed"]
+    finally:
+        closing = True
+        if not task.done():
+            live_park = next(
+                (future for future in reversed(parking_futures) if not future.done()), None
+            )
+            if live_park is None:
+                task.cancel()
+            else:
+                live_park.set_exception(exit_signal)
+        (outcome,) = await asyncio.gather(task, return_exceptions=True)
+    assert outcome is exit_signal

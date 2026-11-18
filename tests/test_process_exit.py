@@ -1186,3 +1186,109 @@ def test_phased_probe_rejects_late_completion_observation(harness: _ProofHarness
     with pytest.raises(pytest.fail.Exception, match="lifecycle did not exit within"):
         harness.run("ready-exit", import_budget_seconds=100.0, clock=clock)
     harness.assert_sleeper_killed()
+
+
+def test_human_exit_guard_bounds_unresolved_native_sqlite_work(tmp_path: Path) -> None:
+    """A real blocked SQLite worker cannot postpone the process exit bound."""
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import os
+        import sys
+        import threading
+        from pathlib import Path
+
+        from roastpilot_agent.api import ShutdownHeatOffOutcome
+        from roastpilot_agent.cli import _finish_live_teardown, _LiveExitGuard
+        from roastpilot_agent.store import RoastStore
+
+        class Service:
+            def close_human_call_admission(self, reason):
+                pass
+
+            async def safe_shutdown_heat_off(self):
+                print("heat-off", flush=True)
+                return ShutdownHeatOffOutcome.DISPATCHED
+
+            async def shutdown(self):
+                print("service-stop", flush=True)
+
+            async def record_child_stop_unconfirmed(self, *, stop_unconfirmed):
+                print("child-proof", flush=True)
+
+            async def mark_process_epoch_clean_after_ordered_teardown(self):
+                raise AssertionError("cannot mark clean over unresolved storage")
+
+        class MCP:
+            stop_unconfirmed = False
+            async def stop(self):
+                print("mcp-stop", flush=True)
+
+        async def main():
+            store = RoastStore(Path(sys.argv[1]))
+            await store.initialize()
+            store.enable_human_storage(asyncio.get_running_loop().time, 0.15)
+            connection = store.connection
+            real_commit = connection.commit
+            blocking = threading.Event()
+            entered = asyncio.Event()
+            loop = asyncio.get_running_loop()
+
+            def block():
+                loop.call_soon_threadsafe(entered.set)
+                blocking.wait()
+                return 1
+
+            await connection.create_function("block_native_writer", 0, block)
+
+            async def blocked_commit():
+                await connection.execute_fetchall("SELECT block_native_writer()")
+                await real_commit()
+
+            connection.commit = blocked_commit
+            pending = asyncio.create_task(store.begin_process_restart_clearance("pending-owner"))
+            await asyncio.wait_for(entered.wait(), 2)
+            armed = asyncio.Event()
+
+            class Guard(_LiveExitGuard):
+                def arm(self, task_names=()):
+                    super().arm(task_names)
+                    armed.set()
+
+            teardown = asyncio.create_task(
+                _finish_live_teardown(Service(), MCP(), store, Guard(grace_seconds=0.25))
+            )
+            await asyncio.wait_for(armed.wait(), 2)
+            for _ in range(2):
+                teardown.cancel()
+                await asyncio.sleep(0)
+                if teardown.done():
+                    print("cancellation escaped the armed unresolved-owner wait", flush=True)
+                    # Do not run the deliberately blocked native owner's Python
+                    # finalizers if the containment assertion fails.
+                    os._exit(1)
+                print("watchdog-wait-retained", flush=True)
+            await teardown
+            await pending
+
+        asyncio.run(main())
+        """
+    )
+    result = subprocess.run(  # noqa: S603 - test-only subprocess uses the bound interpreter
+        [sys.executable, "-c", script, str(tmp_path / "blocked-native.sqlite")],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 70, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "child-proof",
+        "watchdog-wait-retained",
+        "watchdog-wait-retained",
+    ]
+    assert "human-storage-begin_process_restart_clearance" in result.stderr
+    assert "store.close" in result.stderr

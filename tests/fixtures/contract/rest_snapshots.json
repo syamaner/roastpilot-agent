@@ -60,6 +60,7 @@
     "fault_reason": null,
     "human_command_disposition": null,
     "human_endpoint": null,
+    "human_history_durability": null,
     "id": "00000000000000000000000000000000",
     "instance_id": null,
     "mic_status": {

@@ -18,7 +18,8 @@ import logging
 import math
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
 from typing import Literal, Protocol, TypeVar, runtime_checkable
@@ -42,6 +43,16 @@ from roastpilot_agent.control_policy import (
     PostFcFanSignal,
     RoastControlPolicy,
     TrimSignal,
+)
+from roastpilot_agent.human_persistence import (
+    CommandAuditOwner,
+    CommandReference,
+    HistoryUnavailable,
+    StorageCaller,
+    StorageDeadline,
+    audit_command,
+    current_storage_caller,
+    storage_caller,
 )
 from roastpilot_agent.human_protection import (
     HUMAN_PROTECTION_BT_C,
@@ -67,6 +78,7 @@ from roastpilot_agent.human_run_ownership import (
     RefusedHumanCall,
 )
 from roastpilot_agent.models import (
+    ACTIVE_ROAST_PHASES,
     AdvisorTraceStatus,
     AppliedRoasterState,
     DropReason,
@@ -146,6 +158,7 @@ class CommandArbiter:
     def __init__(self) -> None:
         self._condition = asyncio.Condition()
         self._generation = 0
+        self._next_history_attempt = 0
         self._in_flight = False
         self._pending_emergency_stops = 0
         self._emergency_stop_in_flight = False
@@ -160,6 +173,20 @@ class CommandArbiter:
     def generation(self) -> int:
         """Return the current e-stop generation without awaiting."""
         return self._generation
+
+    def stamp_history_attempt(
+        self,
+        session_id: str,
+        child_generation: int,
+        command_generation: int,
+        *,
+        owner: CommandAuditOwner | None,
+    ) -> CommandReference:
+        """Name one actual command attempt across all users of the actuator."""
+        self._next_history_attempt += 1
+        return CommandReference(
+            session_id, child_generation, command_generation, self._next_history_attempt, owner
+        )
 
     def admit_emergency_stop(self) -> int:
         """Synchronously invalidate routine work and reserve e-stop priority."""
@@ -581,6 +608,13 @@ class FaultControlTraceSink(Protocol):
         ...
 
 
+@dataclass
+class _FaultAudit:
+    tasks: list[asyncio.Task[None]] = field(default_factory=list[asyncio.Task[None]])
+    command: CommandReference | None = None
+    deadline: StorageDeadline | None = None
+
+
 class FaultControlExecutor:
     """Controller-owned, single-writer executor for an OPEN terminal lease.
 
@@ -598,12 +632,22 @@ class FaultControlExecutor:
         arbiter: CommandArbiter | None = None,
         trace_sink: FaultControlTraceSink | None = None,
         human_drop_controller: "Callable[[str | None], RoastController | None] | None" = None,
+        history_deadline: Callable[[], StorageDeadline] | None = None,
+        audit_child_generation: Callable[[str | None, str], int | None] | None = None,
+        note_history_gap: Callable[[str, str, str], None] | None = None,
     ) -> None:
         self._safety = safety
         self._port = port
         self._arbiter = arbiter or CommandArbiter()
         self._trace_sink = trace_sink
         self._human_drop_controller = human_drop_controller
+        self._history_deadline = history_deadline
+        self._audit_child_generation = audit_child_generation
+        self._note_history_gap = note_history_gap
+        self._audit_scope: ContextVar[_FaultAudit | None] = ContextVar(
+            "fault_control_audit",
+            default=None,
+        )
         self._queue: asyncio.PriorityQueue[
             tuple[
                 int,
@@ -616,6 +660,7 @@ class FaultControlExecutor:
                 str | None,
                 RoastCommand | None,
                 int | None,
+                _FaultAudit | None,
                 asyncio.Future[FaultControlState | None],
             ]
         ] = asyncio.PriorityQueue()
@@ -681,6 +726,7 @@ class FaultControlExecutor:
         # An MCP call in flight cannot be interrupted, but the next dispatch
         # always takes an admitted e-stop before queued recovery controls.
         priority = 0 if action is OperatorAction.EMERGENCY_STOP else 1
+        audit = _FaultAudit() if self._history_deadline is not None else None
         self._queue.put_nowait(
             (
                 priority,
@@ -693,12 +739,17 @@ class FaultControlExecutor:
                 run_id,
                 command,
                 evaluation_id,
+                audit,
                 future,
             )
         )
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._drain())
-        return await future
+        try:
+            return await future
+        finally:
+            if action is not OperatorAction.EMERGENCY_STOP and not future.cancelled():
+                await self._settle_exact_audit(audit)
 
     async def _drain(self) -> None:
         """Drain fault actions in priority order until no admitted work remains."""
@@ -714,12 +765,14 @@ class FaultControlExecutor:
                 run_id,
                 command,
                 evaluation_id,
+                audit,
                 future,
             ) = await self._queue.get()
             if future.cancelled():
                 if action is OperatorAction.EMERGENCY_STOP:
                     await self._arbiter.cancel_emergency_stop_admission()
                 continue
+            token = self._audit_scope.set(audit)
             try:
                 result = await self._execute_one(
                     action,
@@ -737,6 +790,8 @@ class FaultControlExecutor:
             else:
                 if not future.done():
                     future.set_result(result)
+            finally:
+                self._audit_scope.reset(token)
 
     async def execute_priority_emergency_stop(
         self,
@@ -758,7 +813,46 @@ class FaultControlExecutor:
         Returns:
             Fresh exact-session readback when it confirms the stop, otherwise None.
         """
-        return await self._execute_exact_emergency_stop(session_id, is_current_generation, run_id)
+        audit = _FaultAudit() if self._history_deadline is not None else None
+        token = self._audit_scope.set(audit)
+        try:
+            return await self._execute_exact_emergency_stop(
+                session_id, is_current_generation, run_id
+            )
+        finally:
+            self._audit_scope.reset(token)
+
+    async def _settle_exact_audit(self, audit: _FaultAudit | None) -> None:
+        if audit is not None and audit.tasks and audit.deadline is not None:
+            # Only this command's caller waits, outside the driver queue.
+            # A runner never borrows time from the independently owned audit.
+            caller = current_storage_caller()
+            remaining = audit.deadline.remaining()
+            if caller is not None:
+                remaining = min(remaining, caller.deadline.remaining())
+            await asyncio.wait(audit.tasks, timeout=remaining)
+
+    def _bind_exact_audit_command(
+        self,
+        run_id: str | None,
+        session_id: str,
+        generation: int,
+        *,
+        owner: CommandAuditOwner | None,
+    ) -> None:
+        audit = self._audit_scope.get()
+        if audit is None or self._audit_child_generation is None:
+            return
+        child = self._audit_child_generation(run_id, session_id)
+        if child is not None:
+            audit.command = self._arbiter.stamp_history_attempt(
+                session_id, child, generation, owner=owner
+            )
+
+    def _bind_admitted_drop_audit(self, command: CommandReference | None) -> None:
+        audit = self._audit_scope.get()
+        if audit is not None:
+            audit.command = command
 
     async def _execute_exact_emergency_stop(
         self,
@@ -790,6 +884,11 @@ class FaultControlExecutor:
         async def dispatch_estop() -> None:
             """Mark entry to the adapter so admission failures are not called writes."""
             nonlocal write_started
+            # Audit attribution has no authority over an admitted stop.
+            with contextlib.suppress(Exception):
+                self._bind_exact_audit_command(
+                    run_id, session_id, self._arbiter.generation, owner=CommandAuditOwner.LEASE
+                )
             write_started = True
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
@@ -986,6 +1085,10 @@ class FaultControlExecutor:
             return None
 
         async def write() -> None:
+            if action is not OperatorAction.DROP_BEANS or self._human_drop_controller is None:
+                # A diagnostic lookup cannot revoke the arbiter's admission.
+                with contextlib.suppress(Exception):
+                    self._bind_exact_audit_command(run_id, session_id, generation, owner=None)
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         controller: RoastController | None = None
@@ -1001,6 +1104,7 @@ class FaultControlExecutor:
                             generation=generation,
                             lease_current=generation_current,
                             operation=write,
+                            bind_audit=self._bind_admitted_drop_audit,
                         )
                     )
                 else:
@@ -1143,7 +1247,9 @@ class FaultControlExecutor:
             return await self._trace_sink.record_fault_control_evaluation(
                 run_id=run_id, evaluation=evaluation
             )
-        except Exception:  # noqa: BLE001 - audit uncertainty cannot suppress an e-stop outcome
+        except Exception as exc:  # noqa: BLE001 - audit uncertainty cannot suppress an e-stop outcome
+            if self._note_history_gap is not None and not isinstance(exc, HistoryUnavailable):
+                self._note_history_gap("record_safety_evaluation", run_id, evaluation.rule)
             logging.getLogger(__name__).exception(
                 "could not persist fault-control safety admission"
             )
@@ -1170,7 +1276,9 @@ class FaultControlExecutor:
                 result=result,
                 safety_evaluation_id=evaluation_id,
             )
-        except Exception:  # noqa: BLE001 - audit uncertainty cannot rewrite actuator fact
+        except Exception as exc:  # noqa: BLE001 - audit uncertainty cannot rewrite actuator fact
+            if self._note_history_gap is not None and not isinstance(exc, HistoryUnavailable):
+                self._note_history_gap("record_command", run_id, tool.value)
             logging.getLogger(__name__).exception("could not persist fault-control command outcome")
 
     def _schedule_command_trace(
@@ -1184,10 +1292,9 @@ class FaultControlExecutor:
         """Settle a routine outcome after its arbiter worker has released MCP ownership."""
         if run_id is None or self._trace_sink is None:
             return
-        task = asyncio.create_task(
-            self._record_command(run_id, tool, status, evaluation_id, result)
+        self._start_exact_audit(
+            run_id, lambda: self._record_command(run_id, tool, status, evaluation_id, result)
         )
-        self._track_audit_task(task)
 
     def _schedule_estop_trace(
         self,
@@ -1206,7 +1313,32 @@ class FaultControlExecutor:
                 run_id, RoastCommand.EMERGENCY_STOP, status, evaluation_id, result
             )
 
-        task = asyncio.create_task(persist())
+        self._start_exact_audit(run_id, persist)
+
+    def _start_exact_audit(
+        self,
+        run_id: str,
+        persist: Callable[[], Awaitable[None]],
+    ) -> None:
+        audit = self._audit_scope.get()
+        deadline = self._history_deadline() if self._history_deadline is not None else None
+        caller = (
+            StorageCaller(deadline, run_id, command=None if audit is None else audit.command)
+            if deadline is not None
+            else None
+        )
+
+        async def owned() -> None:
+            if caller is None:
+                await persist()
+            else:
+                with storage_caller(caller):
+                    await persist()
+
+        task = asyncio.create_task(owned())
+        if audit is not None:
+            audit.tasks.append(task)
+            audit.deadline = deadline
         self._track_audit_task(task)
 
     def _track_audit_task(self, task: asyncio.Task[None]) -> None:
@@ -1691,6 +1823,8 @@ class RoastController:
         self._human_continuation: _HumanContinuation | None = None
         self._accepted_readings = AcceptedReadingTracker(clock, config.max_stale_telemetry_seconds)
         self._routine_inhibited = False
+        self._storage_failure_pending = False
+        self._human_confirmed_start_generation: int | None = None
         self._protection_check_pending = False
         self._config = config
         self._safety = safety
@@ -2694,6 +2828,13 @@ class RoastController:
         run = self._human_run
         return run is not None and run.run_id == run_id and self._human_ownership.is_current(run)
 
+    def human_command_child_generation(self, run_id: str, session_id: str) -> int | None:
+        """Return the exact current child for this run/session audit, if proven."""
+        identity = self._known_human_identity() if self.owns_human_run(run_id) else None
+        if identity is not None and identity[0] == session_id:
+            return identity[1]
+        return None
+
     def note_human_run_durably_closed(self) -> None:
         """Record durable local finalization without resolving unknown commands."""
         if self._human_run is not None:
@@ -2835,6 +2976,84 @@ class RoastController:
             ),
         )
         return dispatched
+
+    def inhibit_human_routine_for_storage_failure(self) -> None:
+        """Fence routine authority while leaving the next urgent check eligible."""
+        if self._human_run is not None:
+            self._routine_inhibited = True
+            self._storage_failure_pending = True
+
+    async def apply_human_storage_failure_after_urgent(self) -> None:
+        """Use existing HUMAN containment after urgent endpoint admission."""
+        run = self._human_run
+        turn = self._human_turn
+        if (
+            not self._storage_failure_pending
+            or run is None
+            or turn is None
+            or not self._generation_is_current(turn.generation)
+            or self._emergency_stop_transition_pending
+        ):
+            return
+        self._storage_failure_pending = False
+        evaluation = self._human_history_recovery_evaluation()
+        if run.endpoint is not EndpointDisposition.NONE or self._phase not in ACTIVE_ROAST_PHASES:
+            return
+        turn.evaluations.append(evaluation)
+        await self._act_on_safety(evaluation, generation=turn.generation)
+
+    @staticmethod
+    def _human_history_recovery_evaluation() -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="human_history_unavailable",
+            verdict=SafetyVerdict.RECOVERY,
+            reason="HUMAN history could not be verified within its storage budget",
+        )
+
+    def owns_confirmed_human_start(self) -> bool:
+        """Whether this controller still owns a positively dispatched Start."""
+        run = self._human_run
+        return (
+            run is not None
+            and self._human_confirmed_start_generation is not None
+            and self._human_ownership.is_current(run)
+        )
+
+    async def contain_unconfirmed_human_start_history(self) -> bool:
+        """Recover a confirmed Start whose history acknowledgement was unavailable."""
+        run = self._human_run
+        generation = self._human_confirmed_start_generation
+        if run is None or generation is None or not self.owns_confirmed_human_start():
+            return False
+        self._routine_inhibited = True
+        if (
+            self._generation_is_current(generation)
+            and not self._emergency_stop_transition_pending
+            and run.endpoint is EndpointDisposition.NONE
+            and self._phase in ACTIVE_ROAST_PHASES
+        ):
+            await self._act_on_safety(
+                self._human_history_recovery_evaluation(), generation=generation
+            )
+        return True
+
+    def _new_history_command(
+        self, generation: int, *, owner: CommandAuditOwner
+    ) -> CommandReference | None:
+        identity = self._known_human_identity()
+        if identity is None:
+            return None
+        session, child = identity
+        return self._arbiter.stamp_history_attempt(session, child, generation, owner=owner)
+
+    def _emit_history_command(
+        self,
+        event: RoastEventKind,
+        payload: dict[str, object],
+        command: CommandReference | None,
+    ) -> None:
+        with audit_command(command):
+            self._events.emit(event, payload)
 
     async def human_urgent_stage(self, *, emergency_won_batch: bool = False) -> None:
         """Read once and act on urgent HUMAN safety before any sink awaits."""
@@ -3010,9 +3229,15 @@ class RoastController:
         if self._phase in TERMINAL_LATCH_PHASES and self._generation_is_current(turn.generation):
             await self._retry_pending_fail_safe(generation=turn.generation)
         if turn.evidence is not None:
-            await self._snapshots.persist_snapshot(turn.evidence.telemetry)
+            try:
+                await self._snapshots.persist_snapshot(turn.evidence.telemetry)
+            except HistoryUnavailable:
+                self.inhibit_human_routine_for_storage_failure()
         for evaluation in turn.evaluations:
-            await self._snapshots.persist_evaluation(evaluation)
+            try:
+                await self._snapshots.persist_evaluation(evaluation)
+            except HistoryUnavailable:
+                self.inhibit_human_routine_for_storage_failure()
         if not self._generation_is_current(turn.generation):
             return
         self._check_operator_timeout()
@@ -4150,6 +4375,7 @@ class RoastController:
         generation: int,
         lease_current: Callable[[], bool],
         operation: Callable[[], Awaitable[None]],
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         """Guard one exact fault-session drop through the HUMAN endpoint latch."""
         if self.human_drop_closed():
@@ -4163,7 +4389,12 @@ class RoastController:
         task = asyncio.create_task(self._snapshots.persist_evaluation(evaluation))
         self._human_drop_evaluation_tasks.add(task)
         task.add_done_callback(self._consume_human_drop_evaluation)
-        await asyncio.shield(task)
+        try:
+            await asyncio.shield(task)
+        except HistoryUnavailable:
+            self._human_drop_evaluation_tasks.discard(task)
+            self.inhibit_human_routine_for_storage_failure()
+            return False
         self._human_drop_evaluation_tasks.discard(task)
         if (
             self.human_drop_closed()
@@ -4179,6 +4410,7 @@ class RoastController:
             generation=generation,
             fault_dispatch=operation,
             lease_current=lease_current,
+            bind_audit=bind_audit,
         )
 
     async def _execute_human_drop(
@@ -4189,6 +4421,7 @@ class RoastController:
         generation: int,
         fault_dispatch: Callable[[], Awaitable[None]] | None = None,
         lease_current: Callable[[], bool] | None = None,
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         run = self._human_run
         assert run is not None
@@ -4198,9 +4431,16 @@ class RoastController:
         run.endpoint_owner = owner
         start_utc: datetime | None = None
         started = 0.0
+        command: CommandReference | None = None
 
         async def dispatch() -> AppliedRoasterState | None:
-            nonlocal start_utc, started
+            nonlocal start_utc, started, command
+            # An admitted Drop can proceed with an unknown audit identity.
+            with contextlib.suppress(Exception):
+                reference = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
+                if bind_audit is not None:
+                    bind_audit(reference)
+                command = reference
             run.endpoint = EndpointDisposition.IN_FLIGHT
             start_utc = datetime.now(UTC)
             started = self._clock()
@@ -4235,21 +4475,22 @@ class RoastController:
                 admitted=admitted,
             )
         except asyncio.CancelledError:
-            self._human_drop_unknown(generation, interval())
+            self._human_drop_unknown(generation, interval(), command)
             raise
         except Exception:
-            self._human_drop_unknown(generation, interval())
+            self._human_drop_unknown(generation, interval(), command)
             return False
         known_applied = fault_dispatch is not None or isinstance(applied, AppliedRoasterState)
         if not self._generation_is_current(generation) or (
             lease_current is not None and not lease_current()
         ):
             if dispatched and not known_applied:
-                self._human_drop_unknown(generation, interval())
+                self._human_drop_unknown(generation, interval(), command)
             elif dispatched:
-                self._events.emit(
+                self._emit_history_command(
                     RoastEventKind.COMMAND_EXECUTED,
                     {"command": "drop_beans", "outcome": "superseded", **interval()},
+                    command,
                 )
             return False
         if not dispatched:
@@ -4258,7 +4499,7 @@ class RoastController:
             await self._contain_human_heat(generation=generation)
             return False
         if not known_applied:
-            self._human_drop_unknown(generation, interval())
+            self._human_drop_unknown(generation, interval(), command)
             return False
         run.endpoint = EndpointDisposition.ISSUED
         if (
@@ -4269,7 +4510,7 @@ class RoastController:
             assert run.session_id is not None
             self._fault_drop_readback = _FaultDropReadback(run, run.session_id, generation)
         self._adopt_applied_state(applied)
-        self._events.emit(
+        self._emit_history_command(
             RoastEventKind.COMMAND_EXECUTED,
             {
                 "command": "drop_beans",
@@ -4279,6 +4520,7 @@ class RoastController:
                     "interrupted_unmet" if owner is EndpointOwner.PROTECTION else "operator"
                 ),
             },
+            command,
         )
         if (
             admission_phase is not RoastPhase.FAULTED
@@ -4288,14 +4530,20 @@ class RoastController:
             self.transition_to(RoastPhase.COOLING)
         return True
 
-    def _human_drop_unknown(self, generation: int, interval: dict[str, object]) -> None:
+    def _human_drop_unknown(
+        self,
+        generation: int,
+        interval: dict[str, object],
+        command: CommandReference | None,
+    ) -> None:
         run = self._human_run
         assert run is not None
         run.endpoint = EndpointDisposition.UNKNOWN
         run.command = CommandDisposition.UNKNOWN
-        self._events.emit(
+        self._emit_history_command(
             RoastEventKind.COMMAND_FAILED,
             {"command": "drop_beans", "outcome": run.endpoint.value, **interval},
+            command,
         )
         if self._generation_is_current(generation):
             self._project_human_drop_recovery()
@@ -5267,7 +5515,11 @@ class RoastController:
         )
 
     async def _execute_emergency_stop(
-        self, evaluation: SafetyEvaluation, *, emergency_already_admitted: bool
+        self,
+        evaluation: SafetyEvaluation,
+        *,
+        emergency_already_admitted: bool,
+        bind_audit: Callable[[CommandReference | None], None] | None = None,
     ) -> bool:
         """Execute one policy-approved e-stop and report positive MCP completion.
 
@@ -5281,18 +5533,30 @@ class RoastController:
         if not emergency_already_admitted:
             self.admit_emergency_stop()
         confirmed = False
+        generation = self._arbiter.generation
+        command: CommandReference | None = None
+
+        async def dispatch() -> AppliedRoasterState | None:
+            nonlocal command
+            # Leave failed attribution unknown without delaying the stop.
+            with contextlib.suppress(Exception):
+                reference = self._new_history_command(generation, owner=CommandAuditOwner.LEASE)
+                if bind_audit is not None:
+                    bind_audit(reference)
+                command = reference
+            return await self._executor.emergency_stop(reason=evaluation.reason)
+
         try:
-            applied = await self._run_emergency_write(
-                lambda: self._executor.emergency_stop(reason=evaluation.reason)
-            )
+            applied = await self._run_emergency_write(dispatch)
         except asyncio.CancelledError:
             # Cancellation cannot leave the controller reporting an ordinary,
             # writable phase after an admitted stop. The arbiter has released
             # or retained the physical boundary as appropriate; record the
             # unresolved hardware outcome as a fault and retain retry posture.
-            self._events.emit(
+            self._emit_history_command(
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "emergency_stop", "reason": evaluation.reason},
+                command,
             )
             self._pending_fail_safe = self._heat_off_evaluation(
                 source_rule=_EMERGENCY_STOP_RETRY_RULE
@@ -5308,9 +5572,10 @@ class RoastController:
             # A raising e-stop must not crash the tick loop or leave the phase
             # pre-fault: fault anyway and surface the failed command. The
             # terminal-phase tick retains the heat-off retry posture.
-            self._events.emit(
+            self._emit_history_command(
                 RoastEventKind.COMMAND_FAILED,
                 {"command": "emergency_stop", "reason": evaluation.reason},
+                command,
             )
             self._pending_fail_safe = self._heat_off_evaluation(
                 source_rule=_EMERGENCY_STOP_RETRY_RULE
@@ -5325,6 +5590,7 @@ class RoastController:
             self._pending_fail_safe = None
             self._pending_fail_safe_is_emergency_stop_retry = False
             confirmed = True
+
         # Emit ONCE, only on entry into FAULTED — never while already latched
         # there (the tick loop short-circuits before reaching here in a terminal
         # phase, but the guard keeps the emit transition-bound regardless of
@@ -5458,6 +5724,18 @@ class RoastController:
             adjusted_heat=0,
             adjusted_fan=self._safety.limits.overrun_safe_fan_percent,
             reason="fail-closed retry: heat 0 %, overrun-safe fan",
+        )
+
+    def has_pending_emergency_stop_retry(self) -> bool:
+        """Whether an admitted emergency stop already owns a heat-off retry."""
+        return (
+            self._pending_fail_safe_is_emergency_stop_retry and self._pending_fail_safe is not None
+        )
+
+    def has_pending_emergency_stop_work(self) -> bool:
+        """Whether this controller owns an unsettled stop or its heat-off retry."""
+        return self.has_pending_emergency_stop_retry() or (
+            self._emergency_stop_transition_pending and self._arbiter.emergency_stop_active
         )
 
     def rearm_emergency_stop_fail_safe(self) -> None:
@@ -6170,7 +6448,11 @@ class RoastController:
     # --- E4-S4: run lifecycle and operator actions ---
 
     async def start_run(
-        self, profile: RoastProfile, *, recording_roast_num: int | None = None
+        self,
+        profile: RoastProfile,
+        *,
+        recording_roast_num: int | None = None,
+        on_history_cancelled: Callable[[], None] | None = None,
     ) -> None:
         """Start a new roast run (E4-S4).
 
@@ -6188,6 +6470,8 @@ class RoastController:
                 this origin + 1). When ``None`` (a direct caller / a count
                 failure), the controller falls back to its per-process counter so
                 recording naming is always best-effort and never blocks the roast.
+            on_history_cancelled: Synchronous notification if cancellation
+                interrupts initial safety evaluation persistence.
         """
         generation = self._arbiter.generation
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
@@ -6261,6 +6545,7 @@ class RoastController:
         if not dispatched or not self._generation_is_current(generation):
             return
         if self._human_run is not None:
+            self._human_confirmed_start_generation = generation
             if self._current_session_id is not None:
                 self._human_run.session_id = self._current_session_id()
             if self._current_child_generation is not None:
@@ -6283,7 +6568,12 @@ class RoastController:
             seconds_since_last_command=self._seconds_since_last_command(),
             bounds=self._control_limits(),
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        try:
+            await self._snapshots.persist_evaluation(evaluation)
+        except asyncio.CancelledError:
+            if on_history_cancelled is not None:
+                on_history_cancelled()
+            raise
         if not self._generation_is_current(generation):
             return
         await self._execute_targets(evaluation, generation=generation)
@@ -6527,7 +6817,11 @@ class RoastController:
         if evaluation.verdict is not SafetyVerdict.ALLOW:
             self._enter_human_recovery(evaluation)
             return False
-        if evidence.bean_temp_c is not None and evidence.bean_temp_c < HUMAN_PROTECTION_BT_C:
+        if (
+            not self._storage_failure_pending
+            and evidence.bean_temp_c is not None
+            and evidence.bean_temp_c < HUMAN_PROTECTION_BT_C
+        ):
             self._human_continuation = None
             self._protection_check_pending = False
             self._routine_inhibited = False
@@ -6731,7 +7025,20 @@ class RoastController:
             if recovery
             else self._safety.evaluate_command_phase(command=RoastCommand.DROP_BEANS, phase=phase)
         )
-        await self._snapshots.persist_evaluation(evaluation)
+        try:
+            await self._snapshots.persist_evaluation(evaluation)
+        except HistoryUnavailable:
+            self.inhibit_human_routine_for_storage_failure()
+            if self._generation_is_current(generation) and self._phase is phase:
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {
+                        "command": "drop_beans",
+                        "outcome": "withheld",
+                        "reason": "history_unavailable",
+                    },
+                )
+            return
         run = self._human_run
         assert run is not None
         if (
@@ -6794,7 +7101,11 @@ class RoastController:
         return evaluation.verdict is SafetyVerdict.ALLOW
 
     async def operator_emergency_stop(
-        self, reason: str | None = None, *, already_admitted: bool = False
+        self,
+        reason: str | None = None,
+        *,
+        already_admitted: bool = False,
+        defer_evaluation: Callable[[SafetyEvaluation, CommandReference | None], None] | None = None,
     ) -> bool:
         """Operator e-stop: always available, from every phase (E3-S4).
 
@@ -6806,9 +7117,32 @@ class RoastController:
         evaluation = self._safety.evaluate_emergency_stop(phase=self._phase, operator_reason=reason)
         if not already_admitted:
             self.admit_emergency_stop()
-        confirmed = await self._execute_emergency_stop(evaluation, emergency_already_admitted=True)
+        command: CommandReference | None = None
+
+        def bind(reference: CommandReference | None) -> None:
+            nonlocal command
+            command = reference
+
         try:
-            await self._snapshots.persist_evaluation(evaluation)
+            confirmed = await self._execute_emergency_stop(
+                evaluation,
+                emergency_already_admitted=True,
+                bind_audit=bind,
+            )
+        except asyncio.CancelledError:
+            if defer_evaluation is not None:
+                defer_evaluation(evaluation, command)
+            raise
+        if defer_evaluation is not None:
+            defer_evaluation(evaluation, command)
+            return confirmed
+        caller = current_storage_caller()
+        try:
+            if self._human_run is not None and caller is not None:
+                with storage_caller(replace(caller, command=command)):
+                    await self._snapshots.persist_evaluation(evaluation)
+            else:
+                await self._snapshots.persist_evaluation(evaluation)
         except Exception:  # noqa: BLE001 - e-stop must never wait on trace persistence
             _log.exception("could not persist emergency-stop safety evaluation")
         return confirmed

@@ -14,10 +14,15 @@ import logging
 import math
 import re
 import uuid
+from collections import deque
+from collections.abc import Awaitable, Callable, Coroutine
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from enum import Enum
+from functools import wraps
+from inspect import signature
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import Any, Concatenate, Literal, ParamSpec, TypeVar, cast
 
 import aiosqlite
 from pydantic import BaseModel, ConfigDict
@@ -29,6 +34,14 @@ from roastpilot_agent.ambient_evidence import (
     derive_ambient_doctrine_evidence,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.human_persistence import (
+    CommandAuditOwner,
+    HistoryUnavailable,
+    Settlement,
+    StorageDeadline,
+    StorageReceipt,
+    current_storage_caller,
+)
 from roastpilot_agent.models import (
     AdvisorTraceStatus,
     BeanProfile,
@@ -39,6 +52,7 @@ from roastpilot_agent.models import (
     CommandTraceStatus,
     FaultLeaseClosureProvenance,
     FaultLeaseStatus,
+    HumanHistoryDurability,
     LogManifest,
     OperatorAction,
     PostFcHeatAuthorityState,
@@ -838,6 +852,81 @@ class FaultControlCloseResult(BaseModel):
     requires_faulted_history: bool = False
 
 
+_P = ParamSpec("_P")
+_T = TypeVar("_T")
+
+
+class _StorageAccess(Enum):
+    READ = "read"
+    INDEPENDENT_READ = "independent_read"
+    SHARED_WRITE = "shared_write"
+    DEDICATED_WRITE = "dedicated_write"
+
+    @property
+    def writes(self) -> bool:
+        return self in (_StorageAccess.SHARED_WRITE, _StorageAccess.DEDICATED_WRITE)
+
+
+@dataclass
+class _NativeStorage:
+    receipt: StorageReceipt
+    access: _StorageAccess
+    shared: aiosqlite.Connection | None
+    task: asyncio.Task[object] | None = None
+    writer: aiosqlite.Connection | None = None
+    opened: set[aiosqlite.Connection] = field(default_factory=set[aiosqlite.Connection])
+    commit_ambiguous: bool = False
+    settlement: Settlement = Settlement.UNRESOLVED
+    tainted: bool = False
+    failed: bool = False
+    settled: bool = False
+    published: bool = False
+
+
+def _bounded(
+    access: _StorageAccess,
+) -> Callable[
+    [Callable[Concatenate["RoastStore", _P], Coroutine[Any, Any, _T]]],
+    Callable[Concatenate["RoastStore", _P], Coroutine[Any, Any, _T]],
+]:
+    def decorate(
+        method: Callable[Concatenate["RoastStore", _P], Coroutine[Any, Any, _T]],
+    ) -> Callable[Concatenate["RoastStore", _P], Coroutine[Any, Any, _T]]:
+        names = tuple(signature(method).parameters)
+        run_index = names.index("run_id") - 1 if "run_id" in names else None
+
+        @wraps(method)
+        async def call(store: "RoastStore", /, *args: _P.args, **kwargs: _P.kwargs) -> _T:
+            run_id = kwargs.get("run_id")
+            if not store.human_storage_enabled:
+                return await method(store, *args, **kwargs)
+            if run_id is None and run_index is not None and run_index < len(args):
+                run_id = args[run_index]
+            kind = kwargs.get("kind")
+            tool = kwargs.get("tool")
+            action = kwargs.get("action")
+            detail = (
+                kind.value
+                if isinstance(kind, RoastEventKind)
+                else tool.value
+                if isinstance(tool, RoastCommand)
+                else action
+                if isinstance(action, str)
+                else None
+            )
+            return await store._admit_history(  # pyright: ignore[reportPrivateUsage]
+                access,
+                method.__name__,
+                lambda: method(store, *args, **kwargs),
+                run_id=run_id if isinstance(run_id, str) else None,
+                detail=detail,
+            )
+
+        return call
+
+    return decorate
+
+
 class RoastStore:
     """aiosqlite-backed persistence and recovery reads.
 
@@ -849,6 +938,22 @@ class RoastStore:
 
     def __init__(self, db_path: Path) -> None:
         self._db_path = db_path
+        self._history_clock: Callable[[], float] | None = None
+        self._history_interval = 0.0
+        self._history_owner: _NativeStorage | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._shared_closed_for_epoch = False
+        self._storage_token = 0
+        self._history_waiting = False
+        self._history_receipts: deque[StorageReceipt] = deque(maxlen=128)
+        self._unresolved_owner_audits: dict[CommandAuditOwner, dict[str, StorageReceipt]] = {}
+        self._history_run_id: str | None = None
+        self._history_gap = False
+        self._history_prior_unknown = False
+        self._history_delayed = False
+        self._history_covered = False
+        self._history_diagnostics_omitted = 0
+        self._history_shutdown_clean = True
         self._connection: aiosqlite.Connection | None = None
         self._last_telemetry_elapsed: dict[str, float] = {}
         self._last_telemetry_d96_state: dict[
@@ -861,6 +966,418 @@ class RoastStore:
         self._new_database = False
         self._fault_lease_absence_trusted = False
 
+    def enable_human_storage(self, clock: Callable[[], float], interval: float) -> None:
+        """Enable bounded ownership for this HUMAN store composition."""
+        if self._history_clock is None:
+            self._history_clock = clock
+            self._history_interval = interval
+
+    def set_human_history_run(self, run_id: str, *, recovered: bool) -> None:
+        """Start the aggregate for the exact run without rebinding native owners."""
+        if self._history_run_id != run_id:
+            for audit in self._unresolved_owner_audits.values():
+                for receipt in audit.values():
+                    self._append_history_diagnostic(receipt)
+            self._unresolved_owner_audits.clear()
+            self._history_run_id = run_id
+            self._history_gap = False
+            self._history_prior_unknown = recovered
+            self._history_delayed = False
+            self._history_covered = False
+
+    def human_history_durability(self, run_id: str) -> HumanHistoryDurability:
+        """Project committed evidence for the current run without awaiting SQLite."""
+        if self._history_clock is None or self._connection is None:
+            return HumanHistoryDurability.UNAVAILABLE
+        owner = self._history_owner
+        if owner is not None and owner.tainted:
+            return HumanHistoryDurability.UNAVAILABLE
+        if owner is not None and owner.access.writes:
+            if owner.receipt.run_id == run_id:
+                return HumanHistoryDurability.UNKNOWN
+            return HumanHistoryDurability.UNAVAILABLE
+        if run_id != self._history_run_id or self._history_prior_unknown:
+            return HumanHistoryDurability.UNKNOWN
+        if self._history_gap:
+            return HumanHistoryDurability.INCOMPLETE
+        if not self._history_covered:
+            return HumanHistoryDurability.UNKNOWN
+        if self._history_delayed:
+            return HumanHistoryDurability.DELAYED
+        return HumanHistoryDurability.COMPLETE
+
+    def drain_human_storage_receipts(self) -> tuple[StorageReceipt, ...]:
+        """Drain completed diagnostics while retaining an unresolved exact owner."""
+        completed = tuple(self._history_receipts)
+        self._history_receipts.clear()
+        if self._history_diagnostics_omitted:
+            clock = self._history_clock
+            assert clock is not None
+            gap = self._new_storage_receipt(
+                "diagnostic_backlog_omitted",
+                None,
+                StorageDeadline.start(clock, self._history_interval),
+            )
+            completed = (*completed, replace(gap, writer_entered=None))
+            self._history_diagnostics_omitted = 0
+        retained = tuple(
+            receipt
+            for audit in self._unresolved_owner_audits.values()
+            for receipt in audit.values()
+        )
+        owner = self._history_owner
+        return (*completed, *retained) if owner is None else (*completed, *retained, owner.receipt)
+
+    def note_human_history_pass(self, run_id: str) -> None:
+        """Cover the applicable history after a startup or turn completes."""
+        if run_id == self._history_run_id:
+            self._history_covered = True
+
+    def note_human_history_gap(
+        self,
+        kind: str,
+        run_id: str,
+        *,
+        detail: str | None = None,
+        unverified: bool = False,
+    ) -> None:
+        """Record a dropped audit item or an exception outside native attribution."""
+        caller = current_storage_caller()
+        clock = self._history_clock
+        if clock is None:
+            return
+        deadline = (
+            caller.deadline
+            if caller is not None
+            else StorageDeadline.start(clock, self._history_interval)
+        )
+        receipt = self._new_storage_receipt(kind, run_id, deadline, detail=detail)
+        if unverified and run_id == self._history_run_id:
+            self._history_prior_unknown = True
+        self._record_storage_receipt(
+            replace(
+                receipt,
+                writer_entered=None if unverified else False,
+                timely=False,
+                settlement=Settlement.UNRESOLVED if unverified else Settlement.VERIFIED_NO_WRITE,
+            ),
+            missed_write=not unverified,
+        )
+
+    @property
+    def human_storage_quiescent(self) -> bool:
+        """Return whether all admitted SQLite work has verified settlement."""
+        return self._history_owner is None and self._history_shutdown_clean
+
+    @property
+    def human_storage_enabled(self) -> bool:
+        """Return whether the storage ownership gate is enabled."""
+        return self._history_clock is not None
+
+    async def settle_human_storage_for_teardown(self) -> bool:
+        """Wait within the existing process bound for this exact native owner."""
+        owner = self._history_owner
+        if owner is not None and owner.task is not None:
+            await asyncio.wait({owner.task}, timeout=self._history_interval)
+        return self.human_storage_quiescent
+
+    def _new_storage_receipt(
+        self,
+        kind: str,
+        run_id: str | None,
+        deadline: StorageDeadline,
+        *,
+        detail: str | None = None,
+    ) -> StorageReceipt:
+        caller = current_storage_caller()
+        bound = caller is not None and caller.run_id == run_id
+        self._storage_token += 1
+        return StorageReceipt(
+            self._storage_token,
+            kind,
+            run_id,
+            caller.turn if caller and bound else None,
+            deadline.expires_at,
+            False,
+            None,
+            Settlement.UNRESOLVED,
+            command=caller.command if caller and bound else None,
+            detail=detail,
+        )
+
+    def _record_storage_receipt(self, receipt: StorageReceipt, *, missed_write: bool) -> None:
+        if receipt.run_id is not None and receipt.run_id == self._history_run_id:
+            self._history_gap |= missed_write
+            if receipt.settlement is Settlement.OBSERVED_COMMITTED:
+                self._history_delayed |= receipt.timely is False
+        if not self._retain_unresolved_command_audit(receipt):
+            self._append_history_diagnostic(receipt)
+
+    def _append_history_diagnostic(self, receipt: StorageReceipt) -> None:
+        if len(self._history_receipts) == self._history_receipts.maxlen:
+            self._history_diagnostics_omitted += 1
+        self._history_receipts.append(receipt)
+
+    def _retain_unresolved_command_audit(self, receipt: StorageReceipt) -> bool:
+        command = receipt.command
+        if (
+            receipt.run_id != self._history_run_id
+            or receipt.settlement is not Settlement.UNRESOLVED
+            or command is None
+            or command.owner is None
+            or receipt.kind not in {"record_command", "record_safety_evaluation"}
+        ):
+            return False
+        retained = self._unresolved_owner_audits.setdefault(command.owner, {})
+        previous = next(iter(retained.values()), None)
+        if previous is not None:
+            prior = previous.command
+            assert prior is not None
+            if prior != command:
+                if (command.child_generation, command.command_generation, command.attempt) <= (
+                    prior.child_generation,
+                    prior.command_generation,
+                    prior.attempt,
+                ):
+                    return False
+                for displaced in retained.values():
+                    self._append_history_diagnostic(displaced)
+                retained.clear()
+        displaced = retained.get(receipt.kind)
+        if displaced is not None:
+            self._append_history_diagnostic(displaced)
+        retained[receipt.kind] = receipt
+        return True
+
+    def _current_native_storage(self) -> _NativeStorage | None:
+        owner = self._history_owner
+        if owner is not None and owner.task is asyncio.current_task():
+            return owner
+        return None
+
+    async def _admit_history(
+        self,
+        access: _StorageAccess,
+        kind: str,
+        operation: Callable[[], Awaitable[_T]],
+        *,
+        run_id: str | None,
+        detail: str | None,
+    ) -> _T:
+        clock = self._history_clock
+        if clock is None or self._current_native_storage() is not None:
+            return await operation()
+        caller = current_storage_caller()
+        if caller is not None:
+            run_id = run_id or caller.run_id
+        deadline = (
+            caller.deadline
+            if caller is not None
+            else StorageDeadline.start(clock, self._history_interval)
+        )
+        receipt = self._new_storage_receipt(kind, run_id, deadline, detail=detail)
+        owner = self._history_owner
+        if (
+            owner is not None
+            and access.writes
+            and caller is not None
+            and caller.turn is not None
+            and not self._history_waiting
+            and owner.task is not None
+            and not owner.task.done()
+            and deadline.remaining() > 0
+        ):
+            self._history_waiting = True
+            try:
+                await asyncio.wait({owner.task}, timeout=deadline.remaining())
+            except asyncio.CancelledError:
+                self._refuse_storage(receipt, access)
+                raise
+            finally:
+                self._history_waiting = False
+        remaining = deadline.remaining()
+        if (
+            self._history_owner is not None
+            or self._history_waiting
+            or self._close_task is not None
+            or remaining <= 0
+            or (self._connection is None and kind not in {"initialize", "mark_process_epoch_clean"})
+        ):
+            self._refuse_storage(receipt, access)
+            raise HistoryUnavailable("HUMAN history admission unavailable")
+        shared = self._connection
+        owner = _NativeStorage(receipt, access, shared)
+        self._history_owner = owner
+        task = asyncio.create_task(
+            self._execute_history(owner, deadline, operation),
+            name=f"human-storage-{kind}",
+        )
+        owner.task = task
+        task.add_done_callback(self._observe_storage_exception)
+        try:
+            done, _ = await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            self._finish_storage_ack(owner, timely=False)
+            raise
+        timely = bool(done) and deadline.remaining() > 0
+        self._finish_storage_ack(owner, timely=timely)
+        if not timely:
+            raise HistoryUnavailable("HUMAN history deadline elapsed", receipt=owner.receipt)
+        try:
+            return task.result()
+        except aiosqlite.Error as exc:
+            raise HistoryUnavailable(
+                "HUMAN SQLite operation failed", receipt=owner.receipt
+            ) from exc
+
+    def _finish_storage_ack(self, owner: _NativeStorage, *, timely: bool) -> None:
+        if owner.receipt.timely is None:
+            owner.receipt = replace(owner.receipt, timely=timely)
+        self._publish_settled_storage(owner)
+
+    def _publish_settled_storage(self, owner: _NativeStorage) -> None:
+        if not owner.settled or owner.tainted or owner.published or owner.receipt.timely is None:
+            return
+        owner.published = True
+        self._record_storage_receipt(
+            owner.receipt,
+            missed_write=(
+                owner.access.writes
+                and owner.settlement is not Settlement.OBSERVED_COMMITTED
+                and (owner.failed or owner.receipt.timely is False)
+            ),
+        )
+
+    def _refuse_storage(self, receipt: StorageReceipt, access: _StorageAccess) -> None:
+        self._record_storage_receipt(
+            replace(receipt, timely=False, settlement=Settlement.VERIFIED_NO_WRITE),
+            missed_write=access.writes,
+        )
+
+    @staticmethod
+    def _observe_storage_exception(task: asyncio.Task[object]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _execute_history(
+        self,
+        owner: _NativeStorage,
+        deadline: StorageDeadline,
+        operation: Callable[[], Awaitable[_T]],
+    ) -> _T:
+        failed = True
+        try:
+            if deadline.remaining() <= 0:
+                raise HistoryUnavailable("HUMAN history deadline elapsed before entry")
+            if owner.shared is not None and owner.shared.in_transaction:
+                owner.tainted = True
+                raise HistoryUnavailable("shared history connection has an unowned transaction")
+            result = await operation()
+            if self._connection is not owner.shared and owner.receipt.kind != "initialize":
+                owner.tainted = True
+                raise HistoryUnavailable("shared history connection changed during admission")
+            failed = False
+            return result
+        finally:
+            writer = owner.writer
+            if writer is not None and writer is owner.shared and writer.in_transaction:
+                try:
+                    await self._rollback_connection(writer)
+                except Exception:  # noqa: BLE001 - retain the exact, unverified owner
+                    owner.tainted = True
+            if owner.opened or owner.commit_ambiguous:
+                owner.tainted = True
+            if owner.tainted:
+                self._history_shutdown_clean = False
+            elif owner.settlement is Settlement.UNRESOLVED:
+                owner.settlement = Settlement.VERIFIED_NO_WRITE
+            owner.receipt = replace(
+                owner.receipt,
+                settlement=owner.settlement if not owner.tainted else Settlement.UNRESOLVED,
+            )
+            owner.failed = failed
+            owner.settled = True
+            if not owner.tainted:
+                self._history_owner = None
+            self._publish_settled_storage(owner)
+
+    async def _open_connection(self, *, writer: bool = False) -> aiosqlite.Connection:
+        if self._history_clock is None:
+            return await aiosqlite.connect(self._db_path)
+        owner = self._current_native_storage()
+        connection = aiosqlite.connect(self._db_path, timeout=self._history_interval)
+        if owner is not None:
+            owner.opened.add(connection)
+            if writer:
+                owner.writer = connection
+                owner.receipt = replace(
+                    owner.receipt,
+                    writer_entered=None,
+                    writer_connection=id(connection),
+                )
+        try:
+            await connection
+        except Exception:
+            # Failed connection entry stops aiosqlite's worker before raising.
+            if owner is not None:
+                owner.opened.discard(connection)
+                if writer:
+                    owner.receipt = replace(owner.receipt, writer_entered=False)
+            raise
+        if owner is not None and writer:
+            self._bind_writer(owner, connection)
+        return connection
+
+    async def _close_connection(self, connection: aiosqlite.Connection) -> None:
+        await connection.close()
+        owner = self._current_native_storage()
+        if owner is not None:
+            owner.opened.discard(connection)
+
+    @staticmethod
+    def _bind_writer(owner: _NativeStorage, connection: aiosqlite.Connection) -> None:
+        owner.writer = connection
+        owner.receipt = replace(
+            owner.receipt, writer_entered=True, writer_connection=id(connection)
+        )
+
+    async def _commit_connection(self, connection: aiosqlite.Connection) -> None:
+        owner = self._current_native_storage()
+        if owner is None:
+            await connection.commit()
+            return
+        self._bind_writer(owner, connection)
+        owner.commit_ambiguous = True
+        await connection.commit()
+        owner.commit_ambiguous = False
+        owner.settlement = Settlement.OBSERVED_COMMITTED
+
+    async def _rollback_connection(self, connection: aiosqlite.Connection) -> None:
+        owner = self._current_native_storage()
+        can_disprove_commit = (
+            connection.in_transaction if owner and owner.commit_ambiguous else True
+        )
+        await connection.rollback()
+        if (
+            owner is not None
+            and owner.writer is connection
+            and can_disprove_commit
+            and not connection.in_transaction
+        ):
+            owner.commit_ambiguous = False
+            if owner.settlement is not Settlement.OBSERVED_COMMITTED:
+                owner.settlement = Settlement.VERIFIED_NO_WRITE
+
+    def _storage_commit_ambiguous(self) -> bool:
+        owner = self._current_native_storage()
+        return owner is not None and owner.commit_ambiguous
+
+    def _confirm_storage_commit(self) -> None:
+        owner = self._current_native_storage()
+        if owner is not None:
+            owner.commit_ambiguous = False
+            owner.settlement = Settlement.OBSERVED_COMMITTED
+
     @property
     def db_path(self) -> Path:
         """Path to the SQLite database file."""
@@ -871,8 +1388,16 @@ class RoastStore:
         """The live connection (initialize() first)."""
         if self._connection is None:
             raise RuntimeError("store is not initialized")
+        owner = self._current_native_storage()
+        if (
+            owner is not None
+            and owner.access is _StorageAccess.SHARED_WRITE
+            and owner.writer is None
+        ):
+            self._bind_writer(owner, self._connection)
         return self._connection
 
+    @_bounded(_StorageAccess.READ)
     async def read_ambient_doctrine_evidence(self, run_id: str) -> AmbientDoctrineEvidence:
         """Read conservative ambient-doctrine evidence without modifying the store.
 
@@ -920,11 +1445,12 @@ class RoastStore:
             _log.warning("Ambient doctrine evidence unavailable for run %s", run_id)
             return derive_ambient_doctrine_evidence(None, (), ())
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def initialize(self) -> None:
         """Open the database, set durability PRAGMAs, apply migrations."""
         if self._connection is not None:
             return
-        connection = await aiosqlite.connect(self._db_path)
+        connection = await self._open_connection(writer=True)
         # Name-keyed rows everywhere: the read projections map columns by name
         # (``row["col"]``), so adding or reordering a SELECT column never silently
         # shifts a positional ``row[N]`` index into the wrong field (#242). A
@@ -950,9 +1476,14 @@ class RoastStore:
             # Never leak the connection (and its worker thread) on a
             # failed open/migration — found when the rollback test hung
             # pytest exit on the leaked aiosqlite thread.
-            await connection.close()
+            await self._close_connection(connection)
             raise
+        owner = self._current_native_storage()
+        if owner is not None:
+            owner.opened.discard(connection)
+            owner.settlement = Settlement.OBSERVED_COMMITTED
         self._connection = connection
+        self._shared_closed_for_epoch = False
         self._new_database = is_new_database
         self._fault_lease_absence_trusted = is_new_database
 
@@ -995,10 +1526,15 @@ class RoastStore:
                 # cleanly — never half-applied DDL with a stale version
                 # (review finding, E6-S1 PR). Migration scripts must not
                 # contain their own BEGIN/COMMIT.
+                owner = self._current_native_storage()
+                if owner is not None:
+                    owner.commit_ambiguous = True
                 await connection.executescript(
                     f"BEGIN;\n{script}\nPRAGMA user_version={number};\nCOMMIT;"
                 )
+                self._confirm_storage_commit()
 
+    @_bounded(_StorageAccess.READ)
     async def schema_version(self) -> int:
         """The applied schema version (PRAGMA user_version)."""
         async with self.connection.execute("PRAGMA user_version") as cursor:
@@ -1007,11 +1543,39 @@ class RoastStore:
         return int(row[0])
 
     async def close(self) -> None:
-        """Close the connection (safe to call when never initialized)."""
-        if self._connection is not None:
+        """Close the store without submitting close over an unresolved worker."""
+        if self._connection is None and self._history_owner is None:
+            return
+        if self._history_clock is None and self._connection is not None:
             await self._connection.close()
             self._connection = None
+            return
+        if self._history_owner is not None and self._history_owner.task is not None:
+            owner = self._history_owner
+            task = owner.task
+            if task is not None and not task.done():
+                done, _ = await asyncio.wait({task}, timeout=self._history_interval)
+                if not done:
+                    raise HistoryUnavailable("HUMAN storage worker is still pending")
+            if owner.opened:
+                raise HistoryUnavailable("HUMAN storage connection teardown is unverified")
+        if self._connection is None:
+            return
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._connection.close(), name="human-storage-close")
+            task.add_done_callback(self._observe_storage_exception)
+            self._close_task = task
+        done, _ = await asyncio.wait({task}, timeout=self._history_interval)
+        if not done:
+            self._history_shutdown_clean = False
+            raise HistoryUnavailable("HUMAN store close deadline elapsed")
+        task.result()
+        self._connection = None
+        self._close_task = None
+        self._shared_closed_for_epoch = self.human_storage_quiescent
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def begin_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
         """Durably create this fresh process's required restart gate.
 
@@ -1025,9 +1589,10 @@ class RoastStore:
             "(process_id, state, created_at_utc, updated_at_utc) VALUES (?, ?, ?, ?)",
             (process_id, RestartClearanceState.REQUIRED.value, now, now),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return RestartClearanceState.REQUIRED
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def begin_process_epoch(self, process_id: str) -> bool:
         """Mark a live process unclean and return trusted absent-lease provenance.
 
@@ -1043,7 +1608,7 @@ class RoastStore:
         # Preserve the initialized-store guard before connecting: an
         # uninitialized store must not create a database or mint provenance.
         _ = self.connection
-        connection = await aiosqlite.connect(self._db_path)
+        connection = await self._open_connection(writer=True)
         connection.row_factory = aiosqlite.Row
         try:
             await self._configure_durable_connection(connection)
@@ -1060,26 +1625,80 @@ class RoastStore:
                 "status=excluded.status, updated_at_utc=excluded.updated_at_utc",
                 (process_id, _utc_now()),
             )
-            await connection.commit()
+            await self._commit_connection(connection)
         except BaseException:
             with contextlib.suppress(Exception):
-                await connection.rollback()
+                await self._rollback_connection(connection)
             raise
         finally:
-            await connection.close()
+            await self._close_connection(connection)
         self._fault_lease_absence_trusted = trusted
         return trusted
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def mark_process_epoch_clean(self, process_id: str) -> bool:
         """CAS this live process's epoch to clean after verified shutdown."""
+        if self._history_clock is not None:
+            return await self._mark_human_epoch_after_shared_close(process_id)
         cursor = await self.connection.execute(
             "UPDATE process_epoch SET status = 'clean', updated_at_utc = ? "
             "WHERE singleton = 1 AND process_id = ? AND status = 'unclean'",
             (_utc_now(), process_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    async def _mark_human_epoch_after_shared_close(self, process_id: str) -> bool:
+        if not self._shared_closed_for_epoch or self._connection is not None:
+            return False
+        connection = await self._open_connection(writer=True)
+        matched = False
+        try:
+            await self._configure_durable_connection(connection)
+            async with connection.execute(
+                "UPDATE process_epoch SET status = 'clean', updated_at_utc = ? "
+                "WHERE singleton = 1 AND process_id = ? AND status = 'unclean' "
+                "AND NOT EXISTS (SELECT 1 FROM roast_runs WHERE completed_at_utc IS NULL) "
+                "AND EXISTS (SELECT 1 FROM process_restart_clearance "
+                "WHERE process_id = ? AND state = ?) "
+                "AND NOT EXISTS (SELECT 1 FROM fault_control_lease WHERE status != 'closed') "
+                "AND (? OR EXISTS (SELECT 1 FROM fault_control_lease WHERE status = 'closed'))",
+                (
+                    _utc_now(),
+                    process_id,
+                    process_id,
+                    RestartClearanceState.CLEARED.value,
+                    self._fault_lease_absence_trusted,
+                ),
+            ) as cursor:
+                matched = cursor.rowcount == 1
+            await self._commit_connection(connection)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await self._rollback_connection(connection)
+            if not self._storage_commit_ambiguous() or not matched:
+                raise
+        finally:
+            await self._close_connection(connection)
+        if not self._storage_commit_ambiguous():
+            return matched
+        # The exact current process CAS is the only final-marker writer. A
+        # separate connection supplies proof if its COMMIT acknowledgement failed.
+        verification = await self._open_connection()
+        try:
+            async with verification.execute(
+                "SELECT status FROM process_epoch WHERE singleton = 1 AND process_id = ?",
+                (process_id,),
+            ) as cursor:
+                row = await cursor.fetchone()
+            if row is not None and row[0] == "clean":
+                self._confirm_storage_commit()
+                return True
+            return False
+        finally:
+            await self._close_connection(verification)
+
+    @_bounded(_StorageAccess.READ)
     async def read_process_restart_clearance(self, process_id: str) -> RestartClearanceState:
         """Read this process's durable restart gate, failing closed if absent."""
         async with self.connection.execute(
@@ -1093,6 +1712,7 @@ class RoastStore:
         except ValueError:
             return RestartClearanceState.UNKNOWN
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def confirm_process_restart_clearance(self, process_id: str) -> bool:
         """CAS the current process gate from required to cleared."""
         cursor = await self.connection.execute(
@@ -1105,9 +1725,10 @@ class RoastStore:
                 RestartClearanceState.REQUIRED.value,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def confirm_process_closure_only_clearance(self, process_id: str) -> bool:
         """CAS this fresh process gate from required to D216 closure-only."""
         cursor = await self.connection.execute(
@@ -1120,9 +1741,10 @@ class RoastStore:
                 RestartClearanceState.REQUIRED.value,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def mark_process_restart_clearance_unknown(self, process_id: str) -> None:
         """Fence an uncertain process-clearance transition durably."""
         await self.connection.execute(
@@ -1130,8 +1752,9 @@ class RoastStore:
             "WHERE process_id = ?",
             (RestartClearanceState.UNKNOWN.value, _utc_now(), process_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def end_closure_only_recovered_run(
         self,
         *,
@@ -1145,7 +1768,7 @@ class RoastStore:
         operator audit, and process gate together. It does not issue MCP
         commands or export roast logs.
         """
-        connection = await aiosqlite.connect(self._db_path)
+        connection = await self._open_connection(writer=True)
         connection.row_factory = aiosqlite.Row
         try:
             await self._configure_durable_connection(connection)
@@ -1162,7 +1785,7 @@ class RoastStore:
                 or lease != expected_lease
                 or lease.status is not FaultLeaseStatus.CLOSED
             ):
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             now = _utc_now()
             updated_run = await connection.execute(
@@ -1178,7 +1801,7 @@ class RoastStore:
                 ),
             )
             if updated_run.rowcount != 1:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             payload = json.dumps(
                 {"closure_only": "confirmed", "lease_generation": lease.generation},
@@ -1190,7 +1813,7 @@ class RoastStore:
                 (run_id, OperatorAction.END_RECOVERED_RUN.value, payload, "accepted", now),
             )
             if audit.rowcount != 1:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             reset_gate = await connection.execute(
                 "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
@@ -1203,28 +1826,33 @@ class RoastStore:
                 ),
             )
             if reset_gate.rowcount != 1:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
-            await connection.commit()
-        except BaseException:
+            await self._commit_connection(connection)
+        except BaseException as exc:
             with contextlib.suppress(Exception):
-                await connection.rollback()
-            raise
+                await self._rollback_connection(connection)
+            if not isinstance(exc, Exception) or not self._storage_commit_ambiguous():
+                raise
         finally:
-            await connection.close()
-        return await self.closure_only_end_postcondition(
+            await self._close_connection(connection)
+        verified = await self.closure_only_end_postcondition(
             process_id=process_id,
             run_id=run_id,
             lease_generation=expected_lease.generation,
         )
+        if verified:
+            self._confirm_storage_commit()
+        return verified
 
+    @_bounded(_StorageAccess.INDEPENDENT_READ)
     async def closure_only_end_postcondition(
         self, *, process_id: str, run_id: str, lease_generation: int
     ) -> bool:
         """Prove the exact durable D216 terminal state after an uncertain commit."""
         connection: aiosqlite.Connection | None = None
         try:
-            connection = await aiosqlite.connect(self._db_path)
+            connection = await self._open_connection()
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             async with connection.execute(
@@ -1260,12 +1888,14 @@ class RoastStore:
             return False
         finally:
             if connection is not None:
-                await connection.close()
+                await self._close_connection(connection)
 
+    @_bounded(_StorageAccess.READ)
     async def read_fault_control_lease(self) -> FaultControlLease:
         """Read the current lease, classifying unproven absence as UNKNOWN."""
         return await self._read_fault_control_lease_from_connection(self.connection)
 
+    @_bounded(_StorageAccess.READ)
     async def probe_fault_control_lease_absence(self) -> FaultControlLeaseAbsence:
         """Classify whether the singleton lease row is durably absent.
 
@@ -1301,6 +1931,7 @@ class RoastStore:
             else FaultControlLeaseAbsence.ABSENT_UNTRUSTED
         )
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def initialize_missing_fault_control_safety_record(
         self,
         *,
@@ -1317,7 +1948,7 @@ class RoastStore:
         """
         if generation < 1:
             raise ValueError("D220 baseline generation must be positive")
-        connection = await aiosqlite.connect(self._db_path)
+        connection = await self._open_connection(writer=True)
         connection.row_factory = aiosqlite.Row
         try:
             await self._configure_durable_connection(connection)
@@ -1327,7 +1958,7 @@ class RoastStore:
                 absence_trusted=self._fault_lease_absence_trusted,
             )
             if absence is not FaultControlLeaseAbsence.ABSENT_UNTRUSTED:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             async with connection.execute(
                 "SELECT 1 FROM process_epoch WHERE singleton = 1 "
@@ -1345,7 +1976,7 @@ class RoastStore:
             ) as cursor:
                 active = await cursor.fetchone()
             if epoch is None or clearance is None or active is not None:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             # A generation is a durable server operation identity, not merely
             # a value available while this singleton happens to be absent.
@@ -1355,7 +1986,7 @@ class RoastStore:
                 await self._missing_fault_control_safety_record_audit_count(connection, generation)
                 != 0
             ):
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return False
             now = _utc_now()
             await connection.execute(
@@ -1371,19 +2002,24 @@ class RoastStore:
                 "VALUES (NULL, ?, ?, 'accepted', ?)",
                 (OperatorAction.INITIALIZE_SAFETY_RECORD.value, payload, now),
             )
-            await connection.commit()
-        except BaseException:
+            await self._commit_connection(connection)
+        except BaseException as exc:
             with contextlib.suppress(Exception):
-                await connection.rollback()
-            raise
+                await self._rollback_connection(connection)
+            if not isinstance(exc, Exception) or not self._storage_commit_ambiguous():
+                raise
         finally:
-            await connection.close()
-        return await self.verify_missing_fault_control_safety_record(
+            await self._close_connection(connection)
+        verified = await self.verify_missing_fault_control_safety_record(
             process_id=process_id,
             generation=generation,
             operation_id=operation_id,
         )
+        if verified:
+            self._confirm_storage_commit()
+        return verified
 
+    @_bounded(_StorageAccess.INDEPENDENT_READ)
     async def verify_missing_fault_control_safety_record(
         self,
         *,
@@ -1394,7 +2030,7 @@ class RoastStore:
         """Prove the exact D220 baseline and its unique matching audit."""
         connection: aiosqlite.Connection | None = None
         try:
-            connection = await aiosqlite.connect(self._db_path)
+            connection = await self._open_connection()
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             await connection.execute("BEGIN")
@@ -1439,8 +2075,8 @@ class RoastStore:
         finally:
             if connection is not None:
                 with contextlib.suppress(Exception):
-                    await connection.rollback()
-                await connection.close()
+                    await self._rollback_connection(connection)
+                await self._close_connection(connection)
 
     @staticmethod
     def _fault_control_safety_record_payload(generation: int, operation_id: str) -> str:
@@ -1642,6 +2278,7 @@ class RoastStore:
         ):
             raise ValueError("invalid stranded-fault retirement identity")
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def retire_stranded_fault_lease(
         self,
         *,
@@ -1676,7 +2313,7 @@ class RoastStore:
         committed = False
         outcome = StrandedFaultRetirementCommit.INDETERMINATE
         try:
-            connection = await aiosqlite.connect(self._db_path)
+            connection = await self._open_connection(writer=True)
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             await connection.execute("BEGIN IMMEDIATE")
@@ -1692,7 +2329,7 @@ class RoastStore:
                 or int(lease["generation"]) != generation
                 or str(lease["status"]) != FaultLeaseStatus.OPEN.value
             ):
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
             else:
                 async with connection.execute(
@@ -1729,7 +2366,7 @@ class RoastStore:
                         connection, run_id, generation
                     )
                 ):
-                    await connection.rollback()
+                    await self._rollback_connection(connection)
                     outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
                 else:
                     now = _utc_now()
@@ -1747,7 +2384,7 @@ class RoastStore:
                         ),
                     )
                     if updated.rowcount != 1:
-                        await connection.rollback()
+                        await self._rollback_connection(connection)
                         outcome = StrandedFaultRetirementCommit.PRECONDITION_REJECTED
                     else:
                         await connection.execute(
@@ -1763,12 +2400,12 @@ class RoastStore:
                                 now,
                             ),
                         )
-                        await connection.commit()
+                        await self._commit_connection(connection)
                         committed = True
         except Exception:  # noqa: BLE001 - every persistence ambiguity fails closed
             if connection is not None:
                 try:
-                    await connection.rollback()
+                    await self._rollback_connection(connection)
                 except Exception:
                     pass
                 except BaseException:
@@ -1777,17 +2414,17 @@ class RoastStore:
         except BaseException:
             if connection is not None:
                 with contextlib.suppress(Exception):
-                    await connection.rollback()
+                    await self._rollback_connection(connection)
             raise
         finally:
             if connection is not None:
                 try:
-                    await connection.close()
+                    await self._close_connection(connection)
                 except Exception:  # noqa: BLE001 - cleanup ambiguity cannot report success
                     close_failed = True
         if close_failed:
             return StrandedFaultRetirementCommit.INDETERMINATE
-        if not committed:
+        if not committed and not self._storage_commit_ambiguous():
             return outcome
         try:
             verified = await self.verify_stranded_fault_retirement(
@@ -1799,12 +2436,15 @@ class RoastStore:
             )
         except Exception:  # noqa: BLE001 - a missing postcondition is indeterminate
             return StrandedFaultRetirementCommit.INDETERMINATE
+        if verified:
+            self._confirm_storage_commit()
         return (
             StrandedFaultRetirementCommit.COMMITTED_VERIFIED
             if verified
             else StrandedFaultRetirementCommit.INDETERMINATE
         )
 
+    @_bounded(_StorageAccess.INDEPENDENT_READ)
     async def verify_stranded_fault_retirement(
         self,
         *,
@@ -1818,7 +2458,7 @@ class RoastStore:
         connection: aiosqlite.Connection | None = None
         verified = False
         try:
-            connection = await aiosqlite.connect(self._db_path)
+            connection = await self._open_connection()
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             await connection.execute("BEGIN")
@@ -1870,19 +2510,20 @@ class RoastStore:
             # A failed connect returns in except, so it cannot reach post-finally flow.
             if connection is not None:  # pragma: no branch
                 try:
-                    await connection.rollback()
+                    await self._rollback_connection(connection)
                 except Exception:
                     verified = False
                 except BaseException:
                     with contextlib.suppress(Exception):
-                        await connection.close()
+                        await self._close_connection(connection)
                     raise
                 try:
-                    await connection.close()
+                    await self._close_connection(connection)
                 except Exception:
                     verified = False
         return verified
 
+    @_bounded(_StorageAccess.READ)
     async def read_fault_control_lease_closure_provenance(
         self, lease: FaultControlLease
     ) -> FaultLeaseClosureProvenance | None:
@@ -1985,6 +2626,7 @@ class RoastStore:
         ) as cursor:
             return await cursor.fetchone() is not None
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def open_fault_control_lease(
         self, *, run_id: str | None, mcp_session_id: str | None, generation: int | None = None
     ) -> FaultControlLease:
@@ -2001,9 +2643,10 @@ class RoastStore:
             "WHERE excluded.generation > fault_control_lease.generation",
             (run_id, mcp_session_id, generation, FaultLeaseStatus.OPEN.value, _utc_now()),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return await self.read_fault_control_lease()
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def mark_fault_control_lease_unknown(self, generation: int) -> bool:
         """Fail closed after an unconfirmed lease persistence attempt."""
         cursor = await self.connection.execute(
@@ -2011,9 +2654,10 @@ class RoastStore:
             "WHERE singleton = 1 AND generation = ?",
             (FaultLeaseStatus.UNKNOWN.value, _utc_now(), generation),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def replace_fault_control_lease_unknown(
         self, run_id: str | None, *, generation: int | None = None
     ) -> FaultControlLease:
@@ -2030,9 +2674,10 @@ class RoastStore:
             "WHERE excluded.generation > fault_control_lease.generation",
             (run_id, generation, FaultLeaseStatus.UNKNOWN.value, _utc_now()),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return await self.read_fault_control_lease()
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def close_fault_control_lease(self, generation: int) -> bool:
         """Close only the current OPEN lease generation through a durable CAS."""
         cursor = await self.connection.execute(
@@ -2045,9 +2690,10 @@ class RoastStore:
                 FaultLeaseStatus.OPEN.value,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def close_fault_control_lease_atomically(
         self,
         *,
@@ -2073,7 +2719,7 @@ class RoastStore:
         Returns:
             A result confirmed only by a fresh post-commit durable read.
         """
-        connection = await aiosqlite.connect(self._db_path)
+        connection = await self._open_connection(writer=True)
         connection.row_factory = aiosqlite.Row
         live_run_at_begin = False
         payload = json.dumps(
@@ -2095,7 +2741,7 @@ class RoastStore:
                 or str(lease["run_id"]) != run_id
                 or str(lease["mcp_session_id"]) != mcp_session_id
             ):
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return FaultControlCloseResult(
                     historically_committed=False, confirmed=False, run_completed=False
                 )
@@ -2104,7 +2750,7 @@ class RoastStore:
             ) as cursor:
                 run = await cursor.fetchone()
             if run is None:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return FaultControlCloseResult(
                     historically_committed=False, confirmed=False, run_completed=False
                 )
@@ -2124,7 +2770,7 @@ class RoastStore:
                 ),
             )
             if cursor.rowcount != 1:
-                await connection.rollback()
+                await self._rollback_connection(connection)
                 return FaultControlCloseResult(
                     historically_committed=False, confirmed=False, run_completed=False
                 )
@@ -2156,16 +2802,16 @@ class RoastStore:
                     ),
                 )
                 if completed.rowcount != 1:
-                    await connection.rollback()
+                    await self._rollback_connection(connection)
                     return FaultControlCloseResult(
                         historically_committed=False, confirmed=False, run_completed=False
                     )
-            await connection.commit()
+            await self._commit_connection(connection)
         except Exception:  # noqa: BLE001 - commit ambiguity is fail-closed
             with contextlib.suppress(Exception):
-                await connection.rollback()
+                await self._rollback_connection(connection)
         finally:
-            await connection.close()
+            await self._close_connection(connection)
 
         # A successful COMMIT call is still not enough evidence for an actor
         # whose task was cancelled or whose driver reported ambiguity.  Always
@@ -2175,7 +2821,7 @@ class RoastStore:
         # that this older live runner must finish.
         verification_connection: aiosqlite.Connection | None = None
         try:
-            verification_connection = await aiosqlite.connect(self._db_path)
+            verification_connection = await self._open_connection()
             verification_connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(verification_connection)
             lease = await self._read_fault_control_lease_from_connection(verification_connection)
@@ -2198,7 +2844,7 @@ class RoastStore:
         finally:
             # A failed connect returns in except, so it cannot reach post-finally flow.
             if verification_connection is not None:  # pragma: no branch
-                await verification_connection.close()
+                await self._close_connection(verification_connection)
         history_confirmed = verified_run is not None and (
             not live_run_at_begin
             or (
@@ -2208,6 +2854,8 @@ class RoastStore:
             )
         )
         historically_committed = audit_present and history_confirmed
+        if historically_committed:
+            self._confirm_storage_commit()
         confirmed = (
             historically_committed
             and lease.generation == generation
@@ -2221,6 +2869,7 @@ class RoastStore:
             run_completed=historically_committed and live_run_at_begin,
         )
 
+    @_bounded(_StorageAccess.INDEPENDENT_READ)
     async def verify_fault_control_lease_close(
         self,
         *,
@@ -2237,7 +2886,7 @@ class RoastStore:
         """
         connection: aiosqlite.Connection | None = None
         try:
-            connection = await aiosqlite.connect(self._db_path)
+            connection = await self._open_connection()
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             lease = await self._read_fault_control_lease_from_connection(connection)
@@ -2259,7 +2908,7 @@ class RoastStore:
         finally:
             # A failed connect returns in except, so it cannot reach post-finally flow.
             if connection is not None:  # pragma: no branch
-                await connection.close()
+                await self._close_connection(connection)
         history_confirmed = run is not None and run["completed_at_utc"] is not None
         if requires_faulted_history and run is not None:
             history_confirmed = history_confirmed and (
@@ -2286,6 +2935,7 @@ class RoastStore:
     # roasts" with no forced WAL checkpoint anywhere — SQLite checkpoints
     # WAL automatically; durability comes from synchronous=FULL.
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def create_run(
         self,
         *,
@@ -2321,8 +2971,9 @@ class RoastStore:
                 now,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
+    @_bounded(_StorageAccess.READ)
     async def count_completed_runs_for_origin(self, origin_slug: str) -> int:
         """Count prior *completed* roasts whose origin slug matches (#385).
 
@@ -2368,6 +3019,7 @@ class RoastStore:
                 count += 1
         return count
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def update_run_phase(self, run_id: str, agent_phase: RoastPhase) -> None:
         """Persist the last-known agent phase (the recovery read, E6-S3).
 
@@ -2378,10 +3030,11 @@ class RoastStore:
             "UPDATE roast_runs SET agent_phase = ?, updated_at_utc = ? WHERE id = ?",
             (agent_phase.value, _utc_now(), run_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_t0_detected_at(
         self, run_id: str, t0_detected_at_utc: str | None = None
     ) -> None:
@@ -2419,7 +3072,7 @@ class RoastStore:
             " WHERE id = ? AND t0_detected_at_utc IS NULL",
             (charged_at, _utc_now(), run_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             # Either the run does not exist (a programming error) or T0 is
             # already persisted (the write-once guard fired). Distinguish the
@@ -2432,6 +3085,7 @@ class RoastStore:
             if row is None:
                 raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def set_ambient(
         self,
         run_id: str,
@@ -2476,10 +3130,11 @@ class RoastStore:
             " WHERE id = ?",
             (temperature_c, humidity_percent, pressure_hpa, _utc_now(), run_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_event(
         self,
         *,
@@ -2504,8 +3159,9 @@ class RoastStore:
                 None if payload is None else json.dumps(payload, sort_keys=True),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_telemetry(
         self,
         *,
@@ -2593,11 +3249,12 @@ class RoastStore:
                 raw_state_json,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         self._last_telemetry_elapsed[run_id] = elapsed_seconds
         self._last_telemetry_d96_state[run_id] = d96_state
         return True
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_safety_evaluation(
         self,
         *,
@@ -2625,11 +3282,12 @@ class RoastStore:
                 _utc_now(),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.lastrowid is None:  # pragma: no cover — SQLite guarantees it
             raise RuntimeError("INSERT into safety_evaluations returned no lastrowid")
         return cursor.lastrowid
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_advisor_decision(
         self,
         *,
@@ -2666,8 +3324,9 @@ class RoastStore:
                 _utc_now(),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_command(
         self,
         *,
@@ -2698,7 +3357,7 @@ class RoastStore:
                 _utc_now(),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
     async def record_fault_control_evaluation(
         self, *, run_id: str, evaluation: SafetyEvaluation
@@ -2733,6 +3392,7 @@ class RoastStore:
             safety_evaluation_id=safety_evaluation_id,
         )
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def record_operator_action(
         self,
         *,
@@ -2754,8 +3414,9 @@ class RoastStore:
                 _utc_now(),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def begin_fault_acknowledgement_confirmation(self, run_id: str) -> int:
         """Persist a revocable acknowledgement-confirmation audit candidate.
 
@@ -2776,11 +3437,12 @@ class RoastStore:
                 _utc_now(),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         action_id = cursor.lastrowid
         assert action_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
         return int(action_id)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def resolve_fault_acknowledgement_confirmation(
         self, action_id: int, *, confirmed: bool
     ) -> bool:
@@ -2804,9 +3466,10 @@ class RoastStore:
                 json.dumps({"fault_acknowledgement": "confirmed"}, sort_keys=True),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def begin_fault_controls_acknowledgement_event(self, run_id: str, generation: int) -> int:
         """Persist a revocable candidate for one fault-lease close event.
 
@@ -2834,11 +3497,12 @@ class RoastStore:
                 ),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         event_id = cursor.lastrowid
         assert event_id is not None  # pragma: no cover - SQLite assigns INTEGER PRIMARY KEY
         return int(event_id)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def resolve_fault_controls_acknowledgement_event(
         self, event_id: int, *, generation: int, confirmed: bool
     ) -> bool:
@@ -2875,7 +3539,7 @@ class RoastStore:
                 confirmed_payload,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount == 1
 
     @staticmethod
@@ -2890,6 +3554,7 @@ class RoastStore:
         converted = float(cast("float", value))
         return converted if math.isfinite(converted) else None
 
+    @_bounded(_StorageAccess.READ)
     async def read_first_executed_drop_event(self, run_id: str) -> DropEventAnchor | None:
         """Read the first durably recorded executed ``drop_beans`` event.
 
@@ -2918,6 +3583,7 @@ class RoastStore:
             ]
         return select_first_executed_drop_event(rows)
 
+    @_bounded(_StorageAccess.READ)
     async def read_drop_event_recorded_at(self, run_id: str) -> str | None:
         """Read the first executed ``drop_beans`` event timestamp for a run.
 
@@ -2931,6 +3597,7 @@ class RoastStore:
         anchor = await self.read_first_executed_drop_event(run_id)
         return None if anchor is None else anchor.recorded_at_utc
 
+    @_bounded(_StorageAccess.READ)
     async def read_termination(self, run_id: str) -> RunTermination:
         """Classify persisted abnormal-termination evidence without writing.
 
@@ -2980,6 +3647,7 @@ class RoastStore:
             emergency_stop_recorded_at_utc=emergency_stop_recorded_at_utc,
         )
 
+    @_bounded(_StorageAccess.READ)
     async def read_drop_reading(self, run_id: str) -> DropReading | None:
         """Read a complete authoritative drop temperature and DTR for a run.
 
@@ -3053,6 +3721,7 @@ class RoastStore:
 
     # --- E6-S3: recovery reads, run completion, immutability exceptions ---
 
+    @_bounded(_StorageAccess.READ)
     async def read_latest_run(self) -> PersistedRun | None:
         """The startup recovery read (orchestration plan § Persistence):
         the most recent run with its last persisted phase. None on a
@@ -3084,6 +3753,7 @@ class RoastStore:
             frozen_config=FrozenRunConfig.model_validate_json(str(row["config_json"])),
         )
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def complete_run(
         self,
         *,
@@ -3112,10 +3782,11 @@ class RoastStore:
                 run_id,
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def finalize_stale_faulted_run(self, run_id: str) -> None:
         """Terminally finalise a prior-session unfinalised FAULTED run (#331).
 
@@ -3148,10 +3819,11 @@ class RoastStore:
             " AND agent_phase = ?",
             (now, now, run_id, RoastPhase.FAULTED.value),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no unfinalized FAULTED roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def finalize_orphaned_run(self, run_id: str, *, recency_window_seconds: float) -> None:
         """Terminally finalise an operator-cleared STALE run (#525), or raise.
 
@@ -3300,7 +3972,7 @@ class RoastStore:
             " )",
             (now, now, run_id, threshold, threshold),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             # Disambiguate: already finalized / unknown id (RuntimeError) vs.
             # blocked by guard (c)'s recency check — either clause 2a or 2b
@@ -3317,6 +3989,7 @@ class RoastStore:
                 f"{effective_window_seconds:.0f}s — some process is actively driving it"
             )
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def set_operator_rating(
         self, run_id: str, *, rating: Literal[1, 2, 3, 4, 5], notes: str | None = None
     ) -> None:
@@ -3329,10 +4002,11 @@ class RoastStore:
             " updated_at_utc = ? WHERE id = ? AND completed_at_utc IS NOT NULL",
             (rating, notes, _utc_now(), run_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def set_roasted_weight(self, run_id: str, *, roasted_weight_grams: float) -> None:
         """Operator-entered roasted-out weight (#388) — completed runs only.
 
@@ -3370,10 +4044,11 @@ class RoastStore:
             "   json_extract(profile_json, '$.bean_weight_grams'))",
             (roasted_weight_grams, _utc_now(), run_id, roasted_weight_grams),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             await self._raise_disambiguated_weight_error(run_id)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def set_corrected_charge(self, run_id: str, *, corrected_charge_grams: float) -> None:
         """Operator-entered CHARGE-weight correction (#520) — completed runs only.
 
@@ -3409,7 +4084,7 @@ class RoastStore:
             " AND (roasted_weight_grams IS NULL OR ? >= roasted_weight_grams)",
             (corrected_charge_grams, _utc_now(), run_id, corrected_charge_grams),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             await self._raise_disambiguated_weight_error(run_id)
 
@@ -3438,6 +4113,7 @@ class RoastStore:
             f"the run's current roasted/charge weights"
         )
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def set_run_excluded(self, run_id: str, *, excluded: bool) -> None:
         """Soft-exclude (or restore) a completed run from history/corpus (#582).
 
@@ -3465,10 +4141,11 @@ class RoastStore:
             " WHERE id = ? AND completed_at_utc IS NOT NULL",
             (1 if excluded else 0, _utc_now(), run_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise RuntimeError(f"no completed roast_run with id {run_id!r}")
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def add_tasting(
         self,
         run_id: str,
@@ -3532,7 +4209,7 @@ class RoastStore:
                 json.dumps(defects or [], sort_keys=True),
             ),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         tasting_id = cursor.lastrowid
         assert tasting_id is not None  # pragma: no cover — AUTOINCREMENT always assigns one
         return RoastTasting(
@@ -3547,6 +4224,7 @@ class RoastStore:
             defects=list(defects) if defects else [],
         )
 
+    @_bounded(_StorageAccess.READ)
     async def list_tastings(self, run_id: str) -> list[RoastTasting]:
         """Every tasting entry for a run, oldest first (#522) — the natural
         revisit order (first taste, then any later refinement). Empty list for a
@@ -3591,6 +4269,7 @@ class RoastStore:
     # with the schema it reads, and the store already owns every other
     # persistence concern (writes, recovery reads, immutability).
 
+    @_bounded(_StorageAccess.READ)
     async def active_run(self) -> PersistedRun | None:
         """The current in-progress run, or ``None``.
 
@@ -3619,6 +4298,7 @@ class RoastStore:
             profile=RoastProfile.model_validate_json(str(row["profile_json"])),
         )
 
+    @_bounded(_StorageAccess.READ)
     async def list_runs(self) -> list[RoastSummary]:
         """The roast history list (plan §6): newest first.
 
@@ -3768,6 +4448,7 @@ class RoastStore:
             )
         return summaries
 
+    @_bounded(_StorageAccess.READ)
     async def read_run(self, run_id: str) -> RoastDetail | None:
         """Run detail (plan §6): profile, phase, outcome, export manifest.
         ``None`` when no run has that id.
@@ -3824,6 +4505,7 @@ class RoastStore:
             excluded=bool(row["excluded"]),
         )
 
+    @_bounded(_StorageAccess.READ)
     async def read_telemetry_points(
         self, run_id: str, *, downsample: int = 1
     ) -> list[TelemetryPoint]:
@@ -3884,6 +4566,7 @@ class RoastStore:
             for row in sampled
         ]
 
+    @_bounded(_StorageAccess.READ)
     async def read_timeline(self, run_id: str) -> RoastTimeline:
         """The decision trace (plan §6): roast events, safety verdicts,
         advisor decisions, and the command trail, each insertion-ordered.
@@ -4070,6 +4753,7 @@ class RoastStore:
                 ranked.append(str(row["id"]))
         return ranked
 
+    @_bounded(_StorageAccess.READ)
     async def find_reference_run(
         self,
         origin_slug: str,
@@ -4291,6 +4975,7 @@ class RoastStore:
             curve=curve,
         )
 
+    @_bounded(_StorageAccess.READ)
     async def load_reference_roast(
         self,
         origin_slug: str,
@@ -4366,6 +5051,7 @@ class RoastStore:
     # archive (``archived = 1``), never a hard DELETE, so a profile referenced by
     # a past roast's notes is never dangling.
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def expire_bean_sourcing_drafts(self, *, now_utc: str | None = None) -> int:
         """Clear expired, unclaimed draft snapshots while retaining metrics.
 
@@ -4382,9 +5068,10 @@ class RoastStore:
             " AND draft_snapshot_json IS NOT NULL AND claim_expires_at_utc <= ?",
             (now,),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def clear_unclaimed_bean_sourcing_drafts(self, *, owner_instance_id: str) -> int:
         """Clear one service owner's unclaimed drafts during orderly shutdown.
 
@@ -4403,9 +5090,10 @@ class RoastStore:
             " AND draft_snapshot_json IS NOT NULL AND owner_instance_id = ?",
             (owner_instance_id,),
         )
-        await self._connection.commit()
+        await self._commit_connection(self._connection)
         return cursor.rowcount
 
+    @_bounded(_StorageAccess.READ)
     async def next_bean_sourcing_expiry(self) -> str | None:
         """Return the earliest unclaimed draft expiry, if one exists."""
         async with self.connection.execute(
@@ -4418,6 +5106,7 @@ class RoastStore:
             return None
         return str(row["expires_at"])
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def start_bean_sourcing_attempt(
         self,
         *,
@@ -4436,7 +5125,7 @@ class RoastStore:
         confirmation_cutoff = (
             datetime.fromisoformat(started) - _BEAN_SOURCING_LEASE_CONFIRMATION
         ).isoformat()
-        admission_connection = await aiosqlite.connect(self._db_path)
+        admission_connection = await self._open_connection(writer=True)
         try:
             await admission_connection.execute("PRAGMA busy_timeout=500")
             await admission_connection.execute("BEGIN IMMEDIATE")
@@ -4474,14 +5163,15 @@ class RoastStore:
                     lease_expires,
                 ),
             )
-            await admission_connection.commit()
+            await self._commit_connection(admission_connection)
         except BaseException:
-            await admission_connection.rollback()
+            await self._rollback_connection(admission_connection)
             raise
         finally:
-            await admission_connection.close()
+            await self._close_connection(admission_connection)
         return attempt_id
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def reconcile_interrupted_bean_sourcing_attempts(
         self,
         *,
@@ -4515,9 +5205,10 @@ class RoastStore:
             " AND lease_expired_observed_at_utc IS NULL",
             (completed, lease_deadline),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def renew_bean_sourcing_attempt_lease(
         self,
         attempt_id: str,
@@ -4528,7 +5219,7 @@ class RoastStore:
         """Extend a live attempt lease only for its owning service instance."""
         renewed = renewed_at_utc or _utc_now()
         expires = (datetime.fromisoformat(renewed) + _BEAN_SOURCING_LEASE_DURATION).isoformat()
-        lease_connection = await aiosqlite.connect(self._db_path)
+        lease_connection = await self._open_connection(writer=True)
         try:
             await lease_connection.execute("PRAGMA busy_timeout=500")
             cursor = await lease_connection.execute(
@@ -4537,14 +5228,15 @@ class RoastStore:
                 " WHERE id = ? AND owner_instance_id = ? AND outcome = 'in_progress'",
                 (expires, attempt_id, owner_instance_id),
             )
-            await lease_connection.commit()
+            await self._commit_connection(lease_connection)
             return cursor.rowcount == 1
         except BaseException:
-            await lease_connection.rollback()
+            await self._rollback_connection(lease_connection)
             raise
         finally:
-            await lease_connection.close()
+            await self._close_connection(lease_connection)
 
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
     async def finish_bean_sourcing_attempt(
         self,
         attempt_id: str,
@@ -4604,7 +5296,7 @@ class RoastStore:
             estimated_count = sum(
                 value == "origin_estimated" for value in draft.field_sources.values()
             )
-        finish_connection = await aiosqlite.connect(self._db_path)
+        finish_connection = await self._open_connection(writer=True)
         try:
             await finish_connection.execute("PRAGMA busy_timeout=500")
             await finish_connection.execute("BEGIN IMMEDIATE")
@@ -4634,13 +5326,14 @@ class RoastStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"bean-sourcing attempt {attempt_id} was not in progress")
-            await finish_connection.commit()
+            await self._commit_connection(finish_connection)
         except BaseException:
-            await finish_connection.rollback()
+            await self._rollback_connection(finish_connection)
             raise
         finally:
-            await finish_connection.close()
+            await self._close_connection(finish_connection)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def create_bean_profile(
         self,
         profile_input: BeanProfileInput,
@@ -4674,13 +5367,13 @@ class RoastStore:
                     " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
                     (profile.id, profile.name, profile.model_dump_json(), now, now),
                 )
-                await self.connection.commit()
+                await self._commit_connection(self.connection)
                 return profile
 
             # A dedicated connection owns this transaction. The main store
             # connection also serves the periodic expiry task; sharing it here
             # would let an unrelated commit split the claim transaction.
-            claim_connection = await aiosqlite.connect(self._db_path)
+            claim_connection = await self._open_connection(writer=True)
             claim_connection.row_factory = aiosqlite.Row
             try:
                 await claim_connection.execute("PRAGMA foreign_keys=ON")
@@ -4709,7 +5402,7 @@ class RoastStore:
                     saved_profile = BeanProfile.model_validate_json(str(saved_row["profile_json"]))
                     saved_input = BeanProfileInput.model_validate(saved_profile.model_dump())
                     if saved_input == profile_input:
-                        await claim_connection.rollback()
+                        await self._rollback_connection(claim_connection)
                         return saved_profile
                     raise BeanDraftAttemptAlreadyClaimedError(
                         "draft attempt was already saved with different profile values"
@@ -4743,14 +5436,15 @@ class RoastStore:
                 )
                 if claim.rowcount != 1:  # pragma: no cover - lock + transaction defence
                     raise BeanDraftAttemptClaimError("draft attempt was already saved")
-                await claim_connection.commit()
+                await self._commit_connection(claim_connection)
             except BaseException:
-                await claim_connection.rollback()
+                await self._rollback_connection(claim_connection)
                 raise
             finally:
-                await claim_connection.close()
+                await self._close_connection(claim_connection)
             return profile
 
+    @_bounded(_StorageAccess.READ)
     async def list_bean_profiles(self) -> list[BeanProfile]:
         """The active (non-archived) saved profiles, name-ordered (#303).
 
@@ -4765,6 +5459,7 @@ class RoastStore:
             rows = await cursor.fetchall()
         return [BeanProfile.model_validate_json(str(row["profile_json"])) for row in rows]
 
+    @_bounded(_StorageAccess.READ)
     async def catalogue_ranking_axes(
         self,
     ) -> tuple[
@@ -4816,6 +5511,7 @@ class RoastStore:
         ]
         return profile_axes, rated_pairs
 
+    @_bounded(_StorageAccess.READ)
     async def get_bean_profile(self, profile_id: str) -> BeanProfile | None:
         """One active saved profile by id, or ``None`` (unknown or archived)."""
         async with self.connection.execute(
@@ -4827,6 +5523,7 @@ class RoastStore:
             return None
         return BeanProfile.model_validate_json(str(row["profile_json"]))
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def update_bean_profile(
         self, profile_id: str, profile_input: BeanProfileInput
     ) -> BeanProfile:
@@ -4861,7 +5558,7 @@ class RoastStore:
             " WHERE id = ? AND archived = 0",
             (updated.name, updated.model_dump_json(), now, profile_id),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             # TOCTOU: the profile was archived (or deleted) between the
             # get_bean_profile() read above and this UPDATE, so the
@@ -4871,6 +5568,7 @@ class RoastStore:
             raise BeanProfileNotFoundError(profile_id)
         return updated
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def delete_bean_profile(self, profile_id: str) -> None:
         """Soft-delete (archive) a saved profile (#303).
 
@@ -4896,10 +5594,11 @@ class RoastStore:
             "UPDATE bean_profiles SET archived = 1 WHERE id = ? AND archived = 0",
             (profile_id,),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         if cursor.rowcount == 0:
             raise BeanProfileNotFoundError(profile_id)
 
+    @_bounded(_StorageAccess.SHARED_WRITE)
     async def seed_bean_profile(self, seed: BeanProfile) -> bool:
         """Idempotently insert a built-in seed profile by its fixed id (#303).
 
@@ -4921,7 +5620,7 @@ class RoastStore:
             " created_at_utc, updated_at_utc) VALUES (?, ?, ?, 0, ?, ?)",
             (seed.id, seed.name, seed.model_dump_json(), seed.created_at, seed.updated_at),
         )
-        await self.connection.commit()
+        await self._commit_connection(self.connection)
         return cursor.rowcount > 0
 
 
