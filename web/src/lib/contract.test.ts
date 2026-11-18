@@ -278,16 +278,16 @@ describe("HUMAN protection wire contract", () => {
     const empty = {
       human_endpoint: null,
       human_command_disposition: null,
-      human_history_durability: null,
       physical_intervention_required: null,
       emergency_fallback_disclosure: null,
     };
-    expect(rest.roast_detail).toMatchObject(empty);
+    const wireEmpty = { ...empty, human_history_durability: null };
+    expect(rest.roast_detail).toMatchObject(wireEmpty);
     expect(readHumanProtection(rest.roast_detail)).toEqual(empty);
     expect(readHumanProtection({})).toBeUndefined();
     const heartbeat = frame("heartbeat");
     expect(heartbeat.id).toBeNull();
-    expect(heartbeat.data).toEqual({ run_id: "contract-run", ...empty } satisfies HumanProtectionHeartbeat);
+    expect(heartbeat.data).toEqual({ run_id: "contract-run", ...wireEmpty } satisfies HumanProtectionHeartbeat);
     expect(readHumanProtection(heartbeat.data)).toEqual(empty);
   });
 });

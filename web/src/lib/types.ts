@@ -779,7 +779,7 @@ export type HumanHistoryDurability =
 export interface HumanProtectionProjection {
   human_endpoint: HumanEndpointProjection | null;
   human_command_disposition: HumanCommandProjection | null;
-  human_history_durability: HumanHistoryDurability | null;
+  human_history_durability?: HumanHistoryDurability | null;
   physical_intervention_required: boolean | null;
   emergency_fallback_disclosure: string | null;
 }
