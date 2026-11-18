@@ -11239,6 +11239,7 @@ async def test_human_dedicated_safety_write_classifies_rollback_and_readback(
     fault: str,
 ) -> None:
     run_id = "recovered-run"
+    lease: FaultControlLease | None = None
     if operation == "closure-only":
         store = tmp_store
         process_id = "closure-process"
@@ -11249,12 +11250,6 @@ async def test_human_dedicated_safety_write_classifies_rollback_and_readback(
         lease = await _closed_recovered_lease(store, run_id=run_id, generation=32)
         action = OperatorAction.END_RECOVERED_RUN
         kind = "end_closure_only_recovered_run"
-
-        async def write() -> bool:
-            return await store.end_closure_only_recovered_run(
-                process_id=process_id, run_id=run_id, expected_lease=lease
-            )
-
     else:
         store = await _d220_store_with_unclean_epoch(tmp_path, "bounded-safety-record")
         process_id = "d220-process"
@@ -11265,10 +11260,15 @@ async def test_human_dedicated_safety_write_classifies_rollback_and_readback(
         action = OperatorAction.INITIALIZE_SAFETY_RECORD
         kind = "initialize_missing_fault_control_safety_record"
 
-        async def write() -> bool:
-            return await store.initialize_missing_fault_control_safety_record(
-                process_id=process_id, generation=1, operation_id="bounded-operation"
+    async def write() -> bool:
+        if operation == "closure-only":
+            assert lease is not None
+            return await store.end_closure_only_recovered_run(
+                process_id=process_id, run_id=run_id, expected_lease=lease
             )
+        return await store.initialize_missing_fault_control_safety_record(
+            process_id=process_id, generation=1, operation_id="bounded-operation"
+        )
 
     store.enable_human_storage(FakeClock(), 1.0)
     original_commit = store._commit_connection  # pyright: ignore[reportPrivateUsage]
