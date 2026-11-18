@@ -1218,6 +1218,7 @@ class RoastRunner:
         self._completion_persistence_initiated = False
         self._completion_storage_uncertain = False
         self._history_turn_in_progress = False
+        self._confirmed_start_history_cancelled = False
         if controller.authority is ControlAuthority.HUMAN:
             store.enable_human_storage(clock, config.controller.tick_interval_seconds)
             emitter.bound_history_buffer(self._note_unwritten_event)
@@ -1289,12 +1290,23 @@ class RoastRunner:
                 counter.
         """
         await self._controller.start_run(profile, recording_roast_num=recording_roast_num)
-        events_persisted = await self._flush_events()
-        if self._controller.authority is ControlAuthority.HUMAN and not events_persisted:
-            raise HistoryUnavailable("HUMAN Start event history is unavailable")
-        await self._persist_phase_if_changed()
+        try:
+            events_persisted = await self._flush_events()
+            if self._controller.authority is ControlAuthority.HUMAN and not events_persisted:
+                raise HistoryUnavailable("HUMAN Start event history is unavailable")
+            await self._persist_phase_if_changed()
+        except asyncio.CancelledError:
+            if self._controller.owns_confirmed_human_start():
+                self._controller.inhibit_human_routine_for_storage_failure()
+                self._confirmed_start_history_cancelled = True
+            raise
         if self._controller.authority is ControlAuthority.HUMAN:
             self._store.note_human_history_pass(self._run_id)
+
+    @property
+    def confirmed_start_history_cancelled(self) -> bool:
+        """Whether caller cancellation interrupted this confirmed Start's history."""
+        return self._confirmed_start_history_cancelled
 
     async def recover(
         self,
@@ -6824,6 +6836,12 @@ class RoastService:
             await runner.start(profile, recording_roast_num=recording_roast_num)
         except HistoryUnavailable:
             if start_history_refused:
+                self._supervise_current_failed_human_start(runner, run_id)
+            raise
+        except asyncio.CancelledError:
+            if runner.confirmed_start_history_cancelled:
+                # The ordinary turn handles the pending storage failure
+                # after urgent evaluation, under current run ownership.
                 self._supervise_current_failed_human_start(runner, run_id)
             raise
         # A later successful flush records the fault. It cannot confirm a

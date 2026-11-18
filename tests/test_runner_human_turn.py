@@ -5729,6 +5729,149 @@ async def test_human_start_storage_refusal_remains_unavailable_after_native_writ
 
 
 @pytest.mark.parametrize("teardown", [False, True], ids=["keep-supervision", "teardown-fenced"])
+async def test_cancelled_confirmed_start_history_hands_recovery_to_current_supervisor(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, teardown: bool
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    commit = store.connection.commit
+    entered, release = asyncio.Event(), asyncio.Event()
+    supervised, allow_turn, recovered, finish = (asyncio.Event() for _ in range(4))
+    supervisors: list[RoastRunner] = []
+
+    async def hold_start_audit() -> None:
+        owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
+        if owner is not None and owner.receipt.kind == "record_event" and not entered.is_set():
+            entered.set()
+            await release.wait()
+        await commit()
+
+    async def supervise(runner: RoastRunner) -> None:
+        supervisors.append(runner)
+        assert runner is service.runner and runner.run_id == service.active_run_id
+        supervised.set()
+        await allow_turn.wait()
+        assert not await runner.tick_once()
+        recovered.set()
+        await finish.wait()
+
+    monkeypatch.setattr(store.connection, "commit", hold_start_audit)
+    monkeypatch.setattr(service, "_run_loop", True)
+    monkeypatch.setattr(RoastRunner, "run", supervise)
+    lease = await store.read_fault_control_lease()
+    request = asyncio.create_task(service.start_roast(PROFILE))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        assert actuator.commands() == ["start_session"]
+        runner = service.runner
+        assert runner is not None and runner.run_id == service.active_run_id
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None and controller.owns_confirmed_human_start()
+        identity = controller._known_human_identity()  # pyright: ignore[reportPrivateUsage]
+        assert identity == (actuator.session_id, actuator.epoch)
+        if teardown:
+            service.close_human_call_admission(AdmissionCloseReason.APPLICATION_TEARDOWN)
+
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert request.cancelled()
+        assert controller.phase is RoastPhase.PREHEATING
+        assert controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+        assert controller.owns_human_run(runner.run_id) and controller.owns_confirmed_human_start()
+        assert controller._known_human_identity() == identity  # pyright: ignore[reportPrivateUsage]
+        assert not release.is_set() and not store.human_storage_quiescent
+        (pending,) = [
+            r
+            for r in store.drain_human_storage_receipts()
+            if r.kind == "record_event" and r.settlement is Settlement.UNRESOLVED
+        ]
+        assert pending.run_id == runner.run_id and pending.writer_entered is True
+        assert pending.timely is False
+
+        supervisor = service._loop_task  # pyright: ignore[reportPrivateUsage]
+        if teardown:
+            assert supervisor is None
+            await asyncio.sleep(0)
+            assert supervisors == []
+        else:
+            assert supervisor is not None and not supervisor.done()
+            await asyncio.wait_for(supervised.wait(), 1)
+            assert supervisors == [runner]
+        assert actuator.commands() == ["start_session"]
+
+        release.set()
+        assert await store.settle_human_storage_for_teardown()
+        (settled,) = [r for r in store.drain_human_storage_receipts() if r.token == pending.token]
+        assert settled.settlement is Settlement.OBSERVED_COMMITTED and settled.timely is False
+        assert await store.read_fault_control_lease() == lease
+        if not teardown:
+            clock.advance(0.25)
+            allow_turn.set()
+            await asyncio.wait_for(recovered.wait(), 1)
+            assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            persisted = await store.active_run()
+            assert persisted is not None and persisted.run_id == runner.run_id
+            assert persisted.agent_phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            assert controller._known_human_identity() == identity  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(RoastRunConflictError):
+            await service.start_roast(PROFILE)
+        assert service._loop_task is supervisor  # pyright: ignore[reportPrivateUsage]
+        assert actuator.commands() == ["start_session"]
+    finally:
+        release.set()
+        allow_turn.set()
+        finish.set()
+        if not request.done():
+            request.cancel()
+            with suppress(asyncio.CancelledError):
+                await request
+        await store.settle_human_storage_for_teardown()
+        await service.shutdown()
+
+
+async def test_start_adapter_cancellation_without_confirmation_does_not_start_supervisor(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    entered = asyncio.Event()
+    start_session = actuator.start_session
+
+    async def pending_start(
+        *, recording_origin: str | None = None, recording_roast_num: int | None = None
+    ) -> None:
+        await start_session(
+            recording_origin=recording_origin, recording_roast_num=recording_roast_num
+        )
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(actuator, "start_session", pending_start)
+    monkeypatch.setattr(service, "_run_loop", True)
+    request = asyncio.create_task(service.start_roast(PROFILE))
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        runner = service.runner
+        assert runner is not None and runner.run_id == service.active_run_id
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None and not controller.owns_confirmed_human_start()
+        assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
+        assert actuator.commands() == ["start_session"]
+    finally:
+        if not request.done():
+            request.cancel()
+            with suppress(asyncio.CancelledError):
+                await request
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("teardown", [False, True], ids=["keep-supervision", "teardown-fenced"])
 async def test_cancelled_confirmed_start_containment_keeps_only_current_supervision(
     store: RoastStore, monkeypatch: pytest.MonkeyPatch, teardown: bool
 ) -> None:
