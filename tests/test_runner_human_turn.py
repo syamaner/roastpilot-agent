@@ -49,6 +49,7 @@ from roastpilot_agent.human_protection import (
     ContainmentResult,
     ControlAuthority,
     EndpointDisposition,
+    EndpointOwner,
     HumanReadEvidence,
     RawTemperature,
     ReadingFreshness,
@@ -2030,6 +2031,199 @@ async def _faulted_run(
     )
     actuator.calls.clear()
     return service, runner, actuator, run.id, lease
+
+
+@pytest.mark.parametrize(
+    "owner", [EndpointOwner.OPERATOR, EndpointOwner.OPERATOR_RECOVERY, EndpointOwner.FAULT_CONTROL]
+)
+async def test_admitted_human_drop_ignores_optional_attribution_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, owner: EndpointOwner
+) -> None:
+    fault_route = owner is EndpointOwner.FAULT_CONTROL
+    exact_actuator: _ExactFaultRunner | None = None
+    lease: FaultControlLease | None = None
+    if fault_route:
+        service, runner, exact_actuator, run_id, lease = await _faulted_run(store)
+        assert lease is not None
+        actuator = exact_actuator
+    else:
+        actuator = _RunnerRoaster(FakeClock(), [])
+        service = _service(store, actuator.clock, actuator, exact_child=True)
+        run_id = (await service.start_roast(PROFILE)).id
+        await _charge_live_runner(service, actuator, actuator.clock)
+        live_runner = service.runner
+        assert live_runner is not None
+        runner = live_runner
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    if owner is EndpointOwner.OPERATOR_RECOVERY:
+        controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    run_state = controller._human_run  # pyright: ignore[reportPrivateUsage]
+    assert run_state is not None
+    original_evaluation = store.record_safety_evaluation
+    evaluation_rule = (
+        "command_phase_validity" if owner is EndpointOwner.OPERATOR else "human_recovery_drop"
+    )
+    confirmed_evaluations: list[int] = []
+    attribution_attempts: list[
+        tuple[EndpointOwner | None, EndpointDisposition, CommandAuditOwner]
+    ] = []
+    port_entries: list[tuple[EndpointOwner | None, EndpointDisposition, tuple[int, ...]]] = []
+
+    async def record_evaluation(*, run_id: str, tick: int, evaluation: SafetyEvaluation) -> int:
+        audit_id = await original_evaluation(run_id=run_id, tick=tick, evaluation=evaluation)
+        if evaluation.rule == evaluation_rule and evaluation.verdict is SafetyVerdict.ALLOW:
+            confirmed_evaluations.append(audit_id)
+        return audit_id
+
+    def unavailable_attribution(_generation: int, *, owner: CommandAuditOwner) -> None:
+        attribution_attempts.append((run_state.endpoint_owner, run_state.endpoint, owner))
+        raise RuntimeError("optional Drop attribution unavailable")
+
+    def observe_port() -> None:
+        port_entries.append(
+            (run_state.endpoint_owner, run_state.endpoint, tuple(confirmed_evaluations))
+        )
+
+    if exact_actuator is None:
+        original_drop = actuator.drop_beans
+
+        async def drop() -> AppliedRoasterState | None:
+            observe_port()
+            return await original_drop()
+
+        monkeypatch.setattr(actuator, "drop_beans", drop)
+    else:
+        original_exact_write = exact_actuator.write_fault_control
+
+        async def exact_write(action: OperatorAction, *, expected_session_id: str) -> None:
+            observe_port()
+            await original_exact_write(action, expected_session_id=expected_session_id)
+
+        monkeypatch.setattr(exact_actuator, "write_fault_control", exact_write)
+    monkeypatch.setattr(store, "record_safety_evaluation", record_evaluation)
+    monkeypatch.setattr(controller, "_new_history_command", unavailable_attribution)
+    store.drain_human_storage_receipts()
+
+    try:
+        result = await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+        )
+        assert result.queued is not fault_route
+        if result.queued:
+            assert result.result == "accepted"
+            actuator.clock.advance(0.25)
+            assert not await runner.tick_once()
+        assert attribution_attempts == [
+            (owner, EndpointDisposition.ADMITTED, CommandAuditOwner.ENDPOINT)
+        ]
+        ((actual_owner, disposition, persisted_evaluations),) = port_entries
+        assert actual_owner is owner and disposition is EndpointDisposition.IN_FLIGHT
+        assert persisted_evaluations
+        assert result.result == "accepted"
+        snapshot = controller.snapshot()
+        assert snapshot.human_endpoint is EndpointDisposition.ISSUED
+        assert snapshot.human_command_disposition is CommandDisposition.SETTLED
+        assert snapshot.phase is (RoastPhase.FAULTED if fault_route else RoastPhase.COOLING)
+        if exact_actuator is None:
+            assert actuator.commands().count("drop_beans") == 1
+        else:
+            assert (
+                result.reason == "fault action accepted through exact-session controller dispatch"
+            )
+            assert exact_actuator.fault_writes == [OperatorAction.DROP_BEANS]
+            assert exact_actuator.fault_reads == [actuator.session_id] * 2
+            assert not controller.has_pending_fault_drop_readback()
+            assert lease is not None and await store.read_fault_control_lease() == lease
+
+        (receipt,) = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind == "record_command" and receipt.detail == RoastCommand.DROP_BEANS.value
+        ]
+        assert receipt.run_id == run_id and receipt.command is None
+        assert receipt.settlement is Settlement.OBSERVED_COMMITTED
+        timeline = await store.read_timeline(run_id)
+        (command,) = [
+            command for command in timeline.commands if command.tool is RoastCommand.DROP_BEANS
+        ]
+        assert command.status == "ok"
+        if fault_route:
+            assert command.result is not None and command.result["confirmation"] == "read_back"
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("action", [OperatorAction.START_COOLING, OperatorAction.STOP_COOLING])
+async def test_exact_cooling_ignores_optional_attribution_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, action: OperatorAction
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    actuator.cooling = action is OperatorAction.STOP_COOLING
+    original_evaluation = store.record_fault_control_evaluation
+    original_write = actuator.write_fault_control
+    original_read = actuator.read_fault_control_state
+    attribution = Mock(side_effect=RuntimeError("optional cooling attribution unavailable"))
+    trace: list[str] = []
+    durable_admission: list[int] = []
+
+    async def record_evaluation(*, run_id: str, evaluation: SafetyEvaluation) -> int:
+        assert evaluation.verdict is SafetyVerdict.ALLOW
+        audit_id = await original_evaluation(run_id=run_id, evaluation=evaluation)
+        durable_admission.append(audit_id)
+        trace.append("evaluated")
+        return audit_id
+
+    async def read(session_id: str) -> FaultControlState:
+        assert session_id == lease.mcp_session_id == actuator.session_id
+        trace.append("read")
+        return await original_read(session_id)
+
+    async def write(selected: OperatorAction, *, expected_session_id: str) -> None:
+        assert selected is action
+        assert expected_session_id == lease.mcp_session_id
+        assert trace[-2:] == ["evaluated", "read"]
+        trace.append("write")
+        await original_write(selected, expected_session_id=expected_session_id)
+
+    monkeypatch.setattr(controller, "human_command_child_generation", attribution)
+    monkeypatch.setattr(store, "record_fault_control_evaluation", record_evaluation)
+    monkeypatch.setattr(actuator, "read_fault_control_state", read)
+    monkeypatch.setattr(actuator, "write_fault_control", write)
+    store.drain_human_storage_receipts()
+
+    try:
+        result = await service.submit_fault_controls_action(
+            FaultControlsActionRequest(action=action)
+        )
+        attribution.assert_called_once_with(run_id, actuator.session_id)
+        assert actuator.fault_writes == [action]
+        before = trace.index("evaluated")
+        assert trace[before : before + 4] == ["evaluated", "read", "write", "read"]
+        assert result.result == "accepted"
+        assert actuator.cooling is (action is OperatorAction.START_COOLING)
+        assert controller.phase is RoastPhase.FAULTED
+        assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
+        assert await store.read_fault_control_lease() == lease
+
+        tool = RoastCommand(action.value)
+        (receipt,) = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind == "record_command" and receipt.detail == tool.value
+        ]
+        assert receipt.run_id == run_id and receipt.command is None
+        assert receipt.settlement is Settlement.OBSERVED_COMMITTED
+        timeline = await store.read_timeline(run_id)
+        (command,) = [command for command in timeline.commands if command.tool is tool]
+        assert command.status == "ok"
+        assert command.result is not None and command.result["confirmation"] == "read_back"
+        assert [command.safety_evaluation_id] == durable_admission
+    finally:
+        await service.shutdown()
 
 
 @pytest.mark.parametrize(
@@ -5081,11 +5275,14 @@ async def test_bounded_prior_turn_telemetry_does_not_take_urgent_authority(
             assert snapshot.human_endpoint is EndpointDisposition.UNKNOWN
             assert snapshot.human_command_disposition is CommandDisposition.UNKNOWN
             assert snapshot.physical_intervention_required
+        if sample in {"audit-failure", "executor-failure"}:
+            endpoint = runner.controller_snapshot().human_endpoint
             release.set()
             assert await store.settle_human_storage_for_teardown()
+            monkeypatch.setattr(actuator, "drop_beans", drop_once)
             clock.advance(0.1)
             assert not await runner.tick_once()
-            assert runner.controller_snapshot().human_endpoint is EndpointDisposition.UNKNOWN
+            assert runner.controller_snapshot().human_endpoint is endpoint
             assert actuator.commands().count("drop_beans") == 1
     finally:
         release.set()

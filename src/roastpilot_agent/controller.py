@@ -1086,7 +1086,9 @@ class FaultControlExecutor:
 
         async def write() -> None:
             if action is not OperatorAction.DROP_BEANS or self._human_drop_controller is None:
-                self._bind_exact_audit_command(run_id, session_id, generation, owner=None)
+                # A diagnostic lookup cannot revoke the arbiter's admission.
+                with contextlib.suppress(Exception):
+                    self._bind_exact_audit_command(run_id, session_id, generation, owner=None)
             await self._port.write_fault_control(action, expected_session_id=session_id)
 
         controller: RoastController | None = None
@@ -4433,15 +4435,12 @@ class RoastController:
 
         async def dispatch() -> AppliedRoasterState | None:
             nonlocal start_utc, started, command
-            # Attribution cannot hold up an already-admitted protective Drop.
-            with (
-                contextlib.suppress(Exception)
-                if owner is EndpointOwner.PROTECTION
-                else contextlib.nullcontext()
-            ):
-                command = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
-            if bind_audit is not None:
-                bind_audit(command)
+            # An admitted Drop can proceed with an unknown audit identity.
+            with contextlib.suppress(Exception):
+                reference = self._new_history_command(generation, owner=CommandAuditOwner.ENDPOINT)
+                if bind_audit is not None:
+                    bind_audit(reference)
+                command = reference
             run.endpoint = EndpointDisposition.IN_FLIGHT
             start_utc = datetime.now(UTC)
             started = self._clock()
