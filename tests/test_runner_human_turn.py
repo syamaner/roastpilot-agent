@@ -24,6 +24,7 @@ from roastpilot_agent.api import (
     RoastService,
     ShutdownHeatOffOutcome,
     _BufferedEvent,  # pyright: ignore[reportPrivateUsage]
+    _DetachedRecoveryLoop,  # pyright: ignore[reportPrivateUsage]
     _FinalisationCloseEvidence,  # pyright: ignore[reportPrivateUsage]
     create_app,
     stream_events,
@@ -6569,6 +6570,198 @@ async def test_later_emergency_retry_supervises_unconfirmed_start_with_failed_hi
             await asyncio.gather(loop, return_exceptions=True)
         assert await store.settle_human_storage_for_teardown()
         await service.shutdown()
+
+
+@pytest.mark.parametrize("cancel_stop", [False, True], ids=["handoff-error", "stop-cancelled"])
+async def test_aborted_later_stop_handoff_retains_exact_deferred_audit_gaps(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, cancel_stop: bool
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    detail = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None and controller.owns_confirmed_human_start()
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    stop_once = actuator.emergency_stop
+    failure = RuntimeError("supervisor scheduling failed")
+    dispatch_callers: list[StorageCaller] = []
+    handoffs: list[RoastRunner] = []
+    release_supervisor = asyncio.Event()
+
+    async def keep_supervisor(current: RoastRunner) -> None:
+        handoffs.append(current)
+        await release_supervisor.wait()
+
+    def hand_off() -> bool:
+        assert controller.has_pending_emergency_stop_retry()
+        assert current_storage_caller() is None
+        if not cancel_stop:
+            raise failure
+        return service._supervise_current_failed_human_start(  # pyright: ignore[reportPrivateUsage]
+            runner, detail.id, after_start=True
+        )
+
+    async def abort_after_stop_entry(*, reason: str) -> AppliedRoasterState | None:
+        caller = current_storage_caller()
+        assert caller is not None
+        dispatch_callers.append(caller)
+        await stop_once(reason=reason)
+        if cancel_stop:
+            raise asyncio.CancelledError
+        raise RuntimeError("stop acknowledgement lost")
+
+    monkeypatch.setattr(service, "_run_loop", True)
+    monkeypatch.setattr(RoastRunner, "run", keep_supervisor)
+    monkeypatch.setattr(actuator, "emergency_stop", abort_after_stop_entry)
+    evaluation_audit = AsyncMock(wraps=store.record_safety_evaluation)
+    command_audit = AsyncMock(wraps=store.record_command)
+    monkeypatch.setattr(store, "record_safety_evaluation", evaluation_audit)
+    monkeypatch.setattr(store, "record_command", command_audit)
+    # Seed the callback here to test positively bound command provenance.
+    # The unconfirmed-Start integration separately exercises its installation.
+    runner.defer_failed_start_supervision(hand_off)
+    store.drain_human_storage_receipts()
+    request = FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+    try:
+        if cancel_stop:
+            with pytest.raises(asyncio.CancelledError):
+                await service.submit_fault_controls_action(request)
+            assert handoffs == [runner]
+            assert service._loop_task is not None  # pyright: ignore[reportPrivateUsage]
+        else:
+            with pytest.raises(RuntimeError) as failed:
+                await service.submit_fault_controls_action(request)
+            assert failed.value is failure
+            assert handoffs == []
+            assert service._loop_task is None  # pyright: ignore[reportPrivateUsage]
+
+        assert controller.phase is RoastPhase.FAULTED
+        assert controller.has_pending_emergency_stop_retry()
+        assert actuator.commands()[-1:] == ["emergency_stop"]
+        assert actuator.commands().count("emergency_stop") == 1
+        evaluation_audit.assert_not_awaited()
+        command_audit.assert_not_awaited()
+        (caller,) = dispatch_callers
+        (failed_event,) = [
+            event for event in emitter.peek() if event.kind is RoastEventKind.COMMAND_FAILED
+        ]
+        command = failed_event.audit_command
+        assert command is not None and command.owner is CommandAuditOwner.LEASE
+        assert (
+            command.session_id == actuator.session_id and command.child_generation == actuator.epoch
+        )
+        assert command.command_generation == controller.command_generation
+        receipts = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind in {"record_safety_evaluation", "record_command"}
+        ]
+        assert [receipt.kind for receipt in receipts] == [
+            "record_safety_evaluation",
+            "record_command",
+        ]
+        assert [receipt.detail for receipt in receipts] == [None, RoastCommand.EMERGENCY_STOP.value]
+        for receipt in receipts:
+            assert receipt.run_id == detail.id == caller.run_id
+            assert receipt.turn is None and receipt.deadline == caller.deadline.expires_at
+            assert (
+                receipt.writer_entered is False
+                and receipt.settlement is Settlement.VERIFIED_NO_WRITE
+            )
+            assert receipt.command is command
+    finally:
+        release_supervisor.set()
+        assert await service.settle_fault_lease_persistence_for_teardown()
+        assert await store.settle_human_storage_for_teardown()
+        await service.shutdown()
+
+
+@pytest.mark.parametrize(
+    "fence",
+    [
+        "loop-disabled",
+        "shutdown",
+        "teardown",
+        "stale-runner",
+        "stale-run",
+        "start-in-flight",
+        "finalized",
+        "duplicate-loop",
+        "detached-loop",
+        "finalization",
+        "stale-owner",
+    ],
+)
+async def test_deferred_emergency_retry_handoff_respects_each_existing_fence(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, fence: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    detail = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None and controller.owns_human_run(detail.id)
+    handoffs: list[RoastRunner] = []
+    parked: asyncio.Task[None] | None = None
+
+    async def unexpected_handoff(current: RoastRunner) -> None:
+        handoffs.append(current)
+
+    async def park_loop() -> None:
+        await asyncio.Future[None]()
+
+    monkeypatch.setattr(RoastRunner, "run", unexpected_handoff)
+    supervisor = service._supervise_current_failed_human_start  # pyright: ignore[reportPrivateUsage]
+    with monkeypatch.context() as guard:
+        guard.setattr(service, "_run_loop", fence != "loop-disabled")
+        if fence == "shutdown":
+            guard.setattr(service, "_shutdown_started", True)
+        elif fence == "teardown":
+            guard.setattr(
+                service._human_admission,  # pyright: ignore[reportPrivateUsage]
+                "_closed_reason",
+                AdmissionCloseReason.APPLICATION_TEARDOWN,
+            )
+        elif fence == "stale-runner":
+            guard.setattr(service, "runner", None)
+        elif fence == "stale-run":
+            guard.setattr(service, "active_run_id", "different-active-run")
+        elif fence == "start-in-flight":
+            guard.setattr(service, "_starting_run_id", detail.id)
+        elif fence == "finalized":
+            guard.setattr(runner, "_finalized", True)
+        elif fence in {"duplicate-loop", "detached-loop"}:
+            parked = asyncio.create_task(park_loop())
+            if fence == "duplicate-loop":
+                guard.setattr(service, "_loop_task", parked)
+            else:
+                guard.setattr(
+                    service, "_detached_recovery_loop", _DetachedRecoveryLoop("old", parked)
+                )
+        elif fence == "finalization":
+            gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+            guard.setattr(gate, "fault_finalization_started", True)
+        elif fence == "stale-owner":
+            owner = controller._human_run  # pyright: ignore[reportPrivateUsage]
+            assert owner is not None
+            guard.setattr(service._human_ownership, "_run", replace(owner))  # pyright: ignore[reportPrivateUsage]
+            assert not controller.owns_human_run(detail.id)
+
+        initial_task = service._loop_task  # pyright: ignore[reportPrivateUsage]
+        try:
+            assert not supervisor(runner, detail.id, after_start=True)
+            assert service._loop_task is initial_task  # pyright: ignore[reportPrivateUsage]
+            assert handoffs == []
+        finally:
+            if parked is not None:
+                parked.cancel()
+                await asyncio.gather(parked, return_exceptions=True)
+            await service.shutdown()
 
 
 async def test_human_start_refused_through_fault_flush_keeps_one_exact_supervisor(

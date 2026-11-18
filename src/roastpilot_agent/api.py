@@ -2057,7 +2057,7 @@ class RoastRunner:
                 await self._persist_deferred_stop_audits(
                     caller, deferred_evaluations, deferred_commands
                 )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, Exception):
             self._note_unentered_stop_audits(caller, deferred_evaluations, deferred_commands)
             raise
         with storage_caller(caller):
