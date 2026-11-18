@@ -891,8 +891,11 @@ async def _finish_live_teardown(
         exit_guard.arm(_residual_task_labels())
         if not store_closed and getattr(store, "human_storage_enabled", False):
             # An unresolved SQLite worker can survive asyncio task cancellation.
-            # Keep the existing process watchdog armed until it terminates serve.
-            await asyncio.Future[None]()
+            # Keep the existing watchdog responsible for exit even if another
+            # graceful signal cancels the live task again.
+            while True:
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.Future[None]()
     if cancelled:
         raise asyncio.CancelledError
 

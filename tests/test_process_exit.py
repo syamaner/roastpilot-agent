@@ -1193,6 +1193,7 @@ def test_human_exit_guard_bounds_unresolved_native_sqlite_work(tmp_path: Path) -
     script = textwrap.dedent(
         """
         import asyncio
+        import os
         import sys
         import threading
         from pathlib import Path
@@ -1247,7 +1248,27 @@ def test_human_exit_guard_bounds_unresolved_native_sqlite_work(tmp_path: Path) -
             connection.commit = blocked_commit
             pending = asyncio.create_task(store.begin_process_restart_clearance("pending-owner"))
             await asyncio.wait_for(entered.wait(), 2)
-            await _finish_live_teardown(Service(), MCP(), store, _LiveExitGuard(grace_seconds=0.25))
+            armed = asyncio.Event()
+
+            class Guard(_LiveExitGuard):
+                def arm(self, task_names=()):
+                    super().arm(task_names)
+                    armed.set()
+
+            teardown = asyncio.create_task(
+                _finish_live_teardown(Service(), MCP(), store, Guard(grace_seconds=0.25))
+            )
+            await asyncio.wait_for(armed.wait(), 2)
+            for _ in range(2):
+                teardown.cancel()
+                await asyncio.sleep(0)
+                if teardown.done():
+                    print("cancellation escaped the armed unresolved-owner wait", flush=True)
+                    # Do not run the deliberately blocked native owner's Python
+                    # finalizers if the containment assertion fails.
+                    os._exit(1)
+                print("watchdog-wait-retained", flush=True)
+            await teardown
             await pending
 
         asyncio.run(main())
@@ -1260,7 +1281,14 @@ def test_human_exit_guard_bounds_unresolved_native_sqlite_work(tmp_path: Path) -
         timeout=15,
         check=False,
     )
-    assert result.returncode == 70, result.stderr
-    assert result.stdout.splitlines() == ["heat-off", "service-stop", "mcp-stop", "child-proof"]
+    assert result.returncode == 70, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        "heat-off",
+        "service-stop",
+        "mcp-stop",
+        "child-proof",
+        "watchdog-wait-retained",
+        "watchdog-wait-retained",
+    ]
     assert "human-storage-begin_process_restart_clearance" in result.stderr
     assert "store.close" in result.stderr
