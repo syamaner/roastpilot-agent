@@ -3409,6 +3409,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
     completion_operations: list[str] = []
     exact_attempts: list[str] = []
     dispatch_order: list[str] = []
+    stop_action_audits: list[tuple[str | None, str, bool]] = []
     admissions = capability_reads = direct_attempts = ack_reads = ack_writes = 0
     audit_failures = confirmations = 0
     dispatch_callbacks: list[object] = []
@@ -3585,7 +3586,7 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             per_run = str(error)
         return cooling.result, cooling.reason, per_run
 
-    async def reject_action_audit(
+    async def record_action_audit(
         *,
         action: str,
         result: Literal["accepted", "rejected", "failed"],
@@ -3593,11 +3594,18 @@ async def test_am5_estop_route_during_owned_human_evaluation(
         payload: object = None,
     ) -> None:
         if action == OperatorAction.EMERGENCY_STOP.value:
-            raise RuntimeError("synthetic operator-action audit failure")
+            storage_busy = (
+                store._history_owner is not None  # pyright: ignore[reportPrivateUsage]
+                or store._history_waiting  # pyright: ignore[reportPrivateUsage]
+            )
+            stop_action_audits.append((run_id, result, storage_busy))
+            if fault == "action_audit_raises":
+                raise RuntimeError("synthetic operator-action audit failure")
         await original_action_audit(action=action, result=result, run_id=run_id, payload=payload)
 
     monkeypatch.setattr(store, "record_safety_evaluation", record)
     monkeypatch.setattr(store, "record_command", record_command)
+    monkeypatch.setattr(store, "record_operator_action", record_action_audit)
     monkeypatch.setattr(actuator, "read_fault_acknowledgement_state", read_ack)
     monkeypatch.setattr(actuator, "stop_cooling_for_fault_acknowledgement", stop_ack)
     monkeypatch.setattr(controller, "settle_human_drop_evaluations", settle)
@@ -3693,8 +3701,6 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             monkeypatch.setattr(service, "runner", narrow)
         if fault == "missing_executor":
             monkeypatch.setattr(service, "_fault_control_executor", None)
-        if fault == "action_audit_raises":
-            monkeypatch.setattr(store, "record_operator_action", reject_action_audit)
         if (route, interval, registry, fault) == ("global", "barrier", "pending", "none"):
             cooling_samples.append(await cooling_sample())
 
@@ -3864,23 +3870,33 @@ async def test_am5_estop_route_during_owned_human_evaluation(
             (run_id, OperatorAction.EMERGENCY_STOP.value),
         ) as cursor:
             rows = [row[0] for row in await cursor.fetchall()]
-        if not isinstance(stopped, OperatorActionResult):
-            assert rows == []
-        elif rows:
-            assert rows == [stopped.result]
+        action_receipts = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.run_id == run_id
+            and receipt.kind == "record_operator_action"
+            and receipt.detail == OperatorAction.EMERGENCY_STOP.value
+        ]
+        if fault == "cancel_http":
+            assert rows == [] and action_receipts == [] and stop_action_audits == []
         else:
-            assert any(
-                receipt.run_id == run_id
-                and receipt.kind == "record_operator_action"
-                and receipt.detail == OperatorAction.EMERGENCY_STOP.value
-                and receipt.settlement
-                is (
+            assert isinstance(stopped, OperatorActionResult)
+            if interval == "none" or missing_binding:
+                assert rows == [stopped.result]
+                assert stop_action_audits == [(run_id, stopped.result, False)]
+            else:
+                assert rows == []
+                ((audit_run, audit_result, storage_busy),) = stop_action_audits
+                assert (audit_run, audit_result) == (run_id, stopped.result)
+                if fault != "action_audit_raises":
+                    assert storage_busy
+                (receipt,) = action_receipts
+                assert receipt.settlement is (
                     Settlement.UNRESOLVED
                     if fault == "action_audit_raises"
                     else Settlement.VERIFIED_NO_WRITE
                 )
-                for receipt in store.drain_human_storage_receipts()
-            )
+                assert receipt.writer_entered is (None if fault == "action_audit_raises" else False)
     latest = await store.read_fault_control_lease()
     assert latest.generation == lease.generation + 1
     if not missing_binding:
@@ -3895,19 +3911,13 @@ async def test_am5_estop_route_during_owned_human_evaluation(
         expected_reason = (
             "stop_unconfirmed" if interval == "proof2" else "superseded_by_emergency_stop"
         )
-        if not any(
-            event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
-            and event.payload is not None
-            and event.payload.get("reason") == expected_reason
+        (acknowledgement,) = [
+            event
             for event in timeline.events
-        ):
-            assert any(
-                receipt.run_id == run_id
-                and receipt.kind == "record_event"
-                and receipt.detail == RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED.value
-                and receipt.settlement is Settlement.VERIFIED_NO_WRITE
-                for receipt in store.drain_human_storage_receipts()
-            )
+            if event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+        ]
+        assert acknowledgement.payload is not None
+        assert acknowledgement.payload.get("reason") == expected_reason
     if cooling_samples:
         assert reservation_after_stop
         assert (

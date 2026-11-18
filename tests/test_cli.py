@@ -2324,7 +2324,14 @@ async def test_human_teardown_dispatches_before_history_and_skips_clean_on_pendi
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["commit_acknowledgement", "verification_refused", "worker_close", "no_marker"]
+    "failure",
+    [
+        "commit_acknowledgement",
+        "verification_refused",
+        "worker_close",
+        "no_marker",
+        "shared_worker_close",
+    ],
 )
 async def test_human_live_teardown_records_exact_final_marker_settlement(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, failure: str
@@ -2333,7 +2340,7 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
     import aiosqlite
 
     from roastpilot_agent.api import RoastService
-    from roastpilot_agent.human_persistence import Settlement
+    from roastpilot_agent.human_persistence import HistoryUnavailable, Settlement
     from roastpilot_agent.human_protection import ControlAuthority
     from roastpilot_agent.mcp_client import MCPServerProcess
     from roastpilot_agent.models import RestartClearanceState
@@ -2350,11 +2357,15 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
     if failure != "no_marker":
         assert await store.confirm_process_restart_clearance(service.instance_id)
         service._restart_clearance_state = RestartClearanceState.CLEARED  # pyright: ignore[reportPrivateUsage]
+    assert await store.active_run() is None
+    assert store.human_storage_quiescent
     shared = store.connection
     order: list[str] = []
     marker_workers: list[aiosqlite.Connection] = []
     verify_workers: list[aiosqlite.Connection] = []
     observed_rows: list[str] = []
+    automatic_markers: list[str] = []
+    real_mark = store.mark_process_epoch_clean
     real_open = store._open_connection  # pyright: ignore[reportPrivateUsage]
     real_commit = aiosqlite.Connection.commit
     real_close = aiosqlite.Connection.close
@@ -2379,7 +2390,10 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
         connection = await real_open(writer=writer)
         owner = store._current_native_storage()  # pyright: ignore[reportPrivateUsage]
         if owner is not None and owner.receipt.kind == "mark_process_epoch_clean":
-            assert order[:2] == ["mcp-stop", "shared-closed"]
+            shared_close = (
+                "shared-close-failed" if failure == "shared_worker_close" else "shared-closed"
+            )
+            assert order[:2] == ["mcp-stop", shared_close]
             if writer:
                 marker_workers.append(connection)
                 order.append("marker-open")
@@ -2404,6 +2418,9 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
                 raise aiosqlite.OperationalError("final marker COMMIT acknowledgement lost")
 
     async def close(connection: aiosqlite.Connection) -> None:
+        if connection is shared and failure == "shared_worker_close":
+            order.append("shared-close-failed")
+            raise aiosqlite.OperationalError("shared SQLite close failed")
         if connection in marker_workers and failure == "worker_close":
             order.append("marker-close-unconfirmed")
             raise aiosqlite.OperationalError("final marker worker close failed")
@@ -2415,6 +2432,11 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
         elif connection in verify_workers:
             order.append("verification-closed")
 
+    async def mark(process_id: str) -> bool:
+        automatic_markers.append(process_id)
+        return await real_mark(process_id)
+
+    monkeypatch.setattr(store, "mark_process_epoch_clean", mark)
     monkeypatch.setattr(store, "_open_connection", opened)
     monkeypatch.setattr(aiosqlite.Connection, "commit", commit)
     monkeypatch.setattr(aiosqlite.Connection, "close", close)
@@ -2423,6 +2445,14 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
             service, MCP(), store
         )
         assert roaster.calls == []
+        explicitly_marked = False
+        if failure == "shared_worker_close":
+            assert automatic_markers == []
+            assert order == ["mcp-stop", "shared-close-failed"]
+            try:
+                explicitly_marked = await real_mark(service.instance_id)
+            except HistoryUnavailable:
+                explicitly_marked = False
         async with (
             aiosqlite.connect(store.db_path) as independent,
             independent.execute(
@@ -2431,6 +2461,11 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
         ):
             durable = await cursor.fetchone()
         assert durable is not None
+        if failure == "shared_worker_close":
+            assert (closed, explicitly_marked, durable[0]) == (False, False, "unclean")
+            assert order == ["mcp-stop", "shared-close-failed"]
+            assert not marker_workers and not verify_workers
+            return
         if failure == "no_marker":
             assert durable[0] == "unclean"
             assert closed and store.human_storage_quiescent
@@ -2488,6 +2523,8 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
             assert "could not verify clean process epoch shutdown" in caplog.text
             assert "HUMAN storage connection teardown is unverified" in caplog.text
     finally:
+        if failure == "shared_worker_close":
+            await real_close(shared)
         if failure == "worker_close":
             for worker in marker_workers:
                 await real_close(worker)
