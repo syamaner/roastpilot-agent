@@ -550,6 +550,25 @@ def test_t6_acknowledged_presence_is_satisfied_alongside_other_label(
     ]
 
 
+def test_t6_foreign_row_preserves_sparse_acknowledgement_presence() -> None:
+    """Filtering a foreign generation leaves lawful sparse selected references."""
+    report = _ack_report(
+        [_ack("unknown", at=1), _ack("unknown", at=2, generation=9), _ack("acknowledged", at=3)]
+    )
+    result = _check(report, _N.PERSISTENCE_ACKNOWLEDGEMENT)
+    assert result.status is CheckStatus.SATISFIED and result.reason is None
+    assert _labels(result) == [(_ACK.UNKNOWN, 1, 0), (_ACK.ACKNOWLEDGED, 1, 2)]
+    assert _counts(result) == (2, 0, 1, 0)
+    assert result.evidence == (
+        EvidenceRef(stream=_C.PERSISTENCE_ACK, seq=0, instants=(Instant(clock=_AGENT, value=1),)),
+        EvidenceRef(stream=_C.PERSISTENCE_ACK, seq=2, instants=(Instant(clock=_AGENT, value=3),)),
+    )
+    witness = _check(report, _N.PERSISTENCE_SETTLEMENT_WITNESS)
+    assert witness.status is CheckStatus.UNRESOLVED
+    assert witness.reason is _R.PRODUCER_WITNESS_ABSENT
+    assert witness.evidence == () and witness.detail is None
+
+
 def test_t6_absent_acknowledgement_preserves_unavailable_and_unknown() -> None:
     """Without an acknowledged label the inventory stays visible and unresolved."""
     report = _ack_report([_ack("unavailable", at=1), _ack("unknown", at=2), _ack("unknown", at=3)])
@@ -954,6 +973,53 @@ def test_t13_constructed_bindings_are_revalidated(
     with pytest.raises(InterpretationInputError) as caught:
         interpret_disposition_bundle(b"", expected_sha256="x", expectations=expect)
     assert caught.value.reason is InterpretationInputReason.EXPECTATIONS_INVALID
+
+
+class _ForeignCommandFields(pydantic.BaseModel):
+    """Foreign model whose raw fields must cross the strict public boundary."""
+
+    model_config = pydantic.ConfigDict(extra="allow")
+
+    command_id: str
+    owner_id: str
+    generation: int
+
+
+def _foreign_command_fields() -> _ForeignCommandFields:
+    return _ForeignCommandFields(command_id="command_1", owner_id="owner_1", generation=0)
+
+
+def test_t13_foreign_model_raw_fields_reconstruct_command_binding() -> None:
+    """A foreign model with valid raw fields reconstructs the exact public model."""
+    foreign = _foreign_command_fields()
+    binding = CommandBinding.model_validate(foreign)
+    assert type(binding) is CommandBinding
+    assert binding == CommandBinding(command_id="command_1", owner_id="owner_1", generation=0)
+    assert binding.model_dump() == foreign.model_dump()
+    assert binding.bound
+
+
+@pytest.mark.parametrize(
+    "tamper, message",
+    [
+        ("bool-generation", "expected an exact integer"),
+        ("extra-field", "Extra inputs are not permitted"),
+    ],
+)
+def test_t13_foreign_model_raw_fields_are_strictly_revalidated(tamper: str, message: str) -> None:
+    """Raw fields and model_extra cannot bypass exact types or the closed inventory."""
+    foreign = _foreign_command_fields()
+    if tamper == "bool-generation":
+        object.__setattr__(foreign, "generation", True)
+        assert vars(foreign)["generation"] is True
+    else:
+        extras = foreign.model_extra
+        assert extras is not None
+        extras["unexpected"] = 1
+        assert "unexpected" not in vars(foreign)
+        assert foreign.model_extra == {"unexpected": 1}
+    with pytest.raises(pydantic.ValidationError, match=message):
+        CommandBinding.model_validate(foreign)
 
 
 def test_t13_explicit_nulls_are_preserved_and_text_is_exact() -> None:
@@ -1511,6 +1577,44 @@ def test_t14_recording_sample_integer_is_a_valid_raw_coordinate() -> None:
     instant = Instant(clock=ClockName.RECORDING_SAMPLES, value=1)
     ref = EvidenceRef(stream=_C.COMMAND, seq=0, instants=(instant,))
     assert _result(_CMD_CHECK, None, (ref,), _returned_detail).evidence == (ref,)
+
+
+def test_t14_lawful_sparse_label_counts_are_accepted() -> None:
+    """Label counts use evidence positions, with distinct instants proving no duplicates."""
+    refs = tuple(
+        EvidenceRef(stream=_C.PERSISTENCE_ACK, seq=seq, instants=(Instant(clock=_AGENT, value=at),))
+        for seq, at in zip((0, 3, 6, 9), (1, 2, 3, 4), strict=True)
+    )
+    detail = _detail_of(_label(_ACK.ACKNOWLEDGED, 2, 0), _label(_ACK.UNAVAILABLE, 2, 6), foreign=6)
+    result = _result(_ACK_CHECK, None, refs, lambda: detail)
+    assert result.check is _ACK_CHECK
+    assert result.status is CheckStatus.SATISFIED and result.reason is None
+    assert result.evidence == refs and result.detail == detail
+    assert _labels(result) == [(_ACK.ACKNOWLEDGED, 2, 0), (_ACK.UNAVAILABLE, 2, 6)]
+    assert _counts(result) == (4, 0, 6, 0)
+    assert _detail(result).distinct_returned_heat_values == 0
+    assert _detail(result).returned_heat_percent is None
+
+
+@pytest.mark.parametrize(
+    "check", (*_WITNESSES, _N.OBSERVED_PROVENANCE), ids=lambda check: check.value
+)
+def test_t14_witness_and_provenance_cannot_be_satisfied(check: DispositionCheckName) -> None:
+    """Closed reachability rejects satisfied empty results without report masking."""
+    with pytest.raises(pydantic.ValidationError, match="reason is unreachable for this check"):
+        _result(check, None, evidence=(), detail=lambda: None, status=CheckStatus.SATISFIED)
+
+
+def test_t14_provenance_cannot_use_a_producer_witness_reason() -> None:
+    """Observed provenance has its own closed unresolved reason inventory."""
+    with pytest.raises(pydantic.ValidationError, match="reason is unreachable for this check"):
+        _result(
+            _N.OBSERVED_PROVENANCE,
+            _R.PRODUCER_WITNESS_ABSENT,
+            evidence=(),
+            detail=lambda: None,
+            status=CheckStatus.UNRESOLVED,
+        )
 
 
 @pytest.mark.parametrize(
