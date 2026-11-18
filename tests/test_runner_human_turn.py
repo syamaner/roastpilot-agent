@@ -5036,6 +5036,90 @@ async def test_queued_estop_cancellation_before_storage_preserves_exact_audit_ga
         await service.shutdown()
 
 
+async def test_queued_estop_urgent_failure_preserves_exact_unentered_audit_gaps(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run = await service.start_roast(PROFILE)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    stop_once = actuator.emergency_stop
+    urgent_stage = controller.human_urgent_stage
+    original_failure = RuntimeError("injected failure after the real urgent stage")
+    dispatches: list[tuple[StorageCaller, int]] = []
+    previous_commands = actuator.commands()
+    expected_turn = runner.current_tick + 1
+
+    async def lose_stop_ack(*, reason: str) -> AppliedRoasterState | None:
+        caller = current_storage_caller()
+        assert caller is not None
+        dispatches.append((caller, controller.command_generation))
+        await stop_once(reason=reason)
+        raise OSError("mock e-stop acknowledgement lost")
+
+    async def abort_after_urgent(*, emergency_won_batch: bool = False) -> None:
+        assert emergency_won_batch
+        assert actuator.commands() == [*previous_commands, "emergency_stop"]
+        assert controller.has_pending_emergency_stop_retry()
+        await urgent_stage(emergency_won_batch=emergency_won_batch)
+        raise original_failure
+
+    evaluation_audit = AsyncMock(wraps=store.record_safety_evaluation)
+    command_audit = AsyncMock(wraps=store.record_command)
+    monkeypatch.setattr(store, "record_safety_evaluation", evaluation_audit)
+    monkeypatch.setattr(store, "record_command", command_audit)
+    monkeypatch.setattr(actuator, "emergency_stop", lose_stop_ack)
+    monkeypatch.setattr(controller, "human_urgent_stage", abort_after_urgent)
+    store.drain_human_storage_receipts()
+    service.operator_queue.put_nowait(
+        QueuedOperatorAction(run_id=run.id, action=OperatorAction.EMERGENCY_STOP)
+    )
+    try:
+        with pytest.raises(RuntimeError) as failed:
+            await runner.tick_once()
+        assert failed.value is original_failure
+        assert controller.phase is RoastPhase.FAULTED
+        assert controller.has_pending_emergency_stop_retry()
+        assert service.operator_queue.empty()
+        evaluation_audit.assert_not_awaited()
+        command_audit.assert_not_awaited()
+        ((caller, generation),) = dispatches
+        (failed_event,) = [
+            event for event in emitter.peek() if event.kind is RoastEventKind.COMMAND_FAILED
+        ]
+        command = failed_event.audit_command
+        assert command is not None and command.owner is CommandAuditOwner.LEASE
+        assert command.session_id == actuator.session_id
+        assert command.child_generation == actuator.epoch
+        assert command.command_generation == generation
+        receipts = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind in {"record_safety_evaluation", "record_command"}
+        ]
+        assert [receipt.kind for receipt in receipts] == [
+            "record_safety_evaluation",
+            "record_command",
+        ]
+        assert [receipt.detail for receipt in receipts] == [None, RoastCommand.EMERGENCY_STOP.value]
+        for receipt in receipts:
+            assert receipt.run_id == caller.run_id == run.id
+            assert receipt.turn == caller.turn == expected_turn == runner.current_tick
+            assert receipt.deadline == caller.deadline.expires_at
+            assert receipt.writer_entered is False and receipt.timely is False
+            assert receipt.settlement is Settlement.VERIFIED_NO_WRITE
+            assert receipt.command is command
+        assert runner.history_durability() is HumanHistoryDurability.INCOMPLETE
+        assert actuator.commands() == [*previous_commands, "emergency_stop"]
+    finally:
+        await service.shutdown()
+
+
 @pytest.mark.parametrize(
     ("acknowledged", "held_audit"),
     [
