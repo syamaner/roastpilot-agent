@@ -576,6 +576,44 @@ def test_cf_unordered_beats_absent_sample() -> None:
     _expect(_call(**kwargs), INVALID, R.CHARGE_FIRST_CRACK_UNORDERED)
 
 
+# Explicit pairwise precedence witnesses: each fixture fails two adjacent checks, so
+# swapping those two checks changes the full result.
+_OTHER_SESSION = TimingDomain("session-2", "epoch-1")
+
+
+def test_sample_not_after_fc_precedes_zero_duration() -> None:
+    # Fhi=10 > Slo=0 (step 6) and Slo=0 == Chi=0 (step 7): step 6 wins.
+    result = _run(c_lo=0, c_hi=0, f_lo=0, f_hi=10, s_lo=0, s_hi=20)
+    _expect(result, INDETERMINATE, R.SAMPLE_NOT_AFTER_FIRST_CRACK)
+
+
+def test_charge_absent_precedes_sample_not_after_fc() -> None:
+    # Absent charge (step 5) and S=[50,60] before F=[86,86] (step 6): step 5 wins.
+    kwargs = _kwargs(s_lo=50, s_hi=60)
+    kwargs["charge"] = None
+    _expect(_call(**kwargs), UNAVAILABLE, R.CHARGE_ABSENT)
+
+
+def test_cf_unordered_precedes_sample_not_after_fc() -> None:
+    # C=[90,90] after F=[86,86] (step 4) and S=[50,60] before F (step 6): step 4 wins.
+    result = _run(c_lo=90, c_hi=90, s_lo=50, s_hi=60)
+    _expect(result, INVALID, R.CHARGE_FIRST_CRACK_UNORDERED)
+
+
+def test_bt_validity_precedes_domain_mismatch() -> None:
+    # Reversed BT bounds (step 2) and a charge in another session (step 3): step 2 wins.
+    kwargs = _kwargs(bt_lo=210, bt_hi=205)
+    kwargs["charge"] = _iv(0, 0, _OTHER_SESSION)
+    _expect(_call(**kwargs), INVALID, R.INVALID_REVERSED_BOUNDS)
+
+
+def test_domain_mismatch_precedes_cf_unordered() -> None:
+    # Charge C=[90,90] in another session (step 3) and after F=[86,86] (step 4): step 3 wins.
+    kwargs = _kwargs()
+    kwargs["charge"] = _iv(90, 90, _OTHER_SESSION)
+    _expect(_call(**kwargs), INVALID, R.DOMAIN_MISMATCH)
+
+
 def test_operand_check_order() -> None:
     # Charge is checked before first crack, first crack before the sample.
     kwargs = _kwargs()
