@@ -2528,3 +2528,67 @@ async def test_human_live_teardown_records_exact_final_marker_settlement(
         if failure == "worker_close":
             for worker in marker_workers:
                 await real_close(worker)
+
+
+@pytest.mark.asyncio
+async def test_human_teardown_parks_for_watchdog_after_repeated_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    entered = [asyncio.Event() for _ in range(3)]
+    shutdown_steps: list[str] = []
+    parking_futures: list[asyncio.Future[None]] = []
+
+    def park() -> asyncio.Future[None]:
+        future = asyncio.get_running_loop().create_future()
+        entered[len(parking_futures)].set()
+        parking_futures.append(future)
+        return future
+
+    def close_admission(reason: AdmissionCloseReason) -> None:
+        assert reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+        shutdown_steps.append("admission-closed")
+
+    async def teardown(*_args: object) -> bool:
+        shutdown_steps.append("unresolved-store")
+        return False
+
+    def arm(_labels: tuple[str, ...]) -> None:
+        shutdown_steps.append("watchdog-armed")
+
+    monkeypatch.setattr(cli, "_teardown_live", teardown)
+    monkeypatch.setattr(
+        cli,
+        "asyncio",
+        SimpleNamespace(
+            create_task=asyncio.create_task,
+            shield=asyncio.shield,
+            current_task=asyncio.current_task,
+            all_tasks=asyncio.all_tasks,
+            CancelledError=asyncio.CancelledError,
+            Future={None: park},
+        ),
+    )
+    task = asyncio.create_task(
+        cli._finish_live_teardown(  # pyright: ignore[reportPrivateUsage]
+            SimpleNamespace(close_human_call_admission=close_admission),  # type: ignore[arg-type]
+            SimpleNamespace(),  # type: ignore[arg-type]
+            SimpleNamespace(human_storage_enabled=True),  # type: ignore[arg-type]
+            SimpleNamespace(arm=arm),  # type: ignore[arg-type]
+        )
+    )
+    try:
+        for parked in entered[:2]:
+            await asyncio.wait_for(parked.wait(), 1)
+            assert not task.done()
+            task.cancel()
+        await asyncio.wait_for(entered[2].wait(), 1)
+        assert not task.done()
+        assert all(future.cancelled() for future in parking_futures[:2])
+        assert shutdown_steps == ["admission-closed", "unresolved-store", "watchdog-armed"]
+    finally:
+        if not task.done():
+            parking_futures[-1].set_exception(_ForcedProcessExit(1))
+        with pytest.raises(_ForcedProcessExit):
+            await task

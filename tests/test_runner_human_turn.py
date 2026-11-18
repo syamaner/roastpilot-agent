@@ -38,6 +38,7 @@ from roastpilot_agent.human_persistence import (
     Settlement,
     StorageCaller,
     StorageDeadline,
+    StorageReceipt,
     current_storage_caller,
     storage_caller,
 )
@@ -8153,4 +8154,464 @@ async def test_human_operator_drop_discloses_withheld_when_required_evaluation_i
             await reader
         await store.settle_human_storage_for_teardown()
         service.events.unsubscribe(events)
+        await service.shutdown()
+
+
+async def test_history_buffer_rejects_foreign_origin_and_eviction_replay() -> None:
+    from roastpilot_agent.api import BufferingEventEmitter
+
+    clock = FakeClock()
+    emitter = BufferingEventEmitter(EventBroadcaster(), clock=clock, human_run_id="active")
+    dropped: list[_BufferedEvent] = []
+    emitter.bound_history_buffer(dropped.append)
+    foreign = StorageCaller(StorageDeadline.start(clock, 1), "replaced", 7)
+    with storage_caller(foreign):
+        emitter.emit(RoastEventKind.DRYING_END, {"sequence": 0})
+    original = emitter.last_buffered_event
+    assert original is not None and original.storage_origin is None
+    for sequence in range(1, 257):
+        emitter.emit(RoastEventKind.DRYING_END, {"sequence": sequence})
+
+    assert dropped == [original]
+    assert emitter.drain_through(original) == []
+    assert len(emitter.peek()) == 256
+    current = emitter.last_buffered_event
+    drained = emitter.drain_through(current)
+    assert [event.payload for event in drained] == [
+        {"sequence": sequence} for sequence in range(1, 257)
+    ]
+    assert emitter.peek() == []
+
+
+@pytest.mark.parametrize("clock_fault", ["regression", "nonfinite"])
+async def test_regressed_human_deadline_cannot_restart_after_clock_recovers(
+    clock_fault: str,
+) -> None:
+    observations = iter(
+        [10.0, 10.125, 9.875 if clock_fault == "regression" else float("nan"), 10.25]
+    )
+    deadline = StorageDeadline.start(lambda: next(observations), 1)
+    assert deadline.remaining() > 0
+    assert deadline.remaining() == 0
+    operation = AsyncMock()
+    with pytest.raises(HistoryUnavailable, match="deadline elapsed"):
+        await deadline.wait(operation)
+    operation.assert_not_called()
+
+
+async def test_human_runner_recovered_history_lock_cannot_restart_turn_budget(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    try:
+        run = await service.start_roast(PROFILE)
+        runner = service.runner
+        assert runner is not None
+        lock = service._recovered_history_mutation_lock  # pyright: ignore[reportPrivateUsage]
+        runner._recovered_history_mutation_lock = lock  # pyright: ignore[reportPrivateUsage]
+        store.drain_human_storage_receipts()
+        original_read = actuator.read_human_evidence
+
+        async def use_turn_budget() -> HumanReadEvidence:
+            evidence = await original_read()
+            clock.advance(1)
+            return evidence
+
+        monkeypatch.setattr(actuator, "read_human_evidence", use_turn_budget)
+        async with lock:
+            assert not await asyncio.wait_for(runner.tick_once(), 2)
+            assert lock.locked()
+        (gap,) = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind == "recovered_history_lock"
+        ]
+        assert gap.run_id == run.id
+        assert gap.settlement is Settlement.VERIFIED_NO_WRITE
+        assert gap.writer_entered is False
+    finally:
+        await service.shutdown()
+
+
+async def test_exact_fault_audit_cannot_borrow_automatic_runner_identity(store: RoastStore) -> None:
+    clock = FakeClock()
+    service = _service(
+        store, clock, _RunnerRoaster(clock, []), authority=ControlAuthority.AUTOMATIC
+    )
+    try:
+        run = await service.start_roast(PROFILE)
+        assert service.runner is not None
+        resolve = service._human_fault_audit_child_generation  # pyright: ignore[reportPrivateUsage]
+        assert resolve(run.id, "same-session") is None
+    finally:
+        await service.shutdown()
+
+
+async def test_human_history_http_refusal_downgrades_known_durability(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    service = _service(store, clock, _RunnerRoaster(clock, []))
+    try:
+        run = await service.start_roast(PROFILE)
+        assert service.human_protection_projection(run.id).human_history_durability is (
+            HumanHistoryDurability.COMPLETE
+        )
+        with monkeypatch.context() as injected:
+            injected.setattr(
+                store, "read_run", AsyncMock(side_effect=HistoryUnavailable("refused"))
+            )
+            async with AsyncClient(
+                transport=ASGITransport(app=create_app(service)), base_url="http://test"
+            ) as client:
+                response = await client.get(f"/api/roasts/{run.id}")
+        assert response.status_code == 503
+        assert response.json()["human_history_durability"] == "unavailable"
+        assert "timeline" not in response.json()
+        assert service.human_protection_projection(run.id).human_history_durability is (
+            HumanHistoryDurability.COMPLETE
+        )
+    finally:
+        await service.shutdown()
+
+
+async def test_superseded_human_lease_audit_cannot_replace_current_durable_owner(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    older_generation = lease.generation - 1
+    try:
+        store.drain_human_storage_receipts()
+        persist = service._persist_admitted_fault_control_lease  # pyright: ignore[reportPrivateUsage]
+        reject_write = AsyncMock(side_effect=AssertionError("superseded audit entered SQLite"))
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "open_fault_control_lease", reject_write)
+            await persist(run_id, actuator.session_id, older_generation)
+        reject_write.assert_not_called()
+        assert await store.read_fault_control_lease() == lease
+        (gap,) = [
+            receipt
+            for receipt in store.drain_human_storage_receipts()
+            if receipt.kind == "superseded_fault_lease"
+        ]
+        assert gap.run_id == run_id and gap.settlement is Settlement.VERIFIED_NO_WRITE
+    finally:
+        await service.shutdown()
+
+
+async def test_human_ambient_history_does_not_retry_an_unconfirmed_native_write(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator)
+    try:
+        run = await service.start_roast(PROFILE)
+        runner = service.runner
+        assert runner is not None
+        raw = RoastSessionState.model_validate(SESSION_STATE_PAYLOAD)
+        receipt = StorageReceipt(
+            token=10,
+            kind="set_ambient",
+            run_id=run.id,
+            turn=runner.current_tick,
+            deadline=clock() + 1,
+            writer_entered=True,
+            timely=False,
+            settlement=Settlement.UNRESOLVED,
+        )
+        fault = AsyncMock(side_effect=HistoryUnavailable("uncertain ambient", receipt=receipt))
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "set_ambient", fault)
+            injected.setattr(runner, "_tick_raw_state", lambda: raw)
+            capture = runner._persist_ambient_if_charged  # pyright: ignore[reportPrivateUsage]
+            charged = replace(runner.controller_snapshot(), charge_detected=True)
+            await capture(charged)
+            await capture(charged)
+        fault.assert_awaited_once()
+        detail = await service.detail(run.id)
+        assert detail.ambient_temp_c is None
+    finally:
+        await service.shutdown()
+
+
+async def test_human_command_audit_ignores_non_attributable_event_payloads(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    run_id = (await service.start_roast(PROFILE)).id
+    await _charge_live_runner(service, actuator, clock)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+    drop = controller.operator_drop_beans
+
+    async def drop_with_unrelated_events() -> None:
+        emitter.emit(RoastEventKind.COMMAND_FAILED, "unattributed diagnostic")
+        emitter.emit(RoastEventKind.COMMAND_FAILED, {"command": "set_heat"})
+        await drop()
+
+    try:
+        monkeypatch.setattr(controller, "operator_drop_beans", drop_with_unrelated_events)
+        result = await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.DROP_BEANS)
+        )
+        assert result.queued
+        clock.advance(0.25)
+        await runner.tick_once()
+        timeline = await service.timeline(run_id)
+        assert actuator.commands().count("drop_beans") == 1
+        assert [
+            item.status for item in timeline.commands if item.tool is RoastCommand.DROP_BEANS
+        ] == ["ok"]
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("settlement", ["history_unavailable", "superseded"])
+async def test_legacy_fault_confirmation_never_promotes_uncertain_history(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, settlement: str
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store, open_lease=False)
+    assert lease is None
+    gate = service._fault_acknowledgement_gate  # pyright: ignore[reportPrivateUsage]
+    begin = store.begin_fault_acknowledgement_confirmation
+
+    async def unconfirmed(run_id: str) -> int:
+        if settlement == "history_unavailable":
+            raise HistoryUnavailable("confirmation write unavailable")
+        audit = await begin(run_id)
+        gate.abort_fault_finalization()
+        return audit
+
+    try:
+        monkeypatch.setattr(store, "begin_fault_acknowledgement_confirmation", unconfirmed)
+        accepted = await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+        )
+        assert accepted.queued
+        finished = await runner.tick_once()
+        assert finished is (settlement == "superseded")
+        timeline = await store.read_timeline(run_id)
+        assert not any(
+            event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+            and event.payload == {"outcome": "confirmed"}
+            for event in timeline.events
+        )
+        assert actuator.fault_writes == []
+        if settlement == "history_unavailable":
+            assert runner._completion_storage_uncertain  # pyright: ignore[reportPrivateUsage]
+        else:
+            assert any(
+                event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+                and event.payload == {"outcome": "failed", "reason": "superseded_by_emergency_stop"}
+                for event in timeline.events
+            )
+    finally:
+        await service.shutdown()
+
+
+async def test_exact_cooling_keeps_readback_when_caller_deadline_expires_before_audit(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    write = actuator.write_fault_control
+    release = asyncio.Event()
+
+    async def dispatch_and_advance(action: OperatorAction, *, expected_session_id: str) -> None:
+        await write(action, expected_session_id=expected_session_id)
+        actuator.clock.advance(1)
+
+    record = store.record_command
+
+    async def hold_audit(**kwargs: Any) -> None:
+        await release.wait()
+        await record(**kwargs)
+
+    try:
+        monkeypatch.setattr(actuator, "write_fault_control", dispatch_and_advance)
+        monkeypatch.setattr(store, "record_command", hold_audit)
+        caller = StorageCaller(StorageDeadline.start(actuator.clock, 1), run_id)
+        with storage_caller(caller):
+            async with asyncio.timeout(0.5):
+                observed = await executor.execute(
+                    OperatorAction.START_COOLING,
+                    actuator.session_id,
+                    run_id=run_id,
+                    is_current_generation=lambda: True,
+                )
+        assert caller.deadline.remaining() == 0
+        assert observed is not None and observed.cooling_on
+        assert actuator.fault_writes == [OperatorAction.START_COOLING]
+        assert not release.is_set()
+        release.set()
+        assert await executor.settle_for_shutdown()
+    finally:
+        release.set()
+        await service.shutdown()
+
+
+async def test_exact_emergency_readback_survives_failed_safety_audit(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, actuator, run_id, lease = await _faulted_run(store)
+    assert lease is not None
+    executor = service._fault_control_executor  # pyright: ignore[reportPrivateUsage]
+    assert executor is not None
+    evidence_failure = AsyncMock(side_effect=RuntimeError("injected post-stop audit failure"))
+    store.drain_human_storage_receipts()
+    try:
+        monkeypatch.setattr(store, "record_fault_control_evaluation", evidence_failure)
+        observed = await executor.execute(
+            OperatorAction.EMERGENCY_STOP,
+            actuator.session_id,
+            run_id=run_id,
+            is_current_generation=lambda: True,
+        )
+        assert observed is not None and observed.heat_level_percent == 0
+        assert actuator.fault_writes == [OperatorAction.EMERGENCY_STOP]
+        assert await executor.settle_for_shutdown()
+        evidence_failure.assert_awaited_once()
+        assert any(
+            receipt.kind == "record_safety_evaluation"
+            and receipt.run_id == run_id
+            and receipt.settlement is Settlement.UNRESOLVED
+            for receipt in store.drain_human_storage_receipts()
+        )
+        (stop,) = [
+            command
+            for command in (await store.read_timeline(run_id)).commands
+            if command.tool is RoastCommand.EMERGENCY_STOP
+        ]
+        assert stop.status == "ok" and stop.safety_evaluation_id is None
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.parametrize("interruption", ["cancelled", "unavailable"])
+async def test_automatic_start_does_not_adopt_human_storage_failure(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, interruption: str
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, authority=ControlAuthority.AUTOMATIC)
+    error = (
+        asyncio.CancelledError() if interruption == "cancelled" else HistoryUnavailable("refused")
+    )
+    audit_failure = AsyncMock(side_effect=error)
+    try:
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "record_safety_evaluation", audit_failure)
+            with pytest.raises(type(error)):
+                await service.start_roast(PROFILE)
+        runner = service.runner
+        assert runner is not None and not runner.start_history_cancelled
+        assert runner.controller_for_human_fault_drop() is None
+        assert not store.human_storage_enabled
+        assert not any(command in {"set_heat", "set_fan"} for command in actuator.commands())
+    finally:
+        await service.shutdown()
+
+
+async def test_automatic_event_flush_preserves_cancellation_without_human_gap(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    service = _service(
+        store, clock, _RunnerRoaster(clock, []), authority=ControlAuthority.AUTOMATIC
+    )
+    try:
+        await service.start_roast(PROFILE)
+        runner = service.runner
+        assert runner is not None
+        emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+        emitter.emit(RoastEventKind.DRYING_END, {})
+        blocked_event = AsyncMock(side_effect=asyncio.CancelledError)
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "record_event", blocked_event)
+            with pytest.raises(asyncio.CancelledError):
+                await runner._flush_events()  # pyright: ignore[reportPrivateUsage]
+        blocked_event.assert_awaited_once()
+        assert not store.drain_human_storage_receipts()
+    finally:
+        await service.shutdown()
+
+
+async def test_human_finalized_tick_keeps_terminal_state_when_telemetry_refuses(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, runner, actuator, run_id, lease = await _faulted_run(store, open_lease=False)
+    assert lease is None
+    try:
+        result = await service.submit_operator_action(
+            run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+        )
+        assert result.queued
+        with monkeypatch.context() as injected:
+            injected.setattr(
+                store,
+                "record_telemetry",
+                AsyncMock(side_effect=HistoryUnavailable("late telemetry")),
+            )
+            assert await runner.tick_once()
+        detail = await service.detail(run_id)
+        assert detail.completed_at_utc is not None and detail.agent_phase is RoastPhase.FAULTED
+        assert runner.finalized
+        assert not actuator.fault_writes
+        timeline = await service.timeline(run_id)
+        confirmed = [
+            event
+            for event in timeline.events
+            if event.kind is RoastEventKind.FAULT_ACKNOWLEDGEMENT_EXECUTED
+            and event.payload == {"outcome": "confirmed"}
+        ]
+        assert len(confirmed) == 1
+    finally:
+        await service.shutdown()
+
+
+async def test_human_drop_refusal_does_not_publish_stale_endpoint_after_emergency_admission(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    actuator = _RunnerRoaster(clock, [])
+    service = _service(store, clock, actuator, exact_child=True)
+    try:
+        run = await service.start_roast(PROFILE)
+        await _charge_live_runner(service, actuator, clock)
+        runner = service.runner
+        assert runner is not None and runner.run_id == run.id
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None
+        emitter = runner._emitter  # pyright: ignore[reportPrivateUsage]
+        prior_generation = controller.command_generation
+
+        async def supersede_during_evaluation(**_kwargs: object) -> int:
+            controller.admit_emergency_stop()
+            raise HistoryUnavailable("evaluation was superseded by emergency admission")
+
+        with monkeypatch.context() as injected:
+            injected.setattr(store, "record_safety_evaluation", supersede_during_evaluation)
+            await controller.operator_drop_beans()
+        assert controller.command_generation > prior_generation
+        assert controller.snapshot().human_endpoint is EndpointDisposition.NONE
+        assert "drop_beans" not in actuator.commands()
+        failed_commands = [
+            (cast("dict[str, object] | None", event.payload) or {}).get("command")
+            for event in emitter.peek()
+            if event.kind is RoastEventKind.COMMAND_FAILED
+        ]
+        assert "drop_beans" not in failed_commands
+        assert controller._routine_inhibited  # pyright: ignore[reportPrivateUsage]
+    finally:
         await service.shutdown()
