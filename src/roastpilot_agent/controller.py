@@ -72,6 +72,7 @@ from roastpilot_agent.human_protection import (
 from roastpilot_agent.human_run_ownership import (
     HumanCallAdmission,
     HumanCallRefusal,
+    HumanRunAdmission,
     HumanRunOwnership,
     HumanRunState,
     PendingHumanCall,
@@ -1800,12 +1801,21 @@ class RoastController:
         current_child_generation: Callable[[], int | None] | None = None,
         containment_discovered: Callable[[], bool] | None = None,
         capture_bound_raw_read: Callable[[], str] | None = None,
+        _prepare_human_owner: bool = False,
     ) -> None:
+        if _prepare_human_owner and authority is not ControlAuthority.HUMAN:
+            raise ValueError("prepared ownership requires HUMAN authority")
         self._authority = authority
         self._human_reader = human_reader
         self._human_ownership = human_ownership or HumanRunOwnership()
         self._human_run = (
-            self._human_ownership.claim_run(run_id) if authority is ControlAuthority.HUMAN else None
+            (
+                self._human_ownership._claim_prepared_run(run_id)  # pyright: ignore[reportPrivateUsage]
+                if _prepare_human_owner
+                else self._human_ownership.claim_run(run_id)
+            )
+            if authority is ControlAuthority.HUMAN
+            else None
         )
         if self._human_run is not None:
             self._human_drop_evaluation_tasks: set[asyncio.Task[int | None]] = set()
@@ -2840,6 +2850,29 @@ class RoastController:
         if self._human_run is not None:
             self._human_run.durably_closed = True
 
+    def _routine_owner_admitted(self) -> bool:
+        return self._human_run is None or self._human_run.admission is HumanRunAdmission.ADMITTED
+
+    def _prepared_routine_permitted(
+        self,
+        write_class: WriteClass,
+        *,
+        fault_cooling: bool,
+        close_reservation: int | None,
+    ) -> bool:
+        # These intents never bypass the existing current-owner/settled-command checks.
+        # Only the two policy-authorised FAULTED cooling origins supply fault_cooling.
+        return self._routine_owner_admitted() or (
+            write_class is WriteClass.NON_HEAT
+            and (
+                (fault_cooling and self._phase is RoastPhase.FAULTED)
+                or (
+                    close_reservation is not None
+                    and self._arbiter.close_reservation_is_current(close_reservation)
+                )
+            )
+        )
+
     def _human_actuation_admitted(self) -> bool:
         return (self._human_admission is None or self._human_admission.closed_reason is None) and (
             self._teardown_unconfirmed is None or not self._teardown_unconfirmed()
@@ -2911,6 +2944,7 @@ class RoastController:
         admitted: Callable[[], bool] | None = None,
         close_reservation: int | None = None,
         allow_emergency_stop_transition_for_heat_off: bool = False,
+        _fault_cooling: bool = False,
     ) -> tuple[bool, _ActuationT | None]:
         """Execute one routine write through the controller-owned arbiter."""
 
@@ -2924,7 +2958,14 @@ class RoastController:
                 and (
                     self._human_run is None
                     or allow_emergency_stop_transition_for_heat_off
-                    or self._human_routine_permitted(write_class, endpoint_owner)
+                    or (
+                        self._prepared_routine_permitted(
+                            write_class,
+                            fault_cooling=_fault_cooling,
+                            close_reservation=close_reservation,
+                        )
+                        and self._human_routine_permitted(write_class, endpoint_owner)
+                    )
                 )
                 and (
                     write_class is not WriteClass.SESSION_START
@@ -4425,6 +4466,8 @@ class RoastController:
     ) -> bool:
         run = self._human_run
         assert run is not None
+        if not self._routine_owner_admitted():
+            return False
         prior_endpoint = run.endpoint
         admission_phase = self._phase
         run.endpoint = EndpointDisposition.ADMITTED
@@ -6473,6 +6516,8 @@ class RoastController:
             on_history_cancelled: Synchronous notification if cancellation
                 interrupts initial safety evaluation persistence.
         """
+        if not self._routine_owner_admitted():
+            raise RuntimeError("prepared HUMAN owner cannot start a run")
         generation = self._arbiter.generation
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
         self._profile = profile
@@ -6887,6 +6932,8 @@ class RoastController:
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
+        if not self._routine_owner_admitted():
+            return
         if self._human_run is not None and (
             self._human_run.endpoint is not EndpointDisposition.NONE
             or self._human_run.command is CommandDisposition.UNKNOWN
@@ -7015,6 +7062,8 @@ class RoastController:
             self.transition_to(RoastPhase.COOLING)
 
     async def _human_operator_drop(self) -> None:
+        if not self._routine_owner_admitted() and self._phase not in TERMINAL_LATCH_PHASES:
+            return
         if self._join_human_drop():
             return
         generation = self._arbiter.generation
@@ -7061,6 +7110,8 @@ class RoastController:
         until the operator acknowledges it, so a fault never strands a running
         cooling fan with no way to stop it. (Log export wires in E5/E9 alongside
         the real MCP client.)"""
+        if not self._routine_owner_admitted() and self._phase is not RoastPhase.FAULTED:
+            return
         generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.STOP_COOLING, phase=self._phase
@@ -7073,7 +7124,10 @@ class RoastController:
             raise InvalidTransitionError(self._phase, RoastPhase.COMPLETE)
         try:
             dispatched, _ = await self._run_routine_write(
-                generation, self._executor.stop_cooling, write_class=WriteClass.NON_HEAT
+                generation,
+                self._executor.stop_cooling,
+                write_class=WriteClass.NON_HEAT,
+                _fault_cooling=self._phase is RoastPhase.FAULTED,
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "stop_cooling"})
@@ -7155,6 +7209,8 @@ class RoastController:
         ``roasting_pre_first_crack`` move still goes through the debounced T0
         path in :meth:`_apply_phase_rules`; this records the charge with MCP so
         its detection logic can proceed."""
+        if not self._routine_owner_admitted():
+            return
         generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.MARK_BEANS_ADDED, phase=self._phase
@@ -7187,6 +7243,8 @@ class RoastController:
         on a hot faulted machine **without a transition** (the run stays faulted,
         heat off, until acknowledged). Hardware is never written unless the
         resulting state is reachable (E4-S4 safety rule)."""
+        if not self._routine_owner_admitted() and self._phase is not RoastPhase.FAULTED:
+            return
         generation = self._arbiter.generation
         phase_validity = self._safety.evaluate_command_phase(
             command=RoastCommand.START_COOLING, phase=self._phase
@@ -7207,7 +7265,10 @@ class RoastController:
             raise InvalidTransitionError(self._phase, RoastPhase.COOLING)
         try:
             dispatched, _ = await self._run_routine_write(
-                generation, self._executor.start_cooling, write_class=WriteClass.NON_HEAT
+                generation,
+                self._executor.start_cooling,
+                write_class=WriteClass.NON_HEAT,
+                _fault_cooling=self._phase is RoastPhase.FAULTED,
             )
         except Exception:
             self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_cooling"})
