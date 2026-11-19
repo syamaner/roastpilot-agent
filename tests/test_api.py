@@ -15232,3 +15232,485 @@ async def test_retrieve_reference_for_skips_the_store_when_no_origin_slug(
         punctuation_only_profile
     )
     assert reference is None
+
+
+async def _seed_unresolved_start(store: RoastStore, *, terminal: bool = True) -> tuple[object, ...]:
+    """Insert only synthetic evidence; production has no hold writer in this slice."""
+    run_id = "b" * 32
+    await store.create_run(
+        run_id=run_id, profile=_profile(), config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    if terminal:
+        await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    values: tuple[object, ...] = (1, "a" * 32, run_id, "c" * 32, 1, 0, "2026-11-19T10:00:00+00:00")
+    await store.connection.execute(
+        "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
+    )
+    await store.connection.commit()
+    return values
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("human", [False, True])
+@pytest.mark.parametrize("evidence", ["held", "unknown", "failed"])
+async def test_start_hold_denies_both_authorities_before_side_effects(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, human: bool, evidence: str
+) -> None:
+    """A hold or unproven read blocks the actual Start entry point before any work."""
+    from roastpilot_agent.human_persistence import HistoryUnavailable
+    from roastpilot_agent.human_protection import ControlAuthority
+
+    roaster = FakeMCPClient()
+    child = MCPServerProcess(session=_FakeSession())
+    service = RoastService(
+        store,
+        roaster=roaster,
+        mcp=child,
+        run_loop=False,
+        authority=ControlAuthority.HUMAN if human else ControlAuthority.AUTOMATIC,
+    )
+    try:
+        await service.recover_on_start()
+        if evidence == "held":
+            await _seed_unresolved_start(store)
+        elif evidence == "unknown":
+            await store.connection.execute("DROP TABLE start_attempt_hold")
+            await store.connection.commit()
+        else:
+            monkeypatch.setattr(
+                store,
+                "read_start_attempt_hold",
+                mock.AsyncMock(side_effect=HistoryUnavailable("before body")),
+            )
+        preempt = mock.AsyncMock()
+        create = mock.AsyncMock()
+        respawn = mock.AsyncMock()
+        monkeypatch.setattr(service, "_preempt_bean_drafts_for_roast_start", preempt)
+        monkeypatch.setattr(service, "_respawn_mcp_for_device_config", respawn)
+        monkeypatch.setattr(store, "create_run", create)
+        with mock.patch.object(api_module, "load_app_config") as reload_config:
+            with pytest.raises(RoastRunConflictError, match="unresolved Start attempt clearance"):
+                await service.start_roast(_profile())
+            reload_config.assert_not_called()
+        preempt.assert_not_awaited()
+        respawn.assert_not_awaited()
+        create.assert_not_awaited()
+        assert roaster.calls == []
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["clearance", "baseline"])
+@pytest.mark.parametrize("evidence", ["held", "unknown", "failed"])
+async def test_start_hold_blocks_proof_and_baseline_reservation(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str, evidence: str
+) -> None:
+    """D213 and D220 refuse before active/presence proof or generation reservation."""
+    from roastpilot_agent.human_persistence import HistoryUnavailable
+
+    roaster = FakeMCPClient()
+    presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", presence)
+    service = RoastService(
+        store, roaster=roaster, mcp=MCPServerProcess(session=_FakeSession()), run_loop=False
+    )
+    try:
+        await service.recover_on_start()
+        if evidence == "held":
+            await _seed_unresolved_start(store)
+        elif evidence == "unknown":
+            await store.connection.execute("DROP TABLE start_attempt_hold")
+            await store.connection.commit()
+        else:
+            monkeypatch.setattr(
+                store,
+                "read_start_attempt_hold",
+                mock.AsyncMock(side_effect=HistoryUnavailable("before body")),
+            )
+        active = mock.AsyncMock(side_effect=AssertionError("must refuse before active proof"))
+        monkeypatch.setattr(store, "active_run", active)
+        before = service._fault_control_generation_floor  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        if route == "clearance":
+            with pytest.raises(RoastRunConflictError, match="unresolved Start attempt clearance"):
+                await service.acknowledge_restart_clearance(
+                    RestartClearanceRequest(physical_confirmation=True)
+                )
+        else:
+            result = await service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+            assert result.outcome == "rejected"
+        assert service._fault_control_generation_floor == before  # noqa: SLF001  # pyright: ignore[reportPrivateUsage]
+        active.assert_not_awaited()
+        presence.assert_not_awaited()
+        assert roaster.calls == []
+        monkeypatch.undo()
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["clearance", "baseline"])
+async def test_start_hold_entering_after_early_read_defeats_real_transaction(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """Presence can race with another producer; SQL refuses the late hold atomically."""
+    await store.begin_process_epoch("crashed")
+    roaster = FakeMCPClient()
+    service = RoastService(
+        store, roaster=roaster, mcp=MCPServerProcess(session=_FakeSession()), run_loop=False
+    )
+    try:
+        await service.recover_on_start()
+        if route == "clearance":
+            # A successful D220 baseline creates its valid CLOSED lease first.
+            monkeypatch.setattr(
+                roaster, "read_session_presence", mock.AsyncMock(return_value="none")
+            )
+            baseline = await service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+            assert baseline.outcome == "confirmed"
+        inserted: list[tuple[object, ...]] = []
+
+        async def presence_with_late_hold() -> str:
+            inserted.append(await _seed_unresolved_start(store))
+            return "none"
+
+        monkeypatch.setattr(roaster, "read_session_presence", presence_with_late_hold)
+        if route == "clearance":
+            with pytest.raises(RoastRunConflictError, match="not durably recorded"):
+                await service.acknowledge_restart_clearance(
+                    RestartClearanceRequest(physical_confirmation=True)
+                )
+        else:
+            result = await service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+            assert result.outcome == "unconfirmed"
+            async with store.connection.execute(
+                "SELECT COUNT(*) FROM fault_control_lease"
+            ) as cursor:
+                row = await cursor.fetchone()
+                assert row is not None
+                assert tuple(row) == (0,)
+        assert len(inserted) == 1
+        async with store.connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            assert tuple(row) == inserted[0]
+        assert roaster.calls == []
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase,terminal",
+    [(RoastPhase.STARTING, False), (RoastPhase.FAULTED, False), (RoastPhase.FAULTED, True)],
+)
+async def test_start_hold_survives_automatic_restart_and_finalisation(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, phase: RoastPhase, terminal: bool
+) -> None:
+    """A fresh process/store preserves holds while applying legacy AUTOMATIC recovery."""
+    values = await _seed_unresolved_start(store, terminal=terminal)
+    if not terminal:
+        await store.update_run_phase("b" * 32, phase)
+    before = await store.read_run("b" * 32)
+    await store.close()
+    replacement = RoastStore(store.db_path)
+    roaster = FakeMCPClient()
+    presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", presence)
+    service = RoastService(replacement, roaster=roaster, run_loop=False)
+    try:
+        await replacement.initialize()
+        await service.recover_on_start()
+        recovered = await replacement.read_run("b" * 32)
+        assert recovered is not None and before is not None
+        if phase is RoastPhase.STARTING:
+            assert recovered.completed_at_utc is None
+            assert service.runner is not None
+            assert (
+                service.runner.controller_snapshot().phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
+            )
+        else:
+            assert recovered.agent_phase is RoastPhase.FAULTED
+            assert recovered.outcome == "faulted"
+            assert recovered.completed_at_utc is not None
+            assert service.runner is None
+            if terminal:
+                assert recovered.completed_at_utc == before.completed_at_utc
+            else:
+                assert before.completed_at_utc is None
+        async with replacement.connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+            row = await cursor.fetchone()
+            assert row is not None and tuple(row) == values
+        with pytest.raises(RoastRunConflictError, match="unresolved Start attempt clearance"):
+            await service.start_roast(_profile())
+        presence.assert_not_awaited()
+        assert roaster.calls == []
+        await service.shutdown()
+        async with replacement.connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+            row = await cursor.fetchone()
+            assert row is not None and tuple(row) == values
+    finally:
+        await service.shutdown()
+        await replacement.close()
+
+
+@pytest.mark.asyncio
+async def test_start_hold_read_does_not_delay_estop_and_stales_original_start(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted exact-owner e-stop dispatches while Start's durable read is parked."""
+    from roastpilot_agent.models import StartAttemptHoldRead, StartAttemptHoldState
+
+    roaster = FakeMCPClient()
+    service = RoastService(store, roaster=roaster, run_loop=False)
+    attempt: asyncio.Task[Any] | None = None
+    entered, release = asyncio.Event(), asyncio.Event()
+    try:
+        run = await service.start_roast(_profile())
+        assert service.runner is not None
+        # Keep a valid existing owner while the following Start awaits durable proof.
+
+        async def parked_read() -> StartAttemptHoldRead:
+            entered.set()
+            await release.wait()
+            return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
+
+        monkeypatch.setattr(store, "read_start_attempt_hold", parked_read)
+        attempt = asyncio.create_task(service.start_roast(_profile()))
+        await asyncio.wait_for(entered.wait(), 1)
+        try:
+            result = await asyncio.wait_for(
+                service.submit_fault_controls_action(
+                    FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+                ),
+                1,
+            )
+            assert result.result in ("accepted", "executed")
+            assert any(name == "emergency_stop" for name, _ in roaster.calls)
+        finally:
+            release.set()
+        with pytest.raises(RoastRunConflictError, match="revoked|emergency"):
+            await attempt
+        assert service.active_run_id == run.id
+    finally:
+        release.set()
+        if attempt is not None:
+            await asyncio.gather(attempt, return_exceptions=True)
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_hold_survives_allowed_closure_only_end(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """D216 can end its recovered run but never settles a Start attempt."""
+    service, roaster, _ = await _recovered_d216_service(store, monkeypatch, run_id="b" * 32)
+    try:
+        values: tuple[object, ...] = (
+            1,
+            "a" * 32,
+            "b" * 32,
+            "c" * 32,
+            1,
+            0,
+            "2026-11-19T10:00:00+00:00",
+        )
+        await store.connection.execute(
+            "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
+        )
+        await store.connection.commit()
+        admitted = await service.acknowledge_closure_only_clearance(
+            RestartClearanceRequest(physical_confirmation=True)
+        )
+        assert admitted.outcome == "confirmed"
+        result = await service.end_recovered_run("b" * 32)
+        assert result.outcome == "aborted"
+        async with store.connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+            row = await cursor.fetchone()
+            assert row is not None
+            assert tuple(row) == values
+        with pytest.raises(RoastRunConflictError, match="unresolved Start attempt clearance"):
+            await service.start_roast(_profile())
+        assert roaster.calls == []
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["clearance", "baseline"])
+async def test_start_hold_read_preserves_estop_epoch_fences(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch, route: str
+) -> None:
+    """A CLEAR read finishing after an e-stop cannot reuse old D213/D220 evidence."""
+    from roastpilot_agent.models import StartAttemptHoldRead, StartAttemptHoldState
+
+    roaster = FakeMCPClient()
+    presence = mock.AsyncMock(return_value="none")
+    monkeypatch.setattr(roaster, "read_session_presence", presence)
+    service = RoastService(
+        store, roaster=roaster, mcp=MCPServerProcess(session=_FakeSession()), run_loop=False
+    )
+    try:
+        await service.recover_on_start()
+
+        async def stale_read() -> StartAttemptHoldRead:
+            await service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            )
+            active.reset_mock()
+            return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
+
+        active = mock.AsyncMock(wraps=store.active_run)
+        monkeypatch.setattr(store, "active_run", active)
+        monkeypatch.setattr(store, "read_start_attempt_hold", stale_read)
+        if route == "clearance":
+            with pytest.raises(RoastRunConflictError, match="became stale"):
+                await service.acknowledge_restart_clearance(
+                    RestartClearanceRequest(physical_confirmation=True)
+                )
+        else:
+            assert (
+                await service.initialize_missing_fault_control_safety_record(
+                    RestartClearanceRequest(physical_confirmation=True)
+                )
+            ).outcome == "rejected"
+        active.assert_not_awaited()
+        presence.assert_not_awaited()
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("route", ["d225", "acknowledge", "hardware_clear"])
+async def test_start_hold_survives_independently_allowed_closure_routes(
+    store: RoastStore, route: str
+) -> None:
+    """Existing closure authority retains the exact hold and cannot enable Start."""
+    from roastpilot_agent.models import StrandedFaultRetirementRequest
+    from tests.test_stranded_fault_retirement import (
+        _eligible_service,  # pyright: ignore[reportPrivateUsage]
+    )
+
+    values = await _seed_unresolved_start(store)
+    clock = FakeClock()
+    roaster = FakeMCPClient([_reading(178.0, 185.0)])
+    if route == "d225":
+        service, roaster = await _eligible_service(store)
+    elif route == "acknowledge":
+        service = RoastService(store, roaster=roaster, clock=clock, run_loop=False)
+    else:
+        process = MCPServerProcess()
+        process._stop_unconfirmed = True  # pyright: ignore[reportPrivateUsage]
+        process._teardown_incident_id = "d" * 32  # pyright: ignore[reportPrivateUsage]
+        service = RoastService(store, mcp=process, roaster=roaster, run_loop=False)
+    try:
+        if route == "d225":
+            result = await service.retire_stranded_fault(
+                StrandedFaultRetirementRequest(
+                    stranded_fault_confirmation=(
+                        "roaster_stopped_empty_heat_fan_cooling_off_physical_stop_ready"
+                    )
+                )
+            )
+            assert result.outcome == "confirmed"
+        elif route == "acknowledge":
+            # The existing in-session recovery path has independent acknowledgement authority.
+            run_id = "ordinary-fault"
+            await store.create_run(
+                run_id=run_id,
+                profile=_profile(),
+                config=AppConfig(),
+                agent_phase=RoastPhase.FAULTED,
+            )
+            runner = await service._build_runner(run_id, _profile())  # pyright: ignore[reportPrivateUsage]
+            assert runner is not None
+            service.active_run_id = run_id
+            await runner.recover_faulted(_profile())
+            accepted = await service.submit_operator_action(
+                run_id, OperatorActionRequest(action=OperatorAction.ACKNOWLEDGE_FAULT)
+            )
+            assert accepted.result == "accepted"
+            assert await _tick(service, clock)
+            final = await store.read_run(run_id)
+            assert final is not None and final.outcome == "faulted"
+        else:
+            result = await service.acknowledge_hardware_clear(
+                HardwareClearAcknowledgementRequest(
+                    hardware_clear=True, teardown_incident_id="d" * 32, reason="physically checked"
+                )
+            )
+            assert result.hardware_clear is True
+        async with store.connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+            row = await cursor.fetchone()
+            assert row is not None and tuple(row) == values
+        with pytest.raises(RoastRunConflictError, match="unresolved Start attempt clearance"):
+            await service.start_roast(_profile())
+        assert roaster.calls == []
+    finally:
+        await service.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_start_hold_human_owned_read_does_not_delay_emergency_dispatch(
+    store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admitted HUMAN independent read cannot hold the emergency dispatch path."""
+    from roastpilot_agent.human_protection import ControlAuthority
+    from roastpilot_agent.models import StartAttemptHoldRead
+    from tests.test_runner_human_turn import _RunnerRoaster  # pyright: ignore[reportPrivateUsage]
+
+    clock = FakeClock()
+    log: list[str] = []
+    roaster = _RunnerRoaster(clock, log)
+    service = RoastService(
+        store, roaster=roaster, clock=clock, run_loop=False, authority=ControlAuthority.HUMAN
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_open = store._open_connection  # pyright: ignore[reportPrivateUsage]
+    attempt: asyncio.Task[StartAttemptHoldRead] | None = None
+
+    async def parked_open(*, writer: bool = False) -> aiosqlite.Connection:
+        connection = await real_open(writer=writer)
+        entered.set()
+        await release.wait()
+        return connection
+
+    try:
+        run = await service.start_roast(_profile())
+        assert service.runner is not None
+        assert store.human_storage_enabled
+        monkeypatch.setattr(store, "_open_connection", parked_open)
+        attempt = asyncio.create_task(store.read_start_attempt_hold())
+        await asyncio.wait_for(entered.wait(), 1)
+        assert not store.human_storage_quiescent
+        assert any(
+            receipt.kind == "read_start_attempt_hold"
+            for receipt in store.drain_human_storage_receipts()
+        )
+        # Do not await durable lease settlement: dispatch is the independent invariant.
+        result = await asyncio.wait_for(
+            service.submit_fault_controls_action(
+                FaultControlsActionRequest(action=OperatorAction.EMERGENCY_STOP)
+            ),
+            1,
+        )
+        assert result.result in ("accepted", "executed")
+        assert not release.is_set()
+        assert "emergency_stop" in log
+        with pytest.raises(RoastRunConflictError):
+            await service.start_roast(_profile())
+        assert service.active_run_id == run.id
+    finally:
+        release.set()
+        try:
+            if attempt is not None:
+                await attempt
+        finally:
+            monkeypatch.undo()
+            await service.shutdown()

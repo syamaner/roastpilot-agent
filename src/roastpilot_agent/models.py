@@ -12,6 +12,7 @@ invariant. Use ``.value`` at serialization boundaries.
 import json
 import math
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from typing import Annotated, Any, Literal, cast
@@ -1296,6 +1297,38 @@ class AdvisorHealth(BaseModel):
     provider: str | None = None
     model_slug: str | None = None
     error: str | None = None
+
+
+class StartAttemptHoldState(Enum):
+    """Committed unresolved Start evidence, independent of restart clearance."""
+
+    CLEAR = "clear"
+    HELD = "held"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class StartAttemptHold:
+    """Internal audit identity of one unresolved Start; grants no authority."""
+
+    attempt_key: str
+    run_id: str
+    process_id: str
+    child_epoch: int
+    fault_lease_generation: int
+    created_at_utc: datetime
+
+
+@dataclass(frozen=True)
+class StartAttemptHoldRead:
+    """Validated committed hold result; only HELD carries an audit record."""
+
+    state: StartAttemptHoldState
+    record: StartAttemptHold | None = None
+
+    def __post_init__(self) -> None:
+        if (self.state is StartAttemptHoldState.HELD) != (self.record is not None):
+            raise ValueError("only HELD carries a Start attempt record")
 
 
 class RestartClearanceState(Enum):
