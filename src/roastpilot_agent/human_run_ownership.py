@@ -14,6 +14,13 @@ from roastpilot_agent.human_protection import (
 )
 
 
+class HumanRunAdmission(Enum):
+    """Construction-bound authority for routine HUMAN commands."""
+
+    PREPARED = auto()
+    ADMITTED = auto()
+
+
 class PendingHumanCall(Enum):
     """Operations that retain ownership until their local await terminates."""
 
@@ -95,6 +102,7 @@ class HumanRunState:
     """Run-local command and exact-session ownership retained by the service."""
 
     run_id: str
+    _admission: HumanRunAdmission = HumanRunAdmission.ADMITTED
     child_generation: int | None = None
     session_id: str | None = None
     endpoint: EndpointDisposition = EndpointDisposition.NONE
@@ -102,6 +110,11 @@ class HumanRunState:
     command: CommandDisposition = CommandDisposition.SETTLED
     containment: ContainmentAttempt = ContainmentAttempt.AVAILABLE
     durably_closed: bool = False
+
+    @property
+    def admission(self) -> HumanRunAdmission:
+        """Return the immutable admission value chosen when ownership was claimed."""
+        return self._admission
 
     @property
     def unresolved(self) -> bool:
@@ -138,9 +151,16 @@ class HumanRunOwnership:
 
     def claim_run(self, run_id: str) -> HumanRunState:
         """Create ownership for a run after the application admits it."""
+        return self._claim_run(run_id, HumanRunAdmission.ADMITTED)
+
+    def _claim_prepared_run(self, run_id: str) -> HumanRunState:
+        """Claim a sessionless owner without routine command authority."""
+        return self._claim_run(run_id, HumanRunAdmission.PREPARED)
+
+    def _claim_run(self, run_id: str, admission: HumanRunAdmission) -> HumanRunState:
         if self.lifecycle_blocked:
             raise RuntimeError("unresolved HUMAN ownership")
-        run = HumanRunState(run_id)
+        run = HumanRunState(run_id, _admission=admission)
         self._run = run
         return run
 
