@@ -176,6 +176,8 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEvent,
     SseEventType,
+    StartAttemptHoldRead,
+    StartAttemptHoldState,
     StrandedFaultRetirementEventData,
     StrandedFaultRetirementEventOutcome,
     StrandedFaultRetirementRequest,
@@ -3715,6 +3717,13 @@ class RoastService:
                 self._restart_clearance_state = RestartClearanceState.REQUIRED
             self._restart_epoch_initialized = True
 
+    async def _read_start_attempt_hold_fail_closed(self) -> StartAttemptHoldRead:
+        """Keep bounded-read failure distinct from validated empty evidence."""
+        try:
+            return await self._store.read_start_attempt_hold()
+        except HistoryUnavailable:
+            return StartAttemptHoldRead(StartAttemptHoldState.UNKNOWN)
+
     async def _read_fault_lease_fail_closed(self) -> FaultControlLease:
         """Load the current lease, treating any store failure as UNKNOWN."""
         if self._recording_replay_mode:
@@ -4327,6 +4336,11 @@ class RoastService:
             lease = await self._read_fault_lease_fail_closed()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
+            hold = await self._read_start_attempt_hold_fail_closed()
+            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                raise RoastRunConflictError("restart clearance evidence became stale")
+            if hold.state is not StartAttemptHoldState.CLEAR:
+                raise RoastRunConflictError("unresolved Start attempt clearance is required")
             active = await self._store.active_run()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
@@ -4448,6 +4462,12 @@ class RoastService:
                 return await self._safety_record_initialization_result("rejected")
             lease = await self._read_fault_lease_fail_closed()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+                return await self._safety_record_initialization_result("rejected")
+            hold = await self._read_start_attempt_hold_fail_closed()
+            if (
+                self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
+                or hold.state is not StartAttemptHoldState.CLEAR
+            ):
                 return await self._safety_record_initialization_result("rejected")
             try:
                 active = await self._store.active_run()
@@ -6525,6 +6545,10 @@ class RoastService:
                 )
             lease = await self._read_fault_lease_fail_closed()
             self._require_current_start_admission(admission_generation)
+            hold = await self._read_start_attempt_hold_fail_closed()
+            self._require_current_start_admission(admission_generation)
+            if hold.state is not StartAttemptHoldState.CLEAR:
+                raise RoastRunConflictError("unresolved Start attempt clearance is required")
             if self._fault_acknowledgement_gate.fault_finalization_started or (
                 self._command_arbiter.close_reservation_is_current(self._command_arbiter.generation)
             ):

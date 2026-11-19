@@ -71,6 +71,9 @@ from roastpilot_agent.models import (
     RoastTasting,
     RoastTelemetry,
     RoastTimeline,
+    StartAttemptHold,
+    StartAttemptHoldRead,
+    StartAttemptHoldState,
     TastingAttribute,
     TastingDefect,
     TelemetryPoint,
@@ -686,6 +689,23 @@ DROP TABLE process_restart_clearance;
 ALTER TABLE process_restart_clearance_new RENAME TO process_restart_clearance;
 """
 
+SCHEMA_V22_START_ATTEMPT_HOLD = """
+-- #1078: unresolved Start evidence is independent of all closure operations.
+CREATE TABLE start_attempt_hold (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  attempt_key TEXT NOT NULL UNIQUE
+    CHECK (length(attempt_key) = 32 AND attempt_key NOT GLOB '*[^0-9a-f]*'),
+  run_id TEXT NOT NULL UNIQUE REFERENCES roast_runs(id)
+    CHECK (length(run_id) = 32 AND run_id NOT GLOB '*[^0-9a-f]*'),
+  process_id TEXT NOT NULL
+    CHECK (length(process_id) = 32 AND process_id NOT GLOB '*[^0-9a-f]*'),
+  child_epoch INTEGER NOT NULL CHECK (typeof(child_epoch) = 'integer' AND child_epoch >= 1),
+  fault_lease_generation INTEGER NOT NULL
+    CHECK (typeof(fault_lease_generation) = 'integer' AND fault_lease_generation >= 0),
+  created_at_utc TEXT NOT NULL
+);
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -714,6 +734,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V19_FAULT_CONTROL_EVENTS,
     SCHEMA_V20_PROCESS_EPOCH,
     SCHEMA_V21_CLOSURE_ONLY_RESTART_CLEARANCE,
+    SCHEMA_V22_START_ATTEMPT_HOLD,
 )
 
 
@@ -1717,7 +1738,8 @@ class RoastStore:
         """CAS the current process gate from required to cleared."""
         cursor = await self.connection.execute(
             "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
-            "WHERE process_id = ? AND state = ?",
+            "WHERE process_id = ? AND state = ? "
+            "AND NOT EXISTS (SELECT 1 FROM start_attempt_hold)",
             (
                 RestartClearanceState.CLEARED.value,
                 _utc_now(),
@@ -1890,6 +1912,74 @@ class RoastStore:
             if connection is not None:
                 await self._close_connection(connection)
 
+    @_bounded(_StorageAccess.INDEPENDENT_READ)
+    async def read_start_attempt_hold(self) -> StartAttemptHoldRead:
+        """Read one validated committed snapshot; unreadable evidence is UNKNOWN.
+
+        Never use the shared connection: an uncommitted deletion there must
+        not admit Start. The bounded route may raise HistoryUnavailable before
+        entering this body; callers must also fail closed at that boundary.
+        """
+        unknown = StartAttemptHoldRead(StartAttemptHoldState.UNKNOWN)
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await self._open_connection()
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN")
+            async with connection.execute("SELECT * FROM start_attempt_hold LIMIT 2") as cursor:
+                expected = (
+                    "singleton",
+                    "attempt_key",
+                    "run_id",
+                    "process_id",
+                    "child_epoch",
+                    "fault_lease_generation",
+                    "created_at_utc",
+                )
+                if tuple(col[0] for col in cursor.description) != expected:
+                    return unknown
+                rows = list(await cursor.fetchmany(2))
+            if not rows:
+                return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
+            if len(rows) != 1:
+                return unknown
+            row = rows[0]
+            if type(row["singleton"]) is not int or row["singleton"] != 1:
+                return unknown
+            for key in ("attempt_key", "run_id", "process_id"):
+                if type(row[key]) is not str or re.fullmatch(r"[0-9a-f]{32}", row[key]) is None:
+                    return unknown
+            for key, minimum in (("child_epoch", 1), ("fault_lease_generation", 0)):
+                if type(row[key]) is not int or row[key] < minimum:
+                    return unknown
+            if type(row["created_at_utc"]) is not str:
+                return unknown
+            created_at = datetime.fromisoformat(row["created_at_utc"])
+            if created_at.tzinfo is None or created_at.utcoffset() != timedelta(0):
+                return unknown
+            async with connection.execute(
+                "SELECT 1 FROM roast_runs WHERE id = ?", (row["run_id"],)
+            ) as cursor:
+                if await cursor.fetchone() is None:
+                    return unknown
+            return StartAttemptHoldRead(
+                StartAttemptHoldState.HELD,
+                StartAttemptHold(
+                    attempt_key=row["attempt_key"],
+                    run_id=row["run_id"],
+                    process_id=row["process_id"],
+                    child_epoch=row["child_epoch"],
+                    fault_lease_generation=row["fault_lease_generation"],
+                    created_at_utc=created_at,
+                ),
+            )
+        except Exception:  # noqa: BLE001 - malformed or absent evidence is not clearance
+            return unknown
+        finally:
+            if connection is not None:
+                await self._close_connection(connection)
+
     @_bounded(_StorageAccess.READ)
     async def read_fault_control_lease(self) -> FaultControlLease:
         """Read the current lease, classifying unproven absence as UNKNOWN."""
@@ -1953,6 +2043,10 @@ class RoastStore:
         try:
             await self._configure_durable_connection(connection)
             await connection.execute("BEGIN IMMEDIATE")
+            async with connection.execute("SELECT 1 FROM start_attempt_hold LIMIT 1") as cursor:
+                if await cursor.fetchone() is not None:
+                    await self._rollback_connection(connection)
+                    return False
             absence = await self._probe_fault_control_lease_absence_from_connection(
                 connection,
                 absence_trusted=self._fault_lease_absence_trusted,

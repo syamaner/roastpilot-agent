@@ -62,6 +62,7 @@ EXPECTED_TABLES = {
     "process_restart_clearance",
     "fault_control_lease",
     "process_epoch",
+    "start_attempt_hold",
 }
 
 EXPECTED_INDEXES = {
@@ -257,7 +258,7 @@ async def test_process_epoch_unclean_or_upgraded_database_keeps_absent_lease_unk
         await successor.close()
 
     upgrade_path = tmp_path / "upgraded-process-epoch.sqlite3"
-    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:-1])
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:20])
     old = RoastStore(upgrade_path)
     await old.initialize()
     await old.close()
@@ -591,16 +592,20 @@ async def test_v21_migration_preserves_clearance_rows_and_process_epoch(
             await old.begin_process_restart_clearance("cleared-process")
             is RestartClearanceState.REQUIRED
         )
-        assert await old.confirm_process_restart_clearance("cleared-process")
+        await old.connection.execute(
+            "UPDATE process_restart_clearance SET state = 'cleared' WHERE process_id = ?",
+            ("cleared-process",),
+        )
+        await old.connection.commit()
         assert await old.begin_process_epoch("v20-process")
     finally:
         await old.close()
 
-    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:21])
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 21 == len(MIGRATIONS[:21])
         assert (
             await upgraded.read_process_restart_clearance("required-process")
             is RestartClearanceState.REQUIRED
@@ -893,7 +898,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -909,11 +914,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v21(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v21) schema version."""
+async def test_fresh_store_is_v22(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v22) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 21 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 22 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -937,7 +942,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21
+        assert await upgraded.schema_version() == 22
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -966,7 +971,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -1023,7 +1028,7 @@ async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
         [point] = await upgraded.read_telemetry_points("run-1")
         assert point.post_fc_recovery_enabled is None
         assert point.post_fc_heat_authority_state is None
@@ -1060,7 +1065,7 @@ async def test_v17_migration_preserves_historical_event_ids_and_index(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 21 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
         assert (
             await fetch_one(upgraded, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
             == historical
@@ -11398,3 +11403,252 @@ async def test_human_clean_epoch_cannot_verify_an_uncommitted_marker(
             assert row[0] == "unclean"
     finally:
         await tmp_store.close()
+
+
+async def _seed_start_hold(store: RoastStore) -> tuple[object, ...]:
+    """Create a synthetic terminal run and its unresolved attempt evidence."""
+    run_id = "b" * 32
+    await store.create_run(
+        run_id=run_id, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await store.complete_run(run_id=run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    values: tuple[object, ...] = (1, "a" * 32, run_id, "c" * 32, 1, 0, "2026-11-19T10:00:00+00:00")
+    await store.connection.execute(
+        "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
+    )
+    await store.connection.commit()
+    return values
+
+
+@pytest.mark.asyncio
+async def test_start_hold_empty_and_committed_read_ignores_shared_deletion(
+    tmp_store: RoastStore,
+) -> None:
+    """Only committed absence clears; the read never observes an uncommitted delete."""
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    await tmp_store.initialize()
+    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+    values = await _seed_start_hold(tmp_store)
+    held = await tmp_store.read_start_attempt_hold()
+    assert held.state is StartAttemptHoldState.HELD and held.record is not None
+    assert held.record.attempt_key == values[1]
+    assert held.record.run_id == values[2]
+    assert held.record.process_id == values[3]
+    assert held.record.child_epoch == 1 and held.record.fault_lease_generation == 0
+    assert held.record.created_at_utc == datetime(2026, 11, 19, 10, tzinfo=UTC)
+    await tmp_store.connection.execute("DELETE FROM start_attempt_hold")
+    assert await tmp_store.read_start_attempt_hold() == held
+    await tmp_store.connection.rollback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("singleton", 2),
+        ("singleton", "one"),
+        ("attempt_key", "A" * 32),
+        ("attempt_key", "a" * 31),
+        ("run_id", "d" * 32),
+        ("process_id", "g" * 32),
+        ("child_epoch", 0),
+        ("child_epoch", 1.5),
+        ("child_epoch", "one"),
+        ("fault_lease_generation", -1),
+        ("fault_lease_generation", 0.5),
+        ("created_at_utc", "invalid"),
+        ("created_at_utc", "2026-11-19T10:00:00"),
+        ("created_at_utc", "2026-11-19T10:00:00+01:00"),
+        ("created_at_utc", 42),
+    ],
+)
+async def test_start_hold_corrupt_producer_is_unknown(
+    tmp_store: RoastStore, column: str, value: object
+) -> None:
+    """Compromised constraints cannot turn invalid or orphan evidence into CLEAR."""
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    await tmp_store.initialize()
+    values = list(await _seed_start_hold(tmp_store))
+    names = [
+        "singleton",
+        "attempt_key",
+        "run_id",
+        "process_id",
+        "child_epoch",
+        "fault_lease_generation",
+        "created_at_utc",
+    ]
+    values[names.index(column)] = value
+    await tmp_store.connection.execute("DROP TABLE start_attempt_hold")
+    await tmp_store.connection.execute("CREATE TABLE start_attempt_hold (" + ", ".join(names) + ")")
+    await tmp_store.connection.execute(
+        "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
+    )
+    await tmp_store.connection.commit()
+    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("shape", ["missing", "extra", "reordered", "duplicate", "truncated"])
+async def test_start_hold_unknown_inventory_or_multiple_rows(
+    tmp_store: RoastStore, shape: str
+) -> None:
+    """The full table inventory and at most two rows are validated even when empty."""
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    await tmp_store.initialize()
+    values = await _seed_start_hold(tmp_store)
+    names = [
+        "singleton",
+        "attempt_key",
+        "run_id",
+        "process_id",
+        "child_epoch",
+        "fault_lease_generation",
+        "created_at_utc",
+    ]
+    await tmp_store.connection.execute("DROP TABLE start_attempt_hold")
+    if shape != "missing":
+        if shape == "extra":
+            names.append("surprise")
+        elif shape == "reordered":
+            names.reverse()
+        elif shape == "truncated":
+            names.pop()
+        await tmp_store.connection.execute(
+            "CREATE TABLE start_attempt_hold (" + ", ".join(names) + ")"
+        )
+        if shape == "duplicate":
+            await tmp_store.connection.executemany(
+                "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", [values, values]
+            )
+    await tmp_store.connection.commit()
+    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+
+
+@pytest.mark.asyncio
+async def test_start_hold_open_failure_is_unknown_and_cancellation_propagates(
+    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed independent open is unproven, while cancellation remains cancellation."""
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    await tmp_store.initialize()
+    with mock.patch.object(
+        tmp_store, "_open_connection", mock.AsyncMock(side_effect=OSError("failed"))
+    ):
+        assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+    with (
+        mock.patch.object(
+            tmp_store, "_open_connection", mock.AsyncMock(side_effect=asyncio.CancelledError)
+        ),
+        pytest.raises(asyncio.CancelledError),
+    ):
+        await tmp_store.read_start_attempt_hold()
+
+
+@pytest.mark.asyncio
+async def test_start_hold_transaction_backstops_preserve_row(tmp_store: RoastStore) -> None:
+    """A hold committed after service proof defeats both actual SQL mutation paths."""
+    await tmp_store.initialize()
+    await tmp_store.begin_process_epoch("current")
+    await tmp_store.begin_process_restart_clearance("current")
+    values = await _seed_start_hold(tmp_store)
+    assert not await tmp_store.confirm_process_restart_clearance("current")
+    assert (
+        await tmp_store.read_process_restart_clearance("current")
+    ) is RestartClearanceState.REQUIRED
+    assert not await tmp_store.initialize_missing_fault_control_safety_record(
+        process_id="current", generation=1, operation_id="baseline"
+    )
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    assert await fetch_one(tmp_store, "SELECT * FROM start_attempt_hold") == values
+
+
+@pytest.mark.asyncio
+async def test_v22_upgrade_preserves_all_v21_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """V22 adds only empty hold storage and retains history, epoch, clearance and lease."""
+    path = tmp_path / "v22.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:21])
+    old = RoastStore(path)
+    await old.initialize()
+    await old.begin_process_epoch("predecessor")
+    await old.begin_process_restart_clearance("predecessor")
+    await old.create_run(
+        run_id="b" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    await old.complete_run(run_id="b" * 32, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+    await old.connection.execute(
+        "INSERT INTO fault_control_lease "
+        "VALUES (1, ?, 'session', 1, 'open', '2026-11-19T10:00:00+00:00')",
+        ("b" * 32,),
+    )
+    await old.connection.commit()
+    tables = ["roast_runs", "process_epoch", "process_restart_clearance", "fault_control_lease"]
+    before = [await fetch_one(old, "SELECT * FROM " + table) for table in tables]
+    await old.close()
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    new = RoastStore(path)
+    await new.initialize()
+    try:
+        assert await new.schema_version() == 22
+        assert [await fetch_one(new, "SELECT * FROM " + table) for table in tables] == before
+        assert await fetch_one(new, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    finally:
+        await new.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "index,value",
+    [
+        (0, 2),
+        (1, "A" * 32),
+        (1, "a" * 31),
+        (2, "d" * 32),
+        (3, "g" * 32),
+        (4, 0),
+        (4, 1.5),
+        (5, -1),
+        (5, 0.5),
+    ],
+)
+async def test_v22_start_hold_constraints_reject_invalid_writer_values(
+    tmp_store: RoastStore, index: int, value: object
+) -> None:
+    """The closed schema prevents malformed identities, epochs, generations and orphans."""
+    await tmp_store.initialize()
+    values = list(await _seed_start_hold(tmp_store))
+    await tmp_store.connection.execute("DELETE FROM start_attempt_hold")
+    await tmp_store.connection.commit()
+    values[index] = value
+    with pytest.raises(sqlite3.IntegrityError):
+        await tmp_store.connection.execute(
+            "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
+        )
+    await tmp_store.connection.rollback()
+
+
+def test_start_hold_read_record_invariant() -> None:
+    """HELD is the only state that can carry the internal frozen record."""
+    from dataclasses import FrozenInstanceError
+
+    from roastpilot_agent.models import (
+        StartAttemptHold,
+        StartAttemptHoldRead,
+        StartAttemptHoldState,
+    )
+
+    record = StartAttemptHold("a" * 32, "b" * 32, "c" * 32, 1, 0, datetime.now(UTC))
+    for state in (StartAttemptHoldState.CLEAR, StartAttemptHoldState.UNKNOWN):
+        with pytest.raises(ValueError, match="only HELD"):
+            StartAttemptHoldRead(state, record)
+    with pytest.raises(ValueError, match="only HELD"):
+        StartAttemptHoldRead(StartAttemptHoldState.HELD)
+    with pytest.raises(FrozenInstanceError):
+        record.child_epoch = 2  # pyright: ignore[reportAttributeAccessIssue]
