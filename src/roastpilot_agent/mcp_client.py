@@ -41,6 +41,7 @@ import re
 import secrets
 import shutil
 import signal
+import stat
 import sys
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
@@ -49,6 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
+import yaml
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import (
@@ -75,12 +77,30 @@ from roastpilot_agent.human_protection import (
     ContainmentOutcome,
     ContainmentReason,
     ContainmentResult,
+    ControlAuthority,
     CounterEvidence,
     HumanReadEvidence,
     RawTemperature,
     ToolDiscovery,
     classify_raw_temperature,
     extract_accepted_counters,
+)
+from roastpilot_agent.launch_composition import (
+    AUTHORITY_ENV_KEY,
+    AuthorityClass,
+    ChildConfigRead,
+    ChildConfigSelection,
+    ConfigReadStatus,
+    LaunchEvidence,
+    LaunchProofStatus,
+    LaunchRecord,
+    LaunchRefusal,
+    LaunchRefusalError,
+    RequestedCapture,
+    bind_launch_record,
+    finalize_child_launch,
+    prepare_child_launch,
+    require_launch_proof,
 )
 from roastpilot_agent.models import (
     AppliedRoasterState,
@@ -1961,6 +1981,27 @@ class MCPConnectionError(Exception):
     it to fail-closed — never silent reconnect-and-continue."""
 
 
+class LaunchCompositionError(MCPConnectionError):
+    """A launch refused before the child is spawned (#1078 C1).
+
+    The message names the refusal and at most a key name, never a value or a
+    path. It is an :class:`MCPConnectionError`, so it travels the existing
+    startup-failure path and :meth:`MCPServerProcess.start` re-raises it
+    unchanged.
+    """
+
+    def __init__(self, refusal: LaunchRefusal, key: str | None = None) -> None:
+        """Build the error.
+
+        Args:
+            refusal: The domain refusal reason.
+            key: The key name involved, if any.
+        """
+        super().__init__(refusal.name if key is None else f"{refusal.name}: {key}")
+        self.refusal = refusal
+        self.key = key
+
+
 class MCPToolTimeoutError(MCPConnectionError):
     """An MCP call exceeded ``call_timeout_seconds`` — the child is wedged.
 
@@ -2448,6 +2489,131 @@ async def _call_fixed_zero_sdk(session: ToolSession, arguments: dict[str, object
     return await session.call_tool(_FIXED_ZERO_TOOL, arguments)
 
 
+#: Byte bound for the launch-composition read of the child's selected config,
+#: matching the cold rendered-config allowance without importing that module.
+_MAX_LAUNCH_CONFIG_BYTES = 131_072
+
+
+@dataclass(frozen=True)
+class _ConfigFileOps:
+    """The OS seams of the bounded config read (replaceable in tests).
+
+    ``nofollow_flag`` and ``nonblock_flag`` are required; ``None`` means the
+    platform lacks the safe-open support and an existing target is unreadable.
+    """
+
+    realpath: Callable[[str], str]
+    lstat: Callable[[str], os.stat_result]
+    open: Callable[[str, int], int]
+    fstat: Callable[[int], os.stat_result]
+    read: Callable[[int, int], bytes]
+    close: Callable[[int], None]
+    nofollow_flag: int | None
+    nonblock_flag: int | None
+    optional_flags: int
+
+
+def _strict_realpath(path: str) -> str:
+    return os.path.realpath(path, strict=True)
+
+
+_CONFIG_FILE_OPS = _ConfigFileOps(
+    realpath=_strict_realpath,
+    lstat=os.lstat,
+    open=os.open,
+    fstat=os.fstat,
+    read=os.read,
+    close=os.close,
+    nofollow_flag=getattr(os, "O_NOFOLLOW", None),
+    nonblock_flag=getattr(os, "O_NONBLOCK", None),
+    optional_flags=getattr(os, "O_NOCTTY", 0) | getattr(os, "O_CLOEXEC", 0),
+)
+
+
+def _read_bounded_regular_file(path_text: str) -> bytes | ConfigReadStatus:
+    """Read one existing regular file through a no-follow, nonblocking descriptor.
+
+    Returns the bytes, or ``MISSING`` when the path does not resolve, or
+    ``UNREADABLE`` for a non-regular target, swapped identity, absent safe-open
+    support or more than :data:`_MAX_LAUNCH_CONFIG_BYTES`. The descriptor is
+    always closed. This is a byte/type/identity admission rule, not a
+    wall-clock bound or a guarantee of what the child later reads.
+    """
+    ops = _CONFIG_FILE_OPS
+    try:
+        resolved = ops.realpath(path_text)
+    except FileNotFoundError:
+        return ConfigReadStatus.MISSING
+    inspected = ops.lstat(resolved)
+    if not stat.S_ISREG(inspected.st_mode):
+        return ConfigReadStatus.UNREADABLE
+    if ops.nofollow_flag is None or ops.nonblock_flag is None:
+        return ConfigReadStatus.UNREADABLE
+    flags = os.O_RDONLY | ops.nofollow_flag | ops.nonblock_flag | ops.optional_flags
+    fd = ops.open(resolved, flags)
+    try:
+        opened = ops.fstat(fd)
+        if not stat.S_ISREG(opened.st_mode) or (opened.st_dev, opened.st_ino) != (
+            inspected.st_dev,
+            inspected.st_ino,
+        ):
+            return ConfigReadStatus.UNREADABLE
+        data = bytearray()
+        while len(data) <= _MAX_LAUNCH_CONFIG_BYTES:
+            chunk = ops.read(fd, _MAX_LAUNCH_CONFIG_BYTES + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+        if len(data) > _MAX_LAUNCH_CONFIG_BYTES:
+            return ConfigReadStatus.UNREADABLE
+        return bytes(data)
+    finally:
+        ops.close(fd)
+
+
+def _read_child_config(selection: ChildConfigSelection) -> ChildConfigRead:
+    """Read and safe-parse the child's selected config for launch composition.
+
+    Structural validation and every refusal decision stay in
+    :mod:`roastpilot_agent.launch_composition`. Errors become ``UNREADABLE``
+    with no exception text or contents retained.
+    """
+    try:
+        data = _read_bounded_regular_file(selection.path_text)
+        if isinstance(data, ConfigReadStatus):
+            return ChildConfigRead(data)
+        document: object = yaml.safe_load(data.decode("utf-8"))
+    except (OSError, ValueError, yaml.YAMLError, RecursionError):
+        # ValueError covers UnicodeDecodeError and an embedded-NUL path.
+        return ChildConfigRead(ConfigReadStatus.UNREADABLE)
+    return ChildConfigRead(ConfigReadStatus.LOADED, document)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PendingLaunch:
+    """Transport-private proof of one base composition (never logged or exposed).
+
+    ``parameters`` is the exact object the base builder returned and
+    ``snapshot`` an independent deep copy of all its SDK fields; the owner task
+    spawns only when that exact object is still unchanged.
+    """
+
+    parameters: StdioServerParameters
+    snapshot: StdioServerParameters
+    evidence: LaunchEvidence
+
+
+def _launch_proof_status(
+    pending: _PendingLaunch | None, params: StdioServerParameters
+) -> LaunchProofStatus:
+    """Compare spawn parameters with the base composition proof (identity + all fields)."""
+    if pending is None:
+        return LaunchProofStatus.ABSENT
+    if params is pending.parameters and params == pending.snapshot:
+        return LaunchProofStatus.MATCHED
+    return LaunchProofStatus.MISMATCHED
+
+
 class MCPServerProcess:
     """Owns the coffee-roaster-mcp stdio child process (D6, E5-S2).
 
@@ -2466,6 +2632,7 @@ class MCPServerProcess:
         session: ToolSession | None = None,
         session_factory: SessionFactory | None = None,
         force_terminate: ForceTerminate | None = None,
+        human_capture: RequestedCapture | None = None,
     ) -> None:
         """Initialize the transport.
 
@@ -2485,7 +2652,23 @@ class MCPServerProcess:
                 When provided, it is used directly on fail-closed teardown
                 instead of the spawned-pid hook, letting uncertain-lifecycle
                 paths be unit tested without a real process.
+            human_capture: Constructor-injected HUMAN (manual/mock) capture
+                request (#1078 C1). ``None`` (the default, and the only value
+                any live path passes) launches AUTOMATIC. There is no public
+                config, CLI or API selector; a HUMAN launch is non-admitted
+                until a later strict post-attach readback.
+
+        Raises:
+            TypeError: If ``human_capture`` is not exactly a RequestedCapture.
         """
+        if human_capture is not None and type(human_capture) is not RequestedCapture:
+            raise TypeError("human_capture must be a RequestedCapture or None")
+        self._human_capture: RequestedCapture | None = human_capture
+        #: The launch record bound at the current attach epoch (cleared on any
+        #: session change); ``None`` for a legacy builder or injected session.
+        self._launch_record: LaunchRecord | None = None
+        #: Transient proof of the latest base composition; consumed by the owner.
+        self._pending_launch: _PendingLaunch | None = None
         self._config = config or MCPConfig()
         self._device_config: MCPDeviceConfig | None = device_config
         self._session: ToolSession | None = session  # injectable test seam
@@ -2609,6 +2792,33 @@ class MCPServerProcess:
         ``COFFEE_ROASTER_MCP_CONFIG`` is left exactly as the operator set it —
         so a default all-``None`` ``mcp_device`` on a ``roast-live.sh`` roast
         does not overwrite the operator's proven Hottop yaml with an empty one.
+
+        **Launch composition (#1078 C1)** — the environment is composed by
+        :mod:`roastpilot_agent.launch_composition`: an inherited authority
+        carrier is withheld from the merge base, incompatible authority
+        carriers or configuration are refused before spawn
+        (:class:`LaunchCompositionError`), and a constructor-injected HUMAN
+        capture pins its 15 keys. This base method remains the public virtual
+        spawn seam; it records a transient private proof of the exact returned
+        object, which the owner task consumes only for a launch it starts. A
+        preview call never binds a launch record.
+
+        Raises:
+            LaunchCompositionError: The composition was refused before spawn.
+        """
+        params, evidence = self._compose_launch()
+        self._pending_launch = _PendingLaunch(params, params.model_copy(deep=True), evidence)
+        return params
+
+    def _compose_launch(self) -> tuple[StdioServerParameters, LaunchEvidence]:
+        """Render managed YAML (unchanged), then compose and validate the launch.
+
+        Returns:
+            The spawn parameters and the evidence of their composition.
+
+        Raises:
+            LaunchCompositionError: The domain refused the launch; any temp dir
+                rendered by this call is removed first.
         """
         import tempfile  # noqa: PLC0415
 
@@ -2620,6 +2830,7 @@ class MCPServerProcess:
 
         # Start from the MCPConfig.env overrides (E9-S2 mock-driver path).
         extra_env: dict[str, str] = dict(self._config.env)
+        rendered_by_this_call: Path | None = None
 
         if self._device_config is not None:
             # Resolve the source yaml in priority order (#482: extracted into
@@ -2662,12 +2873,40 @@ class MCPServerProcess:
                     shutil.rmtree(tmp_dir, ignore_errors=True)
                     self._rendered_yaml_dir = None
                     raise
+                rendered_by_this_call = tmp_dir
                 extra_env["COFFEE_ROASTER_MCP_CONFIG"] = str(dest)
                 _log.debug("rendered MCP yaml → %s (source=%s)", dest, source)
 
-        env: dict[str, str] | None = {**os.environ, **extra_env} if extra_env else None
-        command = resolve_mcp_command(self._config.command)
-        return StdioServerParameters(command=command, args=["serve"], env=env)
+        try:
+            prepared = prepare_child_launch(
+                explicit_env=extra_env, inherited_env=os.environ, capture=self._human_capture
+            )
+            composition = finalize_child_launch(prepared, _read_child_config(prepared.selection))
+            params = StdioServerParameters(
+                command=resolve_mcp_command(self._config.command),
+                args=["serve"],
+                env=composition.env,
+            )
+        except Exception as exc:
+            if rendered_by_this_call is not None:
+                # This call set the pointer synchronously above; drop both.
+                shutil.rmtree(rendered_by_this_call, ignore_errors=True)
+                self._rendered_yaml_dir = None
+            if isinstance(exc, LaunchRefusalError):
+                _log.warning(
+                    "MCP launch refused before spawn: %s (key: %s)",
+                    exc.refusal.name,
+                    exc.key or "-",
+                )
+                raise LaunchCompositionError(exc.refusal, exc.key) from None
+            raise
+        if composition.evidence.inherited_authority is not AuthorityClass.ABSENT:
+            _log.warning(
+                "inherited %s withheld from the MCP child merge base (class %s)",
+                AUTHORITY_ENV_KEY,
+                composition.evidence.inherited_authority.name,
+            )
+        return params, composition.evidence
 
     @property
     def device_config(self) -> MCPDeviceConfig | None:
@@ -2710,12 +2949,53 @@ class MCPServerProcess:
         return self._child_epoch
 
     def _replace_session(self, session: ToolSession | None) -> None:
-        """Set the attached session and advance its in-process identity."""
+        """Set the attached session and advance its in-process identity.
+
+        Always drops the transient launch proof; a launch record is dropped
+        whenever the attached session actually changes, before the epoch moves.
+        """
+        self._pending_launch = None
         if self._session is session:
             return
+        self._launch_record = None
         self._session = session
         self._child_epoch += 1
         self._fixed_zero_discovery = None
+
+    def launch_record_for_epoch(self, epoch: object) -> LaunchRecord | None:
+        """Return the launch record only for the exact current attach epoch.
+
+        The record is requested/configured composition consumed at that epoch,
+        not effective configuration or physical capture (#1078 C1).
+
+        Args:
+            epoch: The child epoch the caller is asking about; only an exact
+                ``int`` equal to both the record's and the current epoch matches.
+
+        Returns:
+            The record, or ``None`` for any other epoch, a detached child, an
+            injected session or a legacy builder that produced no proof.
+        """
+        record = self._launch_record
+        if type(epoch) is not int or self._session is None or record is None:
+            return None
+        if record.child_epoch != epoch or epoch != self._child_epoch:
+            return None
+        return record
+
+    def _require_launch_proof(
+        self, params: StdioServerParameters, pending: _PendingLaunch | None
+    ) -> None:
+        """Apply the domain proof policy to ``params``; refusals become typed errors."""
+        authority = (
+            ControlAuthority.AUTOMATIC if self._human_capture is None else ControlAuthority.HUMAN
+        )
+        status = _launch_proof_status(pending, params)
+        try:
+            require_launch_proof(authority, status)
+        except LaunchRefusalError as exc:
+            _log.warning("MCP launch refused before attach: %s", exc.refusal.name)
+            raise LaunchCompositionError(exc.refusal, exc.key) from None
 
     @property
     def fixed_zero_discovery(self) -> ToolDiscovery:
@@ -2848,13 +3128,25 @@ class MCPServerProcess:
             async with AsyncExitStack() as stack:
                 try:
                     try:
-                        session = await stack.enter_async_context(
-                            self._session_factory(self.build_server_parameters())
-                        )
+                        # #1078 C1: the public virtual builder stays the spawn
+                        # seam (cold override included). Only a proof produced
+                        # by THIS call can match; a preview cannot be consumed.
+                        self._pending_launch = None
+                        params = self.build_server_parameters()
+                        pending = self._pending_launch
+                        self._pending_launch = None
+                        self._require_launch_proof(params, pending)
+                        session = await stack.enter_async_context(self._session_factory(params))
                         await asyncio.wait_for(
                             session.initialize(), timeout=self._config.startup_timeout_seconds
                         )
+                        # The exact object must still match its snapshot at attach.
+                        self._require_launch_proof(params, pending)
                         self._replace_session(session)
+                        if pending is not None:
+                            self._launch_record = bind_launch_record(
+                                pending.evidence, self._child_epoch
+                            )
                         # Health check through the public surface before we report ready.
                         await self.call_tool("get_server_info", {})
                     except Exception as exc:  # startup failure: unwind + report to start()
