@@ -5,7 +5,9 @@ extend this suite. Mirror shapes are derived from the coffee-roaster-mcp
 source and validated here against the 7 Jun 2026 live-roast exports.
 """
 
+import ast
 import asyncio
+import dataclasses
 import importlib.util
 import json
 import logging
@@ -15,18 +17,43 @@ import signal
 import subprocess
 import sys
 import time
-from contextlib import AbstractAsyncContextManager, suppress
+from collections.abc import AsyncGenerator, Callable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import cast
 
+import anyio
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
+from mcp import ClientSession
+from mcp.shared.message import SessionMessage
+from mcp.types import CallToolResult, JSONRPCMessage, JSONRPCRequest, JSONRPCResponse
 from pydantic import ValidationError
 
+import roastpilot_agent.human_bootstrap as hb
 import roastpilot_agent.mcp_client as mcp_client_module
 from roastpilot_agent.cold_characterisation.mcp import SessionFinalisationResult, StrictMCPMirror
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig
+from roastpilot_agent.human_bootstrap import (
+    BootstrapRead,
+    BootstrapRefusal,
+    EnvelopeMember,
+    HumanBootstrapEvidence,
+    HumanBootstrapRefused,
+)
+from roastpilot_agent.human_protection import ControlAuthority
+from roastpilot_agent.launch_composition import (
+    AudioSourceKind,
+    ChildConfigRead,
+    ConfigReadStatus,
+    LaunchEvidence,
+    LaunchRecord,
+    RequestedCapture,
+    bind_launch_record,
+    finalize_child_launch,
+    prepare_child_launch,
+)
 from roastpilot_agent.mcp_client import (
     AmbientStatus,
     ControlCommandResult,
@@ -4825,3 +4852,1213 @@ def test_first_crack_status_overflow_fields_round_trip() -> None:
     assert status.overflow_count_last_minute == 4
     assert status.estimated_lost_audio_ms_last_minute == 812.5
     assert status.total_overflow_count == 19
+
+
+# --- #1078 C2a: strict HUMAN manual/mock bootstrap readback ---
+#
+# Synthetic, complete payloads following the observed envelope and field
+# grammar. Test values only (timestamps, paths, selectors); no private data.
+
+_BS_SENTINEL = "PRIVATE-SENTINEL-c2a"
+_BS_SERVER_INFO: dict[str, object] = {
+    "product_name": "RoastPilot",
+    "package_name": "coffee-roaster-mcp",
+    "version": "0.2.4",
+    "transport": "stdio",
+    "current_phase": "bootstrap",
+    "roaster_driver": "mock",
+    "first_crack_mode": "audio",
+    "bootstrap_safe": False,
+    "session_presence": "none",
+    "available_bootstrap_tools": list(hb.BOOTSTRAP_TOOL_INVENTORY),
+    "started_at_utc": "2026-01-01T00:00:00+00:00",
+}
+_BS_RUNTIME_CONFIG: dict[str, object] = {
+    "config_source": None,
+    "roaster_driver": "mock",
+    "roaster_port": None,
+    "roaster_baudrate": 115200,
+    "temperature_unit": "celsius",
+    "command_interval_seconds": 0.3,
+    "first_crack_mode": "audio",
+    "first_crack_event_authority": "manual",
+    "first_crack_observer_protocol": "manual/v1",
+    "model_repo_id": "test-org/test-model",
+    "model_precision": "int8",
+    "allow_manual_override": True,
+    "log_dir": "test-logs",
+    "sample_interval_seconds": 1.0,
+    "auto_t0_detection_enabled": True,
+    "auto_t0_drop_threshold_c": 25.0,
+}
+_BS_CAPTURE_REQUEST: dict[str, object] = {
+    "capture_protocol": "capture_evidence/v1",
+    "intent": "bootstrap",
+}
+_BS_CAPTURE_EVIDENCE: dict[str, object] = {
+    **_BS_CAPTURE_REQUEST,
+    "capability": "manual_mock_capture",
+}
+_BS_PAYLOADS: dict[BootstrapRead, dict[str, object]] = {
+    BootstrapRead.SERVER_INFO: _BS_SERVER_INFO,
+    BootstrapRead.RUNTIME_CONFIG: _BS_RUNTIME_CONFIG,
+    BootstrapRead.CAPTURE_EVIDENCE: _BS_CAPTURE_EVIDENCE,
+}
+_BS_READS = list(hb.BOOTSTRAP_READ_ORDER)
+_BS_ORDER: list[tuple[str, dict[str, object] | None]] = [
+    ("get_server_info", {}),
+    ("get_runtime_config", {}),
+    ("get_capture_evidence", _BS_CAPTURE_REQUEST),
+]
+
+
+def _bs_copy(value: object) -> dict[str, object]:
+    return cast("dict[str, object]", json.loads(json.dumps(value)))
+
+
+def _bs_wrap(read: BootstrapRead, result: object) -> object:
+    return {"result": result} if read is BootstrapRead.CAPTURE_EVIDENCE else result
+
+
+def _bs_raw(
+    read: BootstrapRead,
+    structured: object | None = None,
+    text_value: object | None = None,
+) -> dict[str, object]:
+    """One raw MCP tools/call result: one text block plus the structured member."""
+    payload = _bs_copy(_BS_PAYLOADS[read])
+    structured_value = payload if structured is None else structured
+    text_object = structured_value if text_value is None else text_value
+    return {
+        "content": [{"type": "text", "text": json.dumps(text_object)}],
+        "structuredContent": _bs_wrap(read, structured_value),
+        "isError": False,
+    }
+
+
+def _bs_decode(
+    read: BootstrapRead, raw: dict[str, object], *, config_present: bool = False
+) -> dict[str, object] | None:
+    return hb.decode_bootstrap_reply(
+        read,
+        is_error=raw.get("isError", False),
+        content=raw.get("content", EnvelopeMember.ABSENT),
+        structured=raw.get("structuredContent", EnvelopeMember.ABSENT),
+        config_present=config_present,
+    )
+
+
+def _bs_capture(window: float = 10.0) -> RequestedCapture:
+    return RequestedCapture(
+        source=AudioSourceKind.MICROPHONE,
+        detector_selector="test-selector",
+        wav_path=None,
+        detector_sample_rate_hz=16000,
+        window_seconds=window,
+        overlap=0.7,
+        hop_seconds=None,
+    )
+
+
+def _bs_evidence(capture: RequestedCapture, *, config_present: bool = False) -> LaunchEvidence:
+    prepared = prepare_child_launch(explicit_env={}, inherited_env={}, capture=capture)
+    evidence = finalize_child_launch(prepared, ChildConfigRead(ConfigReadStatus.MISSING)).evidence
+    return dataclasses.replace(evidence, config_present=config_present)
+
+
+class _Hang:
+    """Reply marker: the call never completes."""
+
+
+class _BootstrapDouble:
+    """Initializable session double on the existing session protocol."""
+
+    def __init__(self) -> None:
+        self.replies: dict[str, object] = {
+            read.value: CallToolResult.model_validate(_bs_raw(read)) for read in _BS_READS
+        }
+        self.calls: list[tuple[str, dict[str, object] | None]] = []
+        self.during: dict[str, Callable[[], None]] = {}
+
+    async def initialize(self) -> object:
+        return None
+
+    async def call_tool(self, name: str, arguments: dict[str, object] | None = None) -> object:
+        self.calls.append((name, None if arguments is None else dict(arguments)))
+        await asyncio.sleep(0)
+        action = self.during.get(name)
+        if action is not None:
+            action()
+        reply = self.replies[name]
+        if isinstance(reply, _Hang):
+            await asyncio.Event().wait()
+        if isinstance(reply, BaseException):
+            raise reply
+        return reply
+
+
+def _bs_bind(process: MCPServerProcess, evidence: LaunchEvidence) -> LaunchRecord:
+    record = bind_launch_record(evidence, process.child_epoch)
+    process._launch_record = record  # pyright: ignore[reportPrivateUsage]
+    return record
+
+
+def _bs_process(
+    session: object,
+    *,
+    capture: RequestedCapture | None = None,
+    config_present: bool = False,
+    config: MCPConfig | None = None,
+) -> MCPServerProcess:
+    requested = capture if capture is not None else _bs_capture()
+    process = MCPServerProcess(
+        config, session=cast("InitializableSession", session), human_capture=requested
+    )
+    _bs_bind(process, _bs_evidence(requested, config_present=config_present))
+    return process
+
+
+async def _bs_read(process: MCPServerProcess) -> hb.HumanBootstrapReadback:
+    return await process._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
+
+
+def _bs_refused(reason: BootstrapRefusal, read: BootstrapRead | None) -> HumanBootstrapRefused:
+    return HumanBootstrapRefused(reason, read)
+
+
+# ------------------------------------------------------------- positive readback
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config_present", "config_source", "roaster_port"),
+    [(False, None, None), (True, "test-config.yaml", "test-port")],
+)
+async def test_c2a_reads_three_tools_once_in_order_and_returns_evidence(
+    config_present: bool, config_source: str | None, roaster_port: str | None
+) -> None:
+    double = _BootstrapDouble()
+    runtime = {**_bs_copy(_BS_RUNTIME_CONFIG), "config_source": config_source}
+    runtime["roaster_port"] = roaster_port
+    double.replies["get_runtime_config"] = CallToolResult.model_validate(
+        _bs_raw(BootstrapRead.RUNTIME_CONFIG, runtime)
+    )
+    process = _bs_process(double, config_present=config_present)
+    epoch = process.child_epoch
+    record = process.launch_record_for_epoch(epoch)
+    assert record is not None
+    evidence_before = record.evidence
+
+    result = await _bs_read(process)
+
+    assert result == HumanBootstrapEvidence(
+        child_epoch=epoch,
+        server_version="0.2.4",
+        started_at_utc="2026-01-01T00:00:00+00:00",
+        config_present=config_present,
+        roaster_port_present=roaster_port is not None,
+        roaster_baudrate=115200,
+        command_interval_seconds=0.3,
+        sample_interval_seconds=1.0,
+        auto_t0_detection_enabled=True,
+        auto_t0_drop_threshold_c=25.0,
+        capture_capability="manual_mock_capture",
+    )
+    assert double.calls == _BS_ORDER
+    # Launch evidence is neither replaced nor mutated; no private values retained.
+    assert process.launch_record_for_epoch(epoch) is record
+    assert record.evidence is evidence_before
+    assert process.child_epoch == epoch
+    for private in ("test-config.yaml", "test-port", "test-logs", "test-org/test-model", "int8"):
+        assert private not in repr(result)
+
+
+def test_c2a_evidence_field_set_is_closed() -> None:
+    assert {f.name for f in dataclasses.fields(HumanBootstrapEvidence)} == {
+        "child_epoch",
+        "server_version",
+        "started_at_utc",
+        "config_present",
+        "roaster_port_present",
+        "roaster_baudrate",
+        "command_interval_seconds",
+        "sample_interval_seconds",
+        "auto_t0_detection_enabled",
+        "auto_t0_drop_threshold_c",
+        "capture_capability",
+    }
+    assert {f.name for f in dataclasses.fields(HumanBootstrapRefused)} == {"reason", "read"}
+    assert [r.value for r in hb.BOOTSTRAP_READ_ORDER] == [name for name, _ in _BS_ORDER]
+    assert {r.name for r in BootstrapRefusal} == {
+        "MISSING_LAUNCH_FRAMING",
+        "DISPLACED_FRAMING",
+        "READ_FAILED",
+        "INVALID_PAYLOAD",
+    }
+
+
+def test_c2a_capture_arguments_are_exact_and_fresh() -> None:
+    first = hb.bootstrap_arguments(BootstrapRead.CAPTURE_EVIDENCE)
+    assert first == _BS_CAPTURE_REQUEST
+    first["intent"] = "mutated"
+    assert hb.bootstrap_arguments(BootstrapRead.CAPTURE_EVIDENCE) == _BS_CAPTURE_REQUEST
+    assert hb.bootstrap_arguments(BootstrapRead.SERVER_INFO) == {}
+    assert hb.bootstrap_arguments(BootstrapRead.RUNTIME_CONFIG) == {}
+
+
+@pytest.mark.asyncio
+async def test_c2a_real_start_record_frames_the_readback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The C1 record bound by start() frames the read; the legacy health read is unchanged."""
+    monkeypatch.delenv("COFFEE_FIRST_CRACK_EVENT_AUTHORITY", raising=False)
+    monkeypatch.delenv("COFFEE_ROASTER_MCP_CONFIG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    double = _BootstrapDouble()
+
+    @asynccontextmanager
+    async def factory(_params: object) -> AsyncGenerator[_BootstrapDouble]:
+        yield double
+
+    process = MCPServerProcess(
+        session_factory=cast("mcp_client_module.SessionFactory", factory),
+        human_capture=_bs_capture(),
+    )
+    await process.start()
+    try:
+        # start() made only the legacy health read through the legacy parser.
+        assert double.calls == [("get_server_info", {})]
+        result = await _bs_read(process)
+        assert isinstance(result, HumanBootstrapEvidence)
+        assert result.child_epoch == process.child_epoch
+        assert result.config_present is False
+        assert double.calls[1:] == _BS_ORDER
+    finally:
+        await process.stop()
+    # A stopped (detached) child never grants evidence and sends nothing.
+    sent = len(double.calls)
+    assert await _bs_read(process) == _bs_refused(BootstrapRefusal.MISSING_LAUNCH_FRAMING, None)
+    assert len(double.calls) == sent
+
+
+# ------------------------------------------------------------- framing refusals
+
+
+def _framing_case(case: str) -> MCPServerProcess:
+    double = _BootstrapDouble()
+    capture = _bs_capture()
+    if case == "automatic":
+        return MCPServerProcess(session=double)
+    process = MCPServerProcess(session=double, human_capture=capture)
+    evidence = _bs_evidence(capture)
+    if case == "human_without_record":
+        return process
+    if case == "automatic_with_human_record":
+        process = MCPServerProcess(session=double)
+    elif case == "different_capture":
+        evidence = _bs_evidence(_bs_capture(window=5.0))
+    elif case == "different_capture_same_pins":
+        evidence = dataclasses.replace(evidence, capture=_bs_capture(window=5.0))
+    elif case == "automatic_authority":
+        evidence = dataclasses.replace(evidence, authority=ControlAuthority.AUTOMATIC)
+    elif case == "no_pins":
+        evidence = dataclasses.replace(evidence, pinned_env=())
+    elif case == "reordered_pins":
+        evidence = dataclasses.replace(evidence, pinned_env=evidence.pinned_env[::-1])
+    elif case == "list_pins":
+        evidence = dataclasses.replace(
+            evidence, pinned_env=cast("tuple[tuple[str, str], ...]", list(evidence.pinned_env))
+        )
+    elif case == "missing_capture":
+        evidence = dataclasses.replace(evidence, capture=None)
+    elif case == "config_present_type":
+        evidence = dataclasses.replace(evidence, config_present=cast("bool", 0))
+    _bs_bind(process, evidence)
+    if case == "detached":
+        process._replace_session(None)  # pyright: ignore[reportPrivateUsage]
+    return process
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "automatic",
+        "automatic_with_human_record",
+        "human_without_record",
+        "different_capture",
+        "different_capture_same_pins",
+        "automatic_authority",
+        "no_pins",
+        "reordered_pins",
+        "list_pins",
+        "missing_capture",
+        "config_present_type",
+        "detached",
+    ],
+)
+async def test_c2a_missing_framing_refuses_before_the_first_call(case: str) -> None:
+    process = _framing_case(case)
+    session = process._session  # pyright: ignore[reportPrivateUsage]
+    assert await _bs_read(process) == _bs_refused(BootstrapRefusal.MISSING_LAUNCH_FRAMING, None)
+    if session is not None:
+        assert cast("_BootstrapDouble", session).calls == []
+
+
+@pytest.mark.parametrize("epoch", [0, -1, True, 1.0, "1"])
+def test_c2a_framing_requires_positive_exact_int_epoch(epoch: object) -> None:
+    capture = _bs_capture()
+    record = LaunchRecord(child_epoch=cast("int", epoch), evidence=_bs_evidence(capture))
+    assert hb.check_launch_framing(capture, epoch, record) == _bs_refused(
+        BootstrapRefusal.MISSING_LAUNCH_FRAMING, None
+    )
+
+
+def test_c2a_framing_unit_rows() -> None:
+    capture = _bs_capture()
+    evidence = _bs_evidence(capture)
+    assert hb.check_launch_framing(capture, 1, bind_launch_record(evidence, 1)) is None
+    refused = _bs_refused(BootstrapRefusal.MISSING_LAUNCH_FRAMING, None)
+    assert hb.check_launch_framing(capture, 1, bind_launch_record(evidence, 2)) == refused
+    assert hb.check_launch_framing(None, 1, bind_launch_record(evidence, 1)) == refused
+    assert hb.check_launch_framing(capture, 1, None) == refused
+    stale = LaunchRecord(child_epoch=cast("int", True), evidence=evidence)
+    assert hb.check_launch_framing(capture, 1, stale) == refused
+
+
+# ------------------------------------------------------------- per-await identity fences
+
+_DISPLACEMENTS = ["replace", "detach", "session_swap", "record_rebind", "epoch_bump"]
+
+
+def _displace(process: MCPServerProcess, kind: str, replacement: _BootstrapDouble) -> None:
+    if kind == "replace":
+        process._replace_session(replacement)  # pyright: ignore[reportPrivateUsage]
+        # Even a fresh record for the replacement must not be rebound to.
+        _bs_bind(process, _bs_evidence(_bs_capture()))
+    elif kind == "detach":
+        process._replace_session(None)  # pyright: ignore[reportPrivateUsage]
+    elif kind == "session_swap":
+        process._session = replacement  # pyright: ignore[reportPrivateUsage]
+    elif kind == "record_rebind":
+        record = process.launch_record_for_epoch(process.child_epoch)
+        assert record is not None
+        _bs_bind(process, record.evidence)
+    else:
+        process._child_epoch += 1  # pyright: ignore[reportPrivateUsage]
+        _bs_bind(process, _bs_evidence(_bs_capture()))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("kind", _DISPLACEMENTS)
+async def test_c2a_displacement_during_each_read_stops_without_rebinding(
+    index: int, kind: str
+) -> None:
+    double = _BootstrapDouble()
+    replacement = _BootstrapDouble()
+    process = _bs_process(double)
+    read = _BS_READS[index]
+    double.during[read.value] = lambda: _displace(process, kind, replacement)
+
+    result = await _bs_read(process)
+
+    assert result == _bs_refused(BootstrapRefusal.DISPLACED_FRAMING, read)
+    assert double.calls == _BS_ORDER[: index + 1]
+    assert replacement.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("kind", ["replace", "session_swap", "record_rebind"])
+async def test_c2a_displacement_at_each_dispatch_boundary_sends_nothing_more(
+    monkeypatch: pytest.MonkeyPatch, index: int, kind: str
+) -> None:
+    """A displacement after the previous step (framing or decode) is caught before dispatch."""
+    double = _BootstrapDouble()
+    replacement = _BootstrapDouble()
+    process = _bs_process(double)
+    if index == 0:
+        original_framing = hb.check_launch_framing
+
+        def framing(*args: object) -> HumanBootstrapRefused | None:
+            verdict = original_framing(*cast("tuple[RequestedCapture, int, LaunchRecord]", args))
+            _displace(process, kind, replacement)
+            return verdict
+
+        monkeypatch.setattr(mcp_client_module, "check_launch_framing", framing)
+    else:
+        original_decode = hb.decode_bootstrap_reply
+        target = _BS_READS[index - 1]
+
+        def decode(read: BootstrapRead, **kwargs: object) -> dict[str, object] | None:
+            result = original_decode(read, **cast("dict[str, bool]", kwargs))
+            if read is target:
+                _displace(process, kind, replacement)
+            return result
+
+        monkeypatch.setattr(mcp_client_module, "decode_bootstrap_reply", decode)
+
+    result = await _bs_read(process)
+
+    assert result == _bs_refused(BootstrapRefusal.DISPLACED_FRAMING, _BS_READS[index])
+    assert double.calls == _BS_ORDER[:index]
+    assert replacement.calls == []
+
+
+# ------------------------------------------------------------- failure, timeout, cancellation
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+async def test_c2a_timeout_at_each_read_is_a_bounded_failure(index: int) -> None:
+    double = _BootstrapDouble()
+    double.replies[_BS_READS[index].value] = _Hang()
+    process = _bs_process(double, config=MCPConfig(call_timeout_seconds=0.05))
+    result = await _bs_read(process)
+    assert result == _bs_refused(BootstrapRefusal.READ_FAILED, _BS_READS[index])
+    assert double.calls == _BS_ORDER[: index + 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+async def test_c2a_failed_read_retains_no_exception_text(
+    index: int, caplog: pytest.LogCaptureFixture
+) -> None:
+    double = _BootstrapDouble()
+    double.replies[_BS_READS[index].value] = MCPConnectionError(_BS_SENTINEL)
+    process = _bs_process(double)
+    with caplog.at_level(logging.DEBUG):
+        result = await _bs_read(process)
+    assert result == _bs_refused(BootstrapRefusal.READ_FAILED, _BS_READS[index])
+    assert double.calls == _BS_ORDER[: index + 1]
+    assert _BS_SENTINEL not in repr(result)
+    assert _BS_SENTINEL not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_c2a_displacement_wins_over_a_failed_read() -> None:
+    double = _BootstrapDouble()
+    replacement = _BootstrapDouble()
+    process = _bs_process(double)
+    double.replies["get_runtime_config"] = MCPConnectionError("boom")
+    double.during["get_runtime_config"] = lambda: _displace(process, "replace", replacement)
+    result = await _bs_read(process)
+    assert result == _bs_refused(BootstrapRefusal.DISPLACED_FRAMING, BootstrapRead.RUNTIME_CONFIG)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+async def test_c2a_cancellation_at_each_read_propagates(index: int) -> None:
+    double = _BootstrapDouble()
+    double.replies[_BS_READS[index].value] = _Hang()
+    process = _bs_process(double)
+    task = asyncio.create_task(_bs_read(process))
+    for _ in range(50):
+        if len(double.calls) == index + 1:
+            break
+        await asyncio.sleep(0)
+    assert double.calls == _BS_ORDER[: index + 1]
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert double.calls == _BS_ORDER[: index + 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("bad", ["error_flag", "not_sdk_result"])
+async def test_c2a_invalid_payload_at_each_read_sends_no_later_read(index: int, bad: str) -> None:
+    double = _BootstrapDouble()
+    read = _BS_READS[index]
+    raw = _bs_raw(read)
+    if bad == "error_flag":
+        raw["isError"] = True
+        reply: object = CallToolResult.model_validate(raw)
+    else:
+        reply = FakeResult(structuredContent=_bs_copy(_BS_PAYLOADS[read]))
+    double.replies[read.value] = reply
+    process = _bs_process(double)
+    assert await _bs_read(process) == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, read)
+    assert double.calls == _BS_ORDER[: index + 1]
+
+
+@pytest.mark.asyncio
+async def test_c2a_refused_payload_leaks_no_private_text(caplog: pytest.LogCaptureFixture) -> None:
+    double = _BootstrapDouble()
+    runtime = {**_bs_copy(_BS_RUNTIME_CONFIG), "temperature_unit": _BS_SENTINEL}
+    double.replies["get_runtime_config"] = CallToolResult.model_validate(
+        _bs_raw(BootstrapRead.RUNTIME_CONFIG, runtime)
+    )
+    process = _bs_process(double)
+    with caplog.at_level(logging.DEBUG):
+        result = await _bs_read(process)
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.RUNTIME_CONFIG)
+    assert _BS_SENTINEL not in repr(result) and _BS_SENTINEL not in caplog.text
+    assert double.calls == _BS_ORDER[:2]
+
+
+# ------------------------------------------------------------- real SDK path (send_request)
+
+
+class _BootstrapPeer:
+    """Fake MCP peer answering each observed JSON-RPC request id."""
+
+    def __init__(self) -> None:
+        self.results: dict[str, dict[str, object] | None] = {
+            read.value: _bs_raw(read) for read in _BS_READS
+        }
+        self.requests: list[tuple[str, dict[str, object] | None]] = []
+
+
+@asynccontextmanager
+async def _sdk_session(peer: _BootstrapPeer) -> AsyncGenerator[ClientSession]:
+    to_client_send, to_client_recv = anyio.create_memory_object_stream[SessionMessage | Exception](
+        8
+    )
+    to_peer_send, to_peer_recv = anyio.create_memory_object_stream[SessionMessage](8)
+
+    async def serve() -> None:
+        async for message in to_peer_recv:
+            request = message.message.root
+            assert isinstance(request, JSONRPCRequest)
+            params = request.params
+            peer.requests.append((request.method, params))
+            name = cast("str", (params or {}).get("name"))
+            result = peer.results[name]
+            if result is None:
+                reply = JSONRPCMessage.model_validate(
+                    {
+                        "jsonrpc": "2.0",
+                        "id": request.id,
+                        "error": {"code": -32603, "message": _BS_SENTINEL},
+                    }
+                )
+            else:
+                reply = JSONRPCMessage(JSONRPCResponse(jsonrpc="2.0", id=request.id, result=result))
+            await to_client_send.send(SessionMessage(reply))
+
+    async with anyio.create_task_group() as group:
+        group.start_soon(serve)
+        async with ClientSession(to_client_recv, to_peer_send) as session:
+            yield session
+        group.cancel_scope.cancel()
+
+
+def _forbid_legacy_client_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def forbidden(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("legacy ClientSession path used")
+
+    monkeypatch.setattr(ClientSession, "call_tool", forbidden)
+    monkeypatch.setattr(ClientSession, "list_tools", forbidden)
+    monkeypatch.setattr(mcp_client_module, "parse_tool_result", forbidden)
+
+
+def _sdk_requests(count: int) -> list[tuple[str, dict[str, object] | None]]:
+    return [
+        ("tools/call", {"name": name, "arguments": arguments})
+        for name, arguments in _BS_ORDER[:count]
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("omit_is_error", [False, True])
+async def test_c2a_sdk_positive_uses_send_request_with_protocol_default(
+    monkeypatch: pytest.MonkeyPatch, omit_is_error: bool
+) -> None:
+    _forbid_legacy_client_paths(monkeypatch)
+    peer = _BootstrapPeer()
+    if omit_is_error:
+        for result in peer.results.values():
+            assert result is not None
+            del result["isError"]
+    async with _sdk_session(peer) as session:
+        process = _bs_process(session)
+        result = await _bs_read(process)
+    assert isinstance(result, HumanBootstrapEvidence)
+    assert peer.requests == _sdk_requests(3)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag", ["false", 0, None, 1, "true"])
+async def test_c2a_sdk_wrong_error_flag_type_is_refused(
+    monkeypatch: pytest.MonkeyPatch, flag: object
+) -> None:
+    _forbid_legacy_client_paths(monkeypatch)
+    peer = _BootstrapPeer()
+    raw = peer.results["get_server_info"]
+    assert raw is not None
+    raw["isError"] = flag
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO)
+    assert peer.requests == _sdk_requests(1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("index", [0, 1, 2])
+@pytest.mark.parametrize("member", ["content", "structuredContent"])
+async def test_c2a_sdk_absent_member_is_refused(
+    monkeypatch: pytest.MonkeyPatch, index: int, member: str
+) -> None:
+    """Missing content, and a legacy text-only reply, fail the grammar over send_request."""
+    _forbid_legacy_client_paths(monkeypatch)
+    peer = _BootstrapPeer()
+    raw = peer.results[_BS_READS[index].value]
+    assert raw is not None
+    del raw[member]
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, _BS_READS[index])
+    assert peer.requests == _sdk_requests(index + 1)
+
+
+@pytest.mark.asyncio
+async def test_c2a_sdk_legacy_024_server_info_fails_the_manual_grammar(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The public 0.2.4 reply (same package version) fails the manual/audio grammar."""
+    _forbid_legacy_client_paths(monkeypatch)
+    legacy = {
+        **_bs_copy(_BS_SERVER_INFO),
+        "first_crack_mode": "disabled",
+        "bootstrap_safe": True,
+    }
+    peer = _BootstrapPeer()
+    peer.results["get_server_info"] = _bs_raw(BootstrapRead.SERVER_INFO, legacy)
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO)
+    assert peer.requests == _sdk_requests(1)
+
+
+@pytest.mark.asyncio
+async def test_c2a_sdk_legacy_runtime_config_without_authority_fields_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_legacy_client_paths(monkeypatch)
+    legacy = _bs_copy(_BS_RUNTIME_CONFIG)
+    del legacy["first_crack_event_authority"]
+    del legacy["first_crack_observer_protocol"]
+    peer = _BootstrapPeer()
+    peer.results["get_runtime_config"] = _bs_raw(BootstrapRead.RUNTIME_CONFIG, legacy)
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.RUNTIME_CONFIG)
+    assert peer.requests == _sdk_requests(2)
+
+
+@pytest.mark.asyncio
+async def test_c2a_sdk_nonfinite_structured_value_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_legacy_client_paths(monkeypatch)
+    peer = _BootstrapPeer()
+    raw = peer.results["get_runtime_config"]
+    assert raw is not None
+    cast("dict[str, object]", raw["structuredContent"])["sample_interval_seconds"] = math.inf
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.RUNTIME_CONFIG)
+
+
+@pytest.mark.asyncio
+async def test_c2a_sdk_error_response_is_a_value_free_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_legacy_client_paths(monkeypatch)
+    peer = _BootstrapPeer()
+    peer.results["get_capture_evidence"] = None
+    async with _sdk_session(peer) as session:
+        result = await _bs_read(_bs_process(session))
+    assert result == _bs_refused(BootstrapRefusal.READ_FAILED, BootstrapRead.CAPTURE_EVIDENCE)
+    assert _BS_SENTINEL not in repr(result)
+    assert peer.requests == _sdk_requests(3)
+
+
+# ------------------------------------------------------------- domain grammar
+
+
+@pytest.mark.parametrize("read", _BS_READS)
+def test_c2a_grammar_accepts_each_complete_reply(read: BootstrapRead) -> None:
+    assert _bs_decode(read, _bs_raw(read)) == _BS_PAYLOADS[read]
+
+
+@pytest.mark.parametrize("read", _BS_READS)
+def test_c2a_text_bound_is_exact_in_code_points(read: BootstrapRead) -> None:
+    raw = _bs_raw(read)
+    block = cast("list[dict[str, object]]", raw["content"])[0]
+    text = json.dumps(_BS_PAYLOADS[read])
+    limit = hb.MAX_BOOTSTRAP_TEXT_CODE_POINTS
+    assert limit == 16_384
+    at_limit = text + " " * (limit - len(text))
+    assert len(at_limit) == limit
+    block["text"] = at_limit
+    assert _bs_decode(read, raw) is not None
+    block["text"] = at_limit + " "
+    assert _bs_decode(read, raw) is None
+
+
+def test_c2a_text_bound_counts_code_points_not_bytes() -> None:
+    read = BootstrapRead.SERVER_INFO
+    payload = {**_bs_copy(_BS_SERVER_INFO), "version": "é" * 100}
+    raw = _bs_raw(read, payload)
+    block = cast("list[dict[str, object]]", raw["content"])[0]
+    text = json.dumps(payload, ensure_ascii=False)
+    limit = hb.MAX_BOOTSTRAP_TEXT_CODE_POINTS
+    at_limit = text + " " * (limit - len(text))
+    assert len(at_limit) == limit and len(at_limit.encode("utf-8")) > limit
+    block["text"] = at_limit
+    assert _bs_decode(read, raw) is not None
+    block["text"] = at_limit + " "
+    assert _bs_decode(read, raw) is None
+
+
+def _with_text(read: BootstrapRead, text: str) -> dict[str, object]:
+    raw = _bs_raw(read)
+    raw["content"] = [{"type": "text", "text": text}]
+    return raw
+
+
+_SERVER_TEXT = json.dumps(_BS_SERVER_INFO)
+_RUNTIME_TEXT = json.dumps(_BS_RUNTIME_CONFIG)
+
+
+@pytest.mark.parametrize(
+    ("read", "text"),
+    [
+        (BootstrapRead.SERVER_INFO, '{"version": "0.2.4", ' + _SERVER_TEXT[1:]),
+        (BootstrapRead.SERVER_INFO, _SERVER_TEXT[:-1]),
+        (BootstrapRead.SERVER_INFO, _SERVER_TEXT + " x"),
+        (BootstrapRead.SERVER_INFO, ""),
+        (BootstrapRead.SERVER_INFO, "[" * 6000 + "]" * 6000),
+        (
+            BootstrapRead.RUNTIME_CONFIG,
+            _RUNTIME_TEXT.replace(
+                '"sample_interval_seconds": 1.0', '"sample_interval_seconds": NaN'
+            ),
+        ),
+        (
+            BootstrapRead.RUNTIME_CONFIG,
+            _RUNTIME_TEXT.replace(
+                '"sample_interval_seconds": 1.0', '"sample_interval_seconds": Infinity'
+            ),
+        ),
+        (
+            BootstrapRead.RUNTIME_CONFIG,
+            _RUNTIME_TEXT.replace(
+                '"sample_interval_seconds": 1.0', '"sample_interval_seconds": -Infinity'
+            ),
+        ),
+        (
+            BootstrapRead.RUNTIME_CONFIG,
+            _RUNTIME_TEXT.replace(
+                '"sample_interval_seconds": 1.0', '"sample_interval_seconds": 1e999'
+            ),
+        ),
+        (
+            BootstrapRead.RUNTIME_CONFIG,
+            _RUNTIME_TEXT.replace(
+                '"roaster_baudrate": 115200', '"roaster_baudrate": ' + "9" * 5000
+            ),
+        ),
+    ],
+    ids=[
+        "duplicate_key",
+        "truncated",
+        "trailing_garbage",
+        "empty",
+        "excessive_recursion",
+        "nan",
+        "infinity",
+        "negative_infinity",
+        "overflowed_float",
+        "overlong_int_literal",
+    ],
+)
+def test_c2a_independent_text_decoder_refuses(read: BootstrapRead, text: str) -> None:
+    assert text != json.dumps(_BS_PAYLOADS[read])
+    assert _bs_decode(read, _with_text(read, text)) is None
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        '{"a": NaN}',
+        '{"a": Infinity}',
+        '{"a": -Infinity}',
+        '{"a": 1e999}',
+        '{"a": -1e999}',
+        '{"a": 1, "a": 1}',
+        '{"a": {"b": 1, "b": 2}}',
+    ],
+)
+def test_c2a_text_decoder_itself_refuses_nonfinite_and_duplicates(text: str) -> None:
+    """The independent decoder refuses on its own, before any shape check."""
+    assert hb._decode_text(text) is hb._Undecodable.TOKEN  # pyright: ignore[reportPrivateUsage]
+    assert hb._decode_text('{"a": 1.5, "b": [1]}') == {"a": 1.5, "b": [1]}  # pyright: ignore[reportPrivateUsage]
+
+
+def test_c2a_deep_nesting_is_a_recursion_refusal_not_a_crash() -> None:
+    text = "[" * 6000 + "]" * 6000
+    assert len(text) <= hb.MAX_BOOTSTRAP_TEXT_CODE_POINTS
+    with pytest.raises(RecursionError):
+        json.loads(text)
+    assert hb._decode_text(text) is hb._Undecodable.TOKEN  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        EnvelopeMember.ABSENT,
+        None,
+        [],
+        [{"type": "text", "text": _SERVER_TEXT}, {"type": "text", "text": _SERVER_TEXT}],
+        ({"type": "text", "text": _SERVER_TEXT},),
+        ["not-a-block"],
+        [{"type": "image", "text": _SERVER_TEXT}],
+        [{"type": "text"}],
+        [{"text": _SERVER_TEXT}],
+        [{"type": "text", "text": json.loads(_SERVER_TEXT)}],
+        [{"type": "text", "text": _SERVER_TEXT, "annotations": None}],
+    ],
+    ids=[
+        "absent",
+        "null",
+        "empty",
+        "two_blocks",
+        "tuple",
+        "non_object_block",
+        "wrong_type",
+        "missing_text",
+        "missing_type",
+        "non_string_text",
+        "extra_member",
+    ],
+)
+def test_c2a_exactly_one_text_block_is_required(content: object) -> None:
+    raw = _bs_raw(BootstrapRead.SERVER_INFO)
+    raw["content"] = content
+    assert _bs_decode(BootstrapRead.SERVER_INFO, raw) is None
+
+
+@pytest.mark.parametrize("flag", [True, 0, None, "false", EnvelopeMember.ABSENT])
+def test_c2a_error_flag_must_be_exactly_false(flag: object) -> None:
+    raw = _bs_raw(BootstrapRead.SERVER_INFO)
+    raw["isError"] = flag
+    assert _bs_decode(BootstrapRead.SERVER_INFO, raw) is None
+
+
+@pytest.mark.parametrize("read", _BS_READS)
+@pytest.mark.parametrize("structured", [EnvelopeMember.ABSENT, None, [], "text"])
+def test_c2a_structured_object_is_required(read: BootstrapRead, structured: object) -> None:
+    raw = _bs_raw(read)
+    raw["structuredContent"] = structured
+    assert _bs_decode(read, raw) is None
+
+
+def _field_cases() -> list[tuple[BootstrapRead, str]]:
+    return [(read, key) for read in _BS_READS for key in _BS_PAYLOADS[read]]
+
+
+@pytest.mark.parametrize(("read", "key"), _field_cases())
+def test_c2a_each_missing_field_is_refused(read: BootstrapRead, key: str) -> None:
+    payload = _bs_copy(_BS_PAYLOADS[read])
+    del payload[key]
+    assert _bs_decode(read, _bs_raw(read, payload)) is None
+
+
+@pytest.mark.parametrize("read", _BS_READS)
+def test_c2a_an_extra_field_is_refused(read: BootstrapRead) -> None:
+    payload = {**_bs_copy(_BS_PAYLOADS[read]), "extra": None}
+    assert _bs_decode(read, _bs_raw(read, payload)) is None
+
+
+_TOOLS = list(hb.BOOTSTRAP_TOOL_INVENTORY)
+
+_INVALID_VALUES: list[tuple[BootstrapRead, str, object]] = [
+    (BootstrapRead.SERVER_INFO, "product_name", "roastpilot"),
+    (BootstrapRead.SERVER_INFO, "package_name", "coffee_roaster_mcp"),
+    (BootstrapRead.SERVER_INFO, "transport", "http"),
+    (BootstrapRead.SERVER_INFO, "current_phase", "roasting"),
+    (BootstrapRead.SERVER_INFO, "roaster_driver", "hottop_kn8828b_2k_plus"),
+    (BootstrapRead.SERVER_INFO, "first_crack_mode", "manual"),
+    (BootstrapRead.SERVER_INFO, "first_crack_mode", "Audio"),
+    (BootstrapRead.SERVER_INFO, "bootstrap_safe", True),
+    (BootstrapRead.SERVER_INFO, "bootstrap_safe", 0),
+    (BootstrapRead.SERVER_INFO, "session_presence", "active"),
+    (BootstrapRead.SERVER_INFO, "version", ""),
+    (BootstrapRead.SERVER_INFO, "version", 24),
+    (BootstrapRead.SERVER_INFO, "started_at_utc", ""),
+    (BootstrapRead.SERVER_INFO, "started_at_utc", None),
+    (BootstrapRead.SERVER_INFO, "available_bootstrap_tools", _TOOLS[:-1]),
+    (BootstrapRead.SERVER_INFO, "available_bootstrap_tools", [*_TOOLS, "get_capture_evidence"]),
+    (BootstrapRead.SERVER_INFO, "available_bootstrap_tools", [_TOOLS[1], _TOOLS[0], *_TOOLS[2:]]),
+    (BootstrapRead.SERVER_INFO, "available_bootstrap_tools", [*_TOOLS[:-1], 15]),
+    (BootstrapRead.SERVER_INFO, "available_bootstrap_tools", ",".join(_TOOLS)),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_driver", "hottop_kn8828b_2k_plus"),
+    (BootstrapRead.RUNTIME_CONFIG, "temperature_unit", "fahrenheit"),
+    (BootstrapRead.RUNTIME_CONFIG, "temperature_unit", "Celsius"),
+    (BootstrapRead.RUNTIME_CONFIG, "first_crack_mode", "disabled"),
+    (BootstrapRead.RUNTIME_CONFIG, "first_crack_event_authority", "automatic"),
+    (BootstrapRead.RUNTIME_CONFIG, "first_crack_event_authority", "Manual"),
+    (BootstrapRead.RUNTIME_CONFIG, "first_crack_observer_protocol", "manual/v2"),
+    (BootstrapRead.RUNTIME_CONFIG, "allow_manual_override", False),
+    (BootstrapRead.RUNTIME_CONFIG, "allow_manual_override", 1),
+    (BootstrapRead.RUNTIME_CONFIG, "config_source", ""),
+    (BootstrapRead.RUNTIME_CONFIG, "config_source", 5),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_port", ""),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_port", 5),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_baudrate", 0),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_baudrate", -1),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_baudrate", 115200.0),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_baudrate", True),
+    (BootstrapRead.RUNTIME_CONFIG, "roaster_baudrate", "115200"),
+    (BootstrapRead.RUNTIME_CONFIG, "command_interval_seconds", "0.3"),
+    (BootstrapRead.RUNTIME_CONFIG, "command_interval_seconds", True),
+    (BootstrapRead.RUNTIME_CONFIG, "command_interval_seconds", None),
+    (BootstrapRead.RUNTIME_CONFIG, "sample_interval_seconds", False),
+    (BootstrapRead.RUNTIME_CONFIG, "sample_interval_seconds", 10**400),
+    (BootstrapRead.RUNTIME_CONFIG, "auto_t0_drop_threshold_c", [25.0]),
+    (BootstrapRead.RUNTIME_CONFIG, "model_repo_id", ""),
+    (BootstrapRead.RUNTIME_CONFIG, "model_precision", None),
+    (BootstrapRead.RUNTIME_CONFIG, "log_dir", 7),
+    (BootstrapRead.RUNTIME_CONFIG, "auto_t0_detection_enabled", 1),
+    (BootstrapRead.RUNTIME_CONFIG, "auto_t0_detection_enabled", "true"),
+    (BootstrapRead.CAPTURE_EVIDENCE, "capability", "automatic_capture"),
+    (BootstrapRead.CAPTURE_EVIDENCE, "capability", None),
+    (BootstrapRead.CAPTURE_EVIDENCE, "capture_protocol", "capture_evidence/v2"),
+    (BootstrapRead.CAPTURE_EVIDENCE, "intent", "start"),
+]
+
+
+@pytest.mark.parametrize(("read", "key", "value"), _INVALID_VALUES)
+def test_c2a_field_grammar_refuses(read: BootstrapRead, key: str, value: object) -> None:
+    payload = {**_bs_copy(_BS_PAYLOADS[read]), key: value}
+    assert _bs_decode(read, _bs_raw(read, payload)) is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("command_interval_seconds", 1),
+        ("sample_interval_seconds", 2),
+        ("auto_t0_drop_threshold_c", 25),
+        ("config_source", "test-config.yaml"),
+        ("roaster_port", "test-port"),
+        ("auto_t0_detection_enabled", False),
+    ],
+)
+def test_c2a_field_grammar_admits_exact_alternatives(key: str, value: object) -> None:
+    payload = {**_bs_copy(_BS_RUNTIME_CONFIG), key: value}
+    config_present = payload["config_source"] is not None
+    raw = _bs_raw(BootstrapRead.RUNTIME_CONFIG, payload)
+    assert _bs_decode(BootstrapRead.RUNTIME_CONFIG, raw, config_present=config_present) == payload
+
+
+def test_c2a_shapes_refuse_nonfinite_structured_numbers_directly() -> None:
+    for value in (math.inf, -math.inf, math.nan, 10**400):
+        payload = {**_bs_copy(_BS_RUNTIME_CONFIG), "auto_t0_drop_threshold_c": value}
+        assert hb._runtime_config_shape(payload) is False  # pyright: ignore[reportPrivateUsage]
+    assert hb._runtime_config_shape(_bs_copy(_BS_RUNTIME_CONFIG)) is True  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize(
+    ("read", "key", "structured_value", "text_value"),
+    [
+        (BootstrapRead.RUNTIME_CONFIG, "sample_interval_seconds", 1, 1.0),
+        (BootstrapRead.RUNTIME_CONFIG, "sample_interval_seconds", 1.0, 1),
+        (BootstrapRead.RUNTIME_CONFIG, "command_interval_seconds", 0.3, 0.4),
+        (BootstrapRead.RUNTIME_CONFIG, "auto_t0_detection_enabled", True, False),
+        (BootstrapRead.RUNTIME_CONFIG, "config_source", None, "test-config.yaml"),
+        (BootstrapRead.RUNTIME_CONFIG, "log_dir", "test-logs", "other-logs"),
+        (BootstrapRead.SERVER_INFO, "version", "0.2.4", "0.2.5"),
+        (BootstrapRead.SERVER_INFO, "started_at_utc", "2026-01-01T00:00:00+00:00", "x"),
+    ],
+)
+def test_c2a_structured_and_text_must_agree_type_sensitively(
+    read: BootstrapRead, key: str, structured_value: object, text_value: object
+) -> None:
+    structured = {**_bs_copy(_BS_PAYLOADS[read]), key: structured_value}
+    text = {**_bs_copy(_BS_PAYLOADS[read]), key: text_value}
+    assert _bs_decode(read, _bs_raw(read, structured, text)) is None
+    assert _bs_decode(read, _bs_raw(read, structured, structured)) is not None
+
+
+def test_c2a_comparison_is_type_sensitive_over_shapes() -> None:
+    same = hb._same  # pyright: ignore[reportPrivateUsage]
+    assert same({"a": [1, "x", None]}, {"a": [1, "x", None]})
+    assert not same(1, 1.0)
+    assert not same(True, 1)
+    assert not same({"a": 1}, {"b": 1})
+    assert not same([1], [1, 2])
+    assert not same([1], [2])
+    assert not same({"a": [1]}, {"a": [1.0]})
+
+
+@pytest.mark.parametrize(
+    "case", ["unwrapped", "extra_wrapper_key", "text_is_wrapper", "non_object_wrapper"]
+)
+def test_c2a_capture_evidence_wrapper_is_exact(case: str) -> None:
+    read = BootstrapRead.CAPTURE_EVIDENCE
+    raw = _bs_raw(read)
+    evidence = _bs_copy(_BS_CAPTURE_EVIDENCE)
+    if case == "unwrapped":
+        raw["structuredContent"] = evidence
+    elif case == "extra_wrapper_key":
+        raw["structuredContent"] = {"result": evidence, "extra": 1}
+    elif case == "text_is_wrapper":
+        raw["content"] = [{"type": "text", "text": json.dumps({"result": evidence})}]
+    else:
+        raw["structuredContent"] = {"result": "manual_mock_capture"}
+    assert _bs_decode(read, raw) is None
+
+
+@pytest.mark.parametrize(
+    ("config_present", "config_source", "admitted"),
+    [
+        (False, None, True),
+        (True, "test-config.yaml", True),
+        (True, None, False),
+        (False, "test-config.yaml", False),
+    ],
+)
+def test_c2a_config_presence_must_match_the_launch_record(
+    config_present: bool, config_source: str | None, admitted: bool
+) -> None:
+    read = BootstrapRead.RUNTIME_CONFIG
+    payload = {**_bs_copy(_BS_RUNTIME_CONFIG), "config_source": config_source}
+    result = _bs_decode(read, _bs_raw(read, payload), config_present=config_present)
+    assert (result is not None) is admitted
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("config_present", [True, False])
+async def test_c2a_reader_passes_the_record_config_presence(config_present: bool) -> None:
+    double = _BootstrapDouble()
+    process = _bs_process(double, config_present=config_present)
+    result = await _bs_read(process)
+    # The default reply reports no config source.
+    if config_present:
+        assert result == _bs_refused(BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.RUNTIME_CONFIG)
+        assert double.calls == _BS_ORDER[:2]
+    else:
+        assert isinstance(result, HumanBootstrapEvidence)
+
+
+# ------------------------------------------------------------- source sweeps
+
+_BOOTSTRAP_FUNCTIONS = {"_read_human_bootstrap", "_bootstrap_framed", "_call_bootstrap_sdk"}
+_LEGACY_PATH_NAMES = {
+    "parse_tool_result",
+    "_result_text",
+    "list_tools",
+    "discover_fixed_zero",
+    "_call_fixed_zero_sdk",
+    "_decode_fixed_zero",
+    "wait_for",
+}
+
+
+def _module_tree(module: object) -> ast.Module:
+    return ast.parse(Path(cast("str", getattr(module, "__file__", ""))).read_text(encoding="utf-8"))
+
+
+def _referenced(node: ast.AST) -> set[str]:
+    names = {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    return names | {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+
+
+def test_c2a_bootstrap_path_never_uses_the_legacy_parser_or_discovery() -> None:
+    tree = _module_tree(mcp_client_module)
+    functions = {
+        node.name: node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and node.name in _BOOTSTRAP_FUNCTIONS
+    }
+    assert set(functions) == _BOOTSTRAP_FUNCTIONS
+    for node in functions.values():
+        assert not _referenced(node) & _LEGACY_PATH_NAMES
+    reader = functions["_read_human_bootstrap"]
+    # The reader never routes through the transport's legacy call_tool.
+    assert not any(
+        isinstance(n, ast.Attribute)
+        and n.attr == "call_tool"
+        and isinstance(n.value, ast.Name)
+        and n.value.id == "self"
+        for n in ast.walk(reader)
+    )
+    # The legacy parser keeps exactly its pre-existing production caller.
+    callers = {
+        node.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)
+        and "parse_tool_result" in {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+    }
+    assert callers == {"call_tool"}
+
+
+def test_c2a_reader_has_no_production_caller() -> None:
+    package = Path(mcp_client_module.__file__).parent
+    references: list[str] = []
+    importers: set[str] = set()
+    for path in sorted(package.rglob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and node.attr == "_read_human_bootstrap":
+                references.append(path.name)
+            if (
+                isinstance(node, ast.ImportFrom)
+                and node.module == "roastpilot_agent.human_bootstrap"
+            ):
+                importers.add(path.name)
+            if isinstance(node, ast.Import) and any(
+                alias.name == "roastpilot_agent.human_bootstrap" for alias in node.names
+            ):
+                importers.add(path.name)
+    assert references == []
+    assert importers == {"mcp_client.py"}
+
+
+_ALLOWED_BOOTSTRAP_IMPORTS = {
+    "__future__",
+    "json",
+    "math",
+    "dataclasses",
+    "enum",
+    "typing",
+    "roastpilot_agent.human_protection",
+    "roastpilot_agent.launch_composition",
+}
+
+
+def test_c2a_domain_imports_are_closed() -> None:
+    imported: set[str] = set()
+    for node in ast.walk(_module_tree(hb)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            assert node.level == 0 and node.module is not None
+            imported.add(node.module)
+    assert imported == _ALLOWED_BOOTSTRAP_IMPORTS
+
+
+@pytest.mark.slow
+def test_c2a_domain_import_loads_no_sdk_or_transport() -> None:
+    script = (
+        "import sys, roastpilot_agent.human_bootstrap\n"
+        "bad = sorted(m for m in ('roastpilot_agent.mcp_client', 'mcp', 'anyio', 'yaml',"
+        " 'httpx', 'roastpilot_agent.config') if m in sys.modules)\n"
+        "print(bad)\n"
+        "raise SystemExit(1 if bad else 0)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "[]"

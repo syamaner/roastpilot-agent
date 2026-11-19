@@ -73,6 +73,18 @@ from pydantic import (
 )
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
+from roastpilot_agent.human_bootstrap import (
+    BOOTSTRAP_READ_ORDER,
+    BootstrapRead,
+    BootstrapRefusal,
+    EnvelopeMember,
+    HumanBootstrapReadback,
+    HumanBootstrapRefused,
+    bootstrap_arguments,
+    build_bootstrap_evidence,
+    check_launch_framing,
+    decode_bootstrap_reply,
+)
 from roastpilot_agent.human_protection import (
     ContainmentOutcome,
     ContainmentReason,
@@ -2489,6 +2501,49 @@ async def _call_fixed_zero_sdk(session: ToolSession, arguments: dict[str, object
     return await session.call_tool(_FIXED_ZERO_TOOL, arguments)
 
 
+class _BootstrapSDKResult(Result):
+    """Keep the decoded bootstrap envelope members before any child-schema adaptation.
+
+    ``isError`` keeps the MCP protocol default ``False`` when omitted; an
+    omitted ``content`` or ``structuredContent`` stays explicitly absent so
+    the domain grammar refuses it.
+    """
+
+    isError: StrictBool = False
+    content: object = EnvelopeMember.ABSENT
+    structuredContent: object = EnvelopeMember.ABSENT
+
+
+async def _call_bootstrap_sdk(
+    session: ToolSession, read: BootstrapRead
+) -> tuple[object, object, object]:
+    """Make one bootstrap read and return its ``(isError, content, structured)`` members.
+
+    A real ClientSession uses send_request (no output-schema adaptation and no
+    implicit tools/list). A test double uses the session protocol and must
+    return an SDK ``CallToolResult``; anything else yields absent members.
+    """
+    arguments = bootstrap_arguments(read)
+    if isinstance(session, ClientSession):
+        sdk = await session.send_request(
+            ClientRequest(
+                CallToolRequest(params=CallToolRequestParams(name=read.value, arguments=arguments))
+            ),
+            _BootstrapSDKResult,
+        )
+        return sdk.isError, sdk.content, sdk.structuredContent
+    raw = await session.call_tool(read.value, arguments)
+    if not isinstance(raw, CallToolResult):
+        return EnvelopeMember.ABSENT, EnvelopeMember.ABSENT, EnvelopeMember.ABSENT
+    blocks: list[object] = [
+        block.model_dump(by_alias=True, mode="python", exclude_none=True) for block in raw.content
+    ]
+    structured: object = (
+        EnvelopeMember.ABSENT if raw.structuredContent is None else raw.structuredContent
+    )
+    return raw.isError, blocks, structured
+
+
 #: Byte bound for the launch-composition read of the child's selected config,
 #: matching the cold rendered-config allowance without importing that module.
 _MAX_LAUNCH_CONFIG_BYTES = 131_072
@@ -3533,6 +3588,76 @@ class MCPServerProcess:
         if epoch != self._child_epoch:
             return ContainmentResult(ContainmentOutcome.UNKNOWN_TRANSPORT)
         return _decode_fixed_zero(payload, session_id)
+
+    def _bootstrap_framed(
+        self, session: ToolSession, epoch: int, record: LaunchRecord | None
+    ) -> bool:
+        """Whether the captured session, epoch and launch record are all still current."""
+        return (
+            self._session is session
+            and self._child_epoch == epoch
+            and self.launch_record_for_epoch(epoch) is record
+        )
+
+    async def _read_human_bootstrap(self) -> HumanBootstrapReadback:
+        """Strictly read back one HUMAN manual/mock bootstrap (#1078 C2a).
+
+        The session, epoch and launch record are captured before the first
+        await and re-checked at every dispatch boundary and after every await;
+        any displacement or refusal stops before the next read and never
+        rebinds to a replacement. Each of the three reads is made once, in
+        order, bounded by ``call_timeout_seconds`` and without the legacy
+        result parser or implicit discovery. Cancellation propagates.
+
+        Returns:
+            Bootstrap evidence (no control permission) or a value-free refusal.
+        """
+        session = self._session
+        epoch = self._child_epoch
+        record = self.launch_record_for_epoch(epoch)
+        framing = check_launch_framing(self._human_capture, epoch, record)
+        if framing is not None:
+            return framing
+        # A framed record exists only for an attached session at this epoch.
+        assert session is not None and record is not None
+        config_present = record.evidence.config_present
+        results: list[dict[str, object]] = []
+        for read in BOOTSTRAP_READ_ORDER:
+            if not self._bootstrap_framed(session, epoch, record):
+                return HumanBootstrapRefused(BootstrapRefusal.DISPLACED_FRAMING, read)
+            failure: BootstrapRefusal | None = None
+            members: tuple[object, object, object] = (
+                EnvelopeMember.ABSENT,
+                EnvelopeMember.ABSENT,
+                EnvelopeMember.ABSENT,
+            )
+            try:
+                async with asyncio.timeout(self._config.call_timeout_seconds):
+                    members = await _call_bootstrap_sdk(session, read)
+            except ValidationError:
+                # The typed envelope refused a member type (e.g. isError).
+                failure = BootstrapRefusal.INVALID_PAYLOAD
+            except Exception:
+                # Typed MCP failures, local timeout and SDK protocol/IO errors;
+                # no exception text is retained.
+                failure = BootstrapRefusal.READ_FAILED
+            if not self._bootstrap_framed(session, epoch, record):
+                return HumanBootstrapRefused(BootstrapRefusal.DISPLACED_FRAMING, read)
+            if failure is not None:
+                return HumanBootstrapRefused(failure, read)
+            is_error, content, structured = members
+            result = decode_bootstrap_reply(
+                read,
+                is_error=is_error,
+                content=content,
+                structured=structured,
+                config_present=config_present,
+            )
+            if result is None:
+                return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)
+            results.append(result)
+        server_info, runtime_config, capture_evidence = results
+        return build_bootstrap_evidence(epoch, server_info, runtime_config, capture_evidence)
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""
