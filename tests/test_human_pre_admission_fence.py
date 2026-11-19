@@ -276,6 +276,10 @@ async def test_d212_exception_requires_current_reservation_and_non_heat(
     kind: WriteClass, reservation: str
 ) -> None:
     h = prepared()
+    assert await h.controller.operator_emergency_stop()
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.commands == ["emergency_stop"]
+    h.actuator.calls.clear()
     generation = h.arbiter.generation
     assert h.controller.reserve_fault_acknowledgement_close(generation)
     token = generation
@@ -291,6 +295,54 @@ async def test_d212_exception_requires_current_reservation_and_non_heat(
     )
     assert result == (expected, None)
     assert h.commands == (["stop_cooling"] if expected else [])
+    assert h.controller.phase is RoastPhase.FAULTED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", list(WriteClass))
+@pytest.mark.parametrize("origin", ["reservation", "fault_cooling"])
+async def test_non_heat_exception_class_discrimination_has_unmasked_base_candidate(
+    kind: WriteClass, origin: str
+) -> None:
+    # Synthetic dispatch evidence, not a reachable prepared post-Start owner.
+    # In particular, the real D212 wrapper never supplies a DROP endpoint owner.
+    h = prepared()
+    assert await h.controller.operator_emergency_stop()
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.commands == ["emergency_stop"]
+    h.actuator.calls.clear()
+    fresh_boundary(h)
+    run = run_of(h)
+    if kind is WriteClass.DROP:
+        run.endpoint = EndpointDisposition.ADMITTED
+        run.endpoint_owner = EndpointOwner.OPERATOR
+    h.controller._teardown_unconfirmed = lambda: False  # pyright: ignore[reportPrivateUsage]
+    assert h.fence.closed_reason is None
+    assert h.ownership.is_current(run)
+    assert run.command is CommandDisposition.SETTLED
+    assert h.controller._human_actuation_admitted()  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._accepted_readings.recheck() is ReadingFreshness.FRESH  # pyright: ignore[reportPrivateUsage]
+    assert h.controller._human_routine_permitted(kind, run.endpoint_owner)  # pyright: ignore[reportPrivateUsage]
+    if kind is WriteClass.SESSION_START:
+        assert h.ownership.allows_session_start(run)
+    generation = h.arbiter.generation
+    reservation = generation if origin == "reservation" else None
+    if reservation is not None:
+        assert h.controller.reserve_fault_acknowledgement_close(reservation)
+        assert h.controller.fault_acknowledgement_close_is_current(reservation)
+    result = await h.controller._run_routine_write(  # pyright: ignore[reportPrivateUsage]
+        generation,
+        h.actuator.stop_cooling,
+        write_class=kind,
+        endpoint_owner=run.endpoint_owner,
+        close_reservation=reservation,
+        _fault_cooling=origin == "fault_cooling",
+    )
+    expected = kind is WriteClass.NON_HEAT
+    assert result == (expected, None)
+    assert h.commands == (["stop_cooling"] if expected else [])
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert h.actuator.containments == 0
 
 
 @pytest.mark.asyncio
