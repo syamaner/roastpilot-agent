@@ -33,6 +33,7 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -78,12 +79,24 @@ from roastpilot_agent.human_bootstrap import (
     BootstrapRead,
     BootstrapRefusal,
     EnvelopeMember,
+    HumanBootstrapEvidence,
     HumanBootstrapReadback,
     HumanBootstrapRefused,
+    HumanStartAccepted,
+    HumanStartRefused,
+    HumanStartResult,
+    HumanStartUncertain,
+    StartAttemptState,
+    StartRefusal,
+    StartUncertainty,
     bootstrap_arguments,
     build_bootstrap_evidence,
     check_launch_framing,
     decode_bootstrap_reply,
+    decode_metadata_reply,
+    decode_start_reply,
+    start_arguments,
+    valid_start_metadata,
 )
 from roastpilot_agent.human_protection import (
     ContainmentOutcome,
@@ -2523,16 +2536,22 @@ async def _call_bootstrap_sdk(
     implicit tools/list). A test double uses the session protocol and must
     return an SDK ``CallToolResult``; anything else yields absent members.
     """
-    arguments = bootstrap_arguments(read)
+    return await _call_strict_sdk(session, read.value, bootstrap_arguments(read))
+
+
+async def _call_strict_sdk(
+    session: ToolSession, name: str, arguments: dict[str, object]
+) -> tuple[object, object, object]:
+    """Call the captured SDK session without discovery or output adaptation."""
     if isinstance(session, ClientSession):
         sdk = await session.send_request(
             ClientRequest(
-                CallToolRequest(params=CallToolRequestParams(name=read.value, arguments=arguments))
+                CallToolRequest(params=CallToolRequestParams(name=name, arguments=arguments))
             ),
             _BootstrapSDKResult,
         )
         return sdk.isError, sdk.content, sdk.structuredContent
-    raw = await session.call_tool(read.value, arguments)
+    raw = await session.call_tool(name, arguments)
     if not isinstance(raw, CallToolResult):
         return EnvelopeMember.ABSENT, EnvelopeMember.ABSENT, EnvelopeMember.ABSENT
     blocks: list[object] = [
@@ -2542,6 +2561,24 @@ async def _call_bootstrap_sdk(
         EnvelopeMember.ABSENT if raw.structuredContent is None else raw.structuredContent
     )
     return raw.isError, blocks, structured
+
+
+@dataclass(frozen=True, slots=True)
+class _StartProof:
+    evidence: HumanBootstrapEvidence
+    session: ToolSession
+    epoch: int
+    record: LaunchRecord
+
+
+def _start_gate(gate: Callable[[], bool]) -> bool:
+    try:
+        result = gate()
+    except Exception:
+        return False
+    if inspect.iscoroutine(result):
+        result.close()
+    return result is True
 
 
 #: Byte bound for the launch-composition read of the child's selected config,
@@ -2719,6 +2756,9 @@ class MCPServerProcess:
         if human_capture is not None and type(human_capture) is not RequestedCapture:
             raise TypeError("human_capture must be a RequestedCapture or None")
         self._human_capture: RequestedCapture | None = human_capture
+        self._start_proof: _StartProof | None = None
+        self._bootstrap_read_generation = 0
+        self._human_start_attempt = StartAttemptState.UNATTEMPTED
         #: The launch record bound at the current attach epoch (cleared on any
         #: session change); ``None`` for a legacy builder or injected session.
         self._launch_record: LaunchRecord | None = None
@@ -3013,6 +3053,7 @@ class MCPServerProcess:
         if self._session is session:
             return
         self._launch_record = None
+        self._start_proof = None
         self._session = session
         self._child_epoch += 1
         self._fixed_zero_discovery = None
@@ -3612,6 +3653,9 @@ class MCPServerProcess:
         Returns:
             Bootstrap evidence (no control permission) or a value-free refusal.
         """
+        self._start_proof = None
+        self._bootstrap_read_generation += 1
+        read_generation = self._bootstrap_read_generation
         session = self._session
         epoch = self._child_epoch
         record = self.launch_record_for_epoch(epoch)
@@ -3657,7 +3701,108 @@ class MCPServerProcess:
                 return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)
             results.append(result)
         server_info, runtime_config, capture_evidence = results
-        return build_bootstrap_evidence(epoch, server_info, runtime_config, capture_evidence)
+        evidence = build_bootstrap_evidence(epoch, server_info, runtime_config, capture_evidence)
+        if read_generation == self._bootstrap_read_generation:
+            self._start_proof = _StartProof(evidence, session, epoch, record)
+        return evidence
+
+    @property
+    def _human_start_state(self) -> StartAttemptState:
+        """Return the monotonic private attempt state, including after cancellation."""
+        return self._human_start_attempt
+
+    def _start_proof_current(self, proof: _StartProof) -> bool:
+        return (
+            self._start_proof is proof
+            and proof.evidence.child_epoch == proof.epoch
+            and self._bootstrap_framed(proof.session, proof.epoch, proof.record)
+        )
+
+    async def _attempt_human_start(
+        self,
+        evidence: HumanBootstrapEvidence,
+        *,
+        gate: Callable[[], bool],
+        origin: str | None = None,
+        roast_num: int | None = None,
+    ) -> HumanStartResult:
+        """Attempt one private mock Start on its original strict bootstrap session."""
+        if self._human_start_attempt is not StartAttemptState.UNATTEMPTED:
+            return HumanStartRefused(StartRefusal.ALREADY_ATTEMPTED)
+        self._human_start_attempt = StartAttemptState.RESERVED
+        try:
+            return await self._run_human_start(evidence, gate, origin, roast_num)
+        finally:
+            if self._human_start_attempt is StartAttemptState.RESERVED:
+                self._human_start_attempt = StartAttemptState.REFUSED_BEFORE_CLAIM
+
+    async def _run_human_start(
+        self,
+        evidence: HumanBootstrapEvidence,
+        gate: Callable[[], bool],
+        origin: str | None,
+        roast_num: int | None,
+    ) -> HumanStartResult:
+        proof = self._start_proof
+        if proof is None or proof.evidence is not evidence or not self._start_proof_current(proof):
+            return HumanStartRefused(StartRefusal.NO_PROOF)
+        if not valid_start_metadata(origin, roast_num):
+            return HumanStartRefused(StartRefusal.INVALID_METADATA_REQUEST)
+        metadata_ok = True
+        if origin is not None and roast_num is not None:
+            try:
+                async with asyncio.timeout(self._config.call_timeout_seconds):
+                    error, content, structured = await _call_strict_sdk(
+                        proof.session,
+                        "set_recording_metadata",
+                        {"origin": origin, "roast_num": roast_num},
+                    )
+                metadata_ok = decode_metadata_reply(
+                    is_error=error,
+                    content=content,
+                    structured=structured,
+                    origin=origin,
+                    roast_num=roast_num,
+                )
+            except Exception:
+                metadata_ok = False
+        if not self._start_proof_current(proof):
+            return HumanStartRefused(StartRefusal.DISPLACED_BEFORE_CLAIM)
+        if not metadata_ok:
+            return HumanStartRefused(StartRefusal.METADATA_FAILED)
+        failed = False
+        error: object = EnvelopeMember.ABSENT
+        content: object = EnvelopeMember.ABSENT
+        structured: object = EnvelopeMember.ABSENT
+        try:
+            async with asyncio.timeout(self._config.call_timeout_seconds):
+                permitted = _start_gate(gate)
+                if not self._start_proof_current(proof):
+                    return HumanStartRefused(StartRefusal.DISPLACED_BEFORE_CLAIM)
+                if not permitted:
+                    return HumanStartRefused(StartRefusal.GATE_REFUSED)
+                self._human_start_attempt = StartAttemptState.CLAIMED
+                error, content, structured = await _call_strict_sdk(
+                    proof.session, "start_roast_session", start_arguments()
+                )
+        except Exception:
+            failed = True
+        if not self._start_proof_current(proof):
+            return HumanStartUncertain(StartUncertainty.DISPLACED_AFTER_CLAIM)
+        permitted = _start_gate(gate)
+        if not self._start_proof_current(proof):
+            return HumanStartUncertain(StartUncertainty.DISPLACED_AFTER_CLAIM)
+        if not permitted:
+            return HumanStartUncertain(StartUncertainty.AUTHORITY_LOST)
+        if failed:
+            return HumanStartUncertain(StartUncertainty.TRANSPORT_FAILED)
+        if error is True:
+            return HumanStartUncertain(StartUncertainty.PRODUCER_ERROR)
+        ident = decode_start_reply(is_error=error, content=content, structured=structured)
+        if ident is None:
+            return HumanStartUncertain(StartUncertainty.INVALID_REPLY)
+        self._human_start_attempt = StartAttemptState.ACCEPTED
+        return HumanStartAccepted(ident, proof.epoch)
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""

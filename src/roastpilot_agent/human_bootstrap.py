@@ -464,3 +464,181 @@ def build_bootstrap_evidence(
         auto_t0_drop_threshold_c=cast("int | float", runtime_config["auto_t0_drop_threshold_c"]),
         capture_capability=cast("str", capture_evidence["capability"]),
     )
+
+
+class StartAttemptState(Enum):
+    """Process-local one-shot state, without durable or control authority."""
+
+    UNATTEMPTED = "unattempted"
+    RESERVED = "reserved"
+    REFUSED_BEFORE_CLAIM = "refused_before_claim"
+    CLAIMED = "claimed"
+    ACCEPTED = "accepted"
+
+
+class StartRefusal(Enum):
+    """Reasons known to precede the private Start claim."""
+
+    ALREADY_ATTEMPTED = "already_attempted"
+    NO_PROOF = "no_proof"
+    INVALID_METADATA_REQUEST = "invalid_metadata_request"
+    METADATA_FAILED = "metadata_failed"
+    DISPLACED_BEFORE_CLAIM = "displaced_before_claim"
+    GATE_REFUSED = "gate_refused"
+
+
+class StartUncertainty(Enum):
+    """Reasons that cannot exclude producer entry."""
+
+    DISPLACED_AFTER_CLAIM = "displaced_after_claim"
+    AUTHORITY_LOST = "authority_lost"
+    TRANSPORT_FAILED = "transport_failed"
+    PRODUCER_ERROR = "producer_error"
+    INVALID_REPLY = "invalid_reply"
+
+
+@dataclass(frozen=True, slots=True)
+class HumanStartRefused:
+    """Value-free refusal before any Start request was claimed."""
+
+    reason: StartRefusal
+
+
+@dataclass(frozen=True, slots=True)
+class HumanStartUncertain:
+    """Value-free uncertainty after possible Start entry."""
+
+    reason: StartUncertainty
+
+
+@dataclass(frozen=True, slots=True)
+class HumanStartAccepted:
+    """Validated acknowledgement, without capture or actuation permission."""
+
+    session_id: str
+    child_epoch: int
+
+
+HumanStartResult = HumanStartRefused | HumanStartUncertain | HumanStartAccepted
+
+
+def start_arguments() -> dict[str, object]:
+    """Return the private manual mock Start arguments."""
+    return {"purpose": "roast", "first_crack_observer_ack": "manual/v1"}
+
+
+def valid_start_metadata(origin: object, roast_num: object) -> bool:
+    """Validate an omitted pair or bounded canonical recording metadata.
+
+    Args:
+        origin: Optional canonical lower-case origin slug.
+        roast_num: Optional paired integer roast number.
+
+    Returns:
+        Whether the complete pair is admitted on this private mock path.
+    """
+    if origin is None and roast_num is None:
+        return True
+    if type(origin) is not str or type(roast_num) is not int:
+        return False
+    return (
+        0 < len(origin) <= 200
+        and all(char in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in origin)
+        and not origin.startswith("-")
+        and not origin.endswith("-")
+        and "--" not in origin
+        and 0 <= roast_num <= 2**63 - 1
+    )
+
+
+def _bounded_start_json(value: object) -> bool:
+    pending: list[tuple[object, int]] = [(value, 0)]
+    nodes = 0
+    while pending:
+        item, depth = pending.pop()
+        nodes += 1
+        if nodes > 2048 or depth > 16:
+            return False
+        if type(item) is dict:
+            mapping = cast("dict[object, object]", item)
+            if len(mapping) > 2048 - nodes or any(
+                type(key) is not str or len(key) > MAX_BOOTSTRAP_TEXT_CODE_POINTS for key in mapping
+            ):
+                return False
+            pending.extend((child, depth + 1) for child in mapping.values())
+        elif type(item) is list:
+            sequence = cast("list[object]", item)
+            if len(sequence) > 2048 - nodes:
+                return False
+            pending.extend((child, depth + 1) for child in sequence)
+        elif type(item) is str:
+            if len(item) > MAX_BOOTSTRAP_TEXT_CODE_POINTS:
+                return False
+        elif item is not None and type(item) is not bool and not _finite_number(item):
+            return False
+    return True
+
+
+def _start_reply(is_error: object, content: object, structured: object) -> dict[str, object] | None:
+    if is_error is not False:
+        return None
+    text = _single_text(content)
+    if (
+        not _bounded_start_json(structured)
+        or not _bounded_start_json(text)
+        or not _same(structured, text)
+        or type(structured) is not dict
+    ):
+        return None
+    return cast("dict[str, object]", structured)
+
+
+def decode_metadata_reply(
+    *, is_error: object, content: object, structured: object, origin: str, roast_num: int
+) -> bool:
+    """Require the exact canonical metadata echo in both representations.
+
+    Args:
+        is_error: Raw SDK error member.
+        content: Raw SDK text blocks.
+        structured: Raw structured member.
+        origin: Previously validated origin sent to the child.
+        roast_num: Previously validated roast number sent to the child.
+
+    Returns:
+        Whether both bounded representations echo the exact request.
+    """
+    value = _start_reply(is_error, content, structured)
+    return value is not None and _same(value, {"origin": origin, "roast_num": roast_num})
+
+
+def decode_start_reply(*, is_error: object, content: object, structured: object) -> str | None:
+    """Validate bounded independent Start representations and project only identity.
+
+    Args:
+        is_error: Raw SDK error member.
+        content: Raw SDK text blocks.
+        structured: Raw structured member.
+
+    Returns:
+        The strict session ID, or None for any refusal.
+    """
+    value = _start_reply(is_error, content, structured)
+    if value is None or value.keys() != {"session"} or type(value["session"]) is not dict:
+        return None
+    session = cast("dict[str, object]", value["session"])
+    ident = session.get("session_id")
+    if (
+        type(ident) is not str
+        or len(ident) != 32
+        or any(char not in "0123456789abcdef" for char in ident)
+        or session.get("active") is not True
+        or not _is_text(session.get("phase"), "pre_roast")
+        or not _is_text(session.get("session_purpose"), "roast")
+        or any(
+            name not in session or session[name] is not None
+            for name in ("stopped_at_utc", "faulted_at_utc", "first_crack_at_utc")
+        )
+    ):
+        return None
+    return ident
