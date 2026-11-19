@@ -6577,12 +6577,69 @@ def test_c2b_start_envelope_requires_exact_success(error: object) -> None:
 
 
 def test_c2b_private_start_has_no_production_caller() -> None:
-    references: list[str] = []
-    for path in Path(mcp_client_module.__file__).parent.rglob("*.py"):
-        for node in ast.walk(ast.parse(path.read_text())):
-            if isinstance(node, ast.Attribute) and node.attr == "_attempt_human_start":
-                references.append(path.name)
-    assert references == []
+    """Pin direct and static reflective references, not arbitrary dynamic indirection."""
+    run_references: list[tuple[str, str]] = []
+    strict_references: list[tuple[str, str]] = []
+    for path in sorted(Path(mcp_client_module.__file__).parent.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            assert not (
+                isinstance(node, ast.Attribute)
+                and node.attr == "_attempt_human_start"
+                or isinstance(node, ast.Name)
+                and node.id == "_attempt_human_start"
+                or isinstance(node, ast.Constant)
+                and node.value == "_attempt_human_start"
+            ), path
+            if isinstance(node, ast.Constant):
+                assert node.value not in ("_run_human_start", "_call_strict_sdk"), path
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(function):
+                if isinstance(node, ast.Attribute | ast.Name):
+                    name = node.attr if isinstance(node, ast.Attribute) else node.id
+                    if name == "_run_human_start":
+                        run_references.append((path.name, function.name))
+                    if name == "_call_strict_sdk":
+                        strict_references.append((path.name, function.name))
+    assert run_references == [("mcp_client.py", "_attempt_human_start")]
+    assert strict_references == [
+        ("mcp_client.py", "_call_bootstrap_sdk"),
+        ("mcp_client.py", "_run_human_start"),
+        ("mcp_client.py", "_run_human_start"),
+    ]
+    functions = {
+        node.name: node
+        for node in ast.walk(_module_tree(mcp_client_module))
+        if isinstance(node, ast.AsyncFunctionDef)
+    }
+    reservation = functions["_attempt_human_start"]
+    invocations = [
+        node
+        for node in ast.walk(reservation)
+        if isinstance(node, ast.Await)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Attribute)
+        and node.value.func.attr == "_run_human_start"
+    ]
+    assert len(invocations) == 1
+    call = cast("ast.Call", invocations[0].value)
+    assert ast.unparse(call) == "self._run_human_start(evidence, gate, origin, roast_num)"
+    strict_calls = [
+        node
+        for node in ast.walk(functions["_run_human_start"])
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_call_strict_sdk"
+    ]
+    assert sorted(ast.unparse(node) for node in strict_calls) == sorted(
+        [
+            "_call_strict_sdk(proof.session, 'set_recording_metadata', "
+            "{'origin': origin, 'roast_num': roast_num})",
+            "_call_strict_sdk(proof.session, 'start_roast_session', start_arguments())",
+        ]
+    )
 
 
 @pytest.mark.asyncio
@@ -6752,3 +6809,131 @@ def test_c2b_bounded_json_checks_before_representation_comparison(
 ) -> None:
     """Independent shape bounds apply before cross-representation recursion."""
     assert hb._bounded_start_json(value) is accepted  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("number", "echo"), [(0, False), (1, True), (0, 0.0), (0, "extra")])
+async def test_c2b_metadata_echo_is_exactly_typed(number: int, echo: object) -> None:
+    process, double, evidence = await _hs_ready()
+    payload: dict[str, object] = {"origin": "brazil-santos", "roast_num": echo}
+    if echo == "extra":
+        payload = {"origin": "brazil-santos", "roast_num": number, "extra": None}
+    double.replies["set_recording_metadata"] = _hs_raw(payload)
+    gates = 0
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        return True
+
+    assert await _hs_attempt(process, evidence, gate, origin="brazil-santos", roast_num=number) == (
+        hb.HumanStartRefused(hb.StartRefusal.METADATA_FAILED)
+    )
+    assert gates == 0
+    assert double.calls == [
+        ("set_recording_metadata", {"origin": "brazil-santos", "roast_num": number})
+    ]
+    assert _hs_state(process) is hb.StartAttemptState.REFUSED_BEFORE_CLAIM
+
+    control, control_double, control_evidence = await _hs_ready()
+    control_double.replies["set_recording_metadata"] = _hs_raw(
+        {"origin": "brazil-santos", "roast_num": number}
+    )
+    assert await _hs_attempt(
+        control, control_evidence, gate, origin="brazil-santos", roast_num=number
+    ) == hb.HumanStartAccepted("a" * 32, control.child_epoch)
+    assert gates == 2
+    assert [name for name, _ in control_double.calls] == [
+        "set_recording_metadata",
+        "start_roast_session",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_c2b_old_read_after_latest_failure_cannot_resurrect_proof() -> None:
+    process, double, original = await _hs_ready()
+    entered, release = asyncio.Event(), asyncio.Event()
+    real_call = double.call_tool
+    first = True
+
+    async def call(name: str, arguments: dict[str, object] | None = None) -> object:
+        nonlocal first
+        if first:
+            first = False
+            entered.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return await real_call(name, arguments)
+
+    double.call_tool = call
+    old = asyncio.create_task(_bs_read(process))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        double.replies["get_server_info"] = RuntimeError("synthetic latest read failure")
+        latest = await _bs_read(process)
+        assert latest == _bs_refused(BootstrapRefusal.READ_FAILED, BootstrapRead.SERVER_INFO)
+        double.replies["get_server_info"] = CallToolResult.model_validate(
+            _bs_raw(BootstrapRead.SERVER_INFO)
+        )
+        release.set()
+        prior = await asyncio.wait_for(old, 5)
+    finally:
+        release.set()
+        if not old.done():
+            old.cancel()
+            with suppress(asyncio.CancelledError):
+                await old
+    assert isinstance(prior, HumanBootstrapEvidence) and prior is not original
+    assert [name for name, _ in double.calls] == [
+        "get_server_info",
+        "get_server_info",
+        "get_runtime_config",
+        "get_capture_evidence",
+    ]
+    double.calls.clear()
+    gates = 0
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        return True
+
+    assert await _hs_attempt(process, prior, gate) == hb.HumanStartRefused(hb.StartRefusal.NO_PROOF)
+    assert gates == 0 and double.calls == []
+
+
+def _hs_depth_payload(containers: int, tail: str) -> dict[str, object]:
+    payload = _hs_payload()
+    nested: object = {} if tail == "dict" else []
+    for _ in range(containers - 3):
+        nested = [nested]
+    cast("dict[str, object]", payload["session"])["diagnostic"] = nested
+    return payload
+
+
+@pytest.mark.parametrize("tail", ["dict", "list"])
+@pytest.mark.parametrize("representation", ["text", "structured", "both"])
+def test_c2b_exact_container_depth_bound(
+    tail: str, representation: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    valid = _hs_depth_payload(16, tail)
+    invalid = _hs_depth_payload(17, tail)
+    assert _hs_decode(valid) == "a" * 32
+    assert _hs_decode(invalid) is None
+
+    def comparison_must_not_run(*_: object) -> bool:
+        pytest.fail("unbounded representation reached agreement comparison")
+
+    monkeypatch.setattr(hb, "_same", comparison_must_not_run)
+    structured = invalid if representation in ("structured", "both") else valid
+    text = invalid if representation in ("text", "both") else valid
+    assert _hs_decode(structured, text=json.dumps(text)) is None
+
+
+@pytest.mark.parametrize("leaf", [None, True, 1, 1.0, "leaf"])
+def test_c2b_scalar_leaf_at_depth_sixteen_is_permitted(leaf: object) -> None:
+    payload = _hs_payload()
+    nested = leaf
+    for _ in range(14):
+        nested = [nested]
+    cast("dict[str, object]", payload["session"])["diagnostic"] = nested
+    assert _hs_decode(payload) == "a" * 32

@@ -557,7 +557,7 @@ def _bounded_start_json(value: object) -> bool:
     while pending:
         item, depth = pending.pop()
         nodes += 1
-        if nodes > 2048 or depth > 16:
+        if nodes > 2048 or depth > 16 or (depth == 16 and type(item) in (dict, list)):
             return False
         if type(item) is dict:
             mapping = cast("dict[object, object]", item)
