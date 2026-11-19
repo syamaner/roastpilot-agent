@@ -1331,6 +1331,29 @@ class StartAttemptHoldRead:
             raise ValueError("only HELD carries a Start attempt record")
 
 
+class StartHoldInstallOutcome(Enum):
+    """Install truth; INDETERMINATE never grants command admission."""
+
+    INSTALLED_VERIFIED = "installed_verified"
+    PRECONDITION_REJECTED = "precondition_rejected"
+    INDETERMINATE = "indeterminate"
+
+
+class StartHoldSettlementOutcome(Enum):
+    """Settlement truth, independent of current Start permission."""
+
+    SETTLED_VERIFIED = "settled_verified"
+    PRECONDITION_REJECTED = "precondition_rejected"
+    INDETERMINATE = "indeterminate"
+
+
+class StartHoldDisposition(Enum):
+    """Application-proven terminal disposition; never a raw transport status."""
+
+    NON_ENTRY = "non_entry"
+    ACCEPTED_SESSION = "accepted_session"
+
+
 class RestartClearanceState(Enum):
     """Durable clearance state for the current Agent process (#954/D213)."""
 
