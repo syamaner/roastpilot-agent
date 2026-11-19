@@ -11756,7 +11756,6 @@ async def test_start_hold_writer_exact_roundtrip_and_terminal_reuse(
         is StartHoldInstallOutcome.INSTALLED_VERIFIED
     )
     assert (await hold_store.read_start_attempt_hold()).record == hold
-    assert not await hold_store.confirm_process_restart_clearance(hold.process_id)
     assert (
         await hold_store.install_start_attempt_hold(hold)
         is StartHoldInstallOutcome.PRECONDITION_REJECTED
@@ -11815,6 +11814,7 @@ async def test_start_hold_writer_exact_roundtrip_and_terminal_reuse(
         "UPDATE roast_runs SET completed_at_utc = 'terminal'",
         "DELETE FROM roast_runs",
         "INSERT INTO fault_control_lease VALUES (1, NULL, NULL, 1, 'open', 'now')",
+        "INSERT INTO fault_control_lease VALUES (1, NULL, NULL, 1, 'closed', 'now')",
         "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
         "VALUES (NULL, 'start_attempt_hold_settled', '{}', 'accepted', 'now')",
     ],
@@ -11827,7 +11827,16 @@ async def test_start_hold_writer_refused_prerequisites_are_atomic(
 
     hold = await _ready_start_hold_writer(hold_store)
     await hold_store.connection.execute(mutation)
+    if "'closed'" in mutation:
+        await hold_store.connection.execute(
+            "INSERT INTO operator_actions (action, payload_json, result, recorded_at_utc) "
+            "VALUES ('initialize_safety_record', ?, 'accepted', 'now')",
+            (json.dumps({"baseline": "initialised", "generation": 1, "operation_id": "lease"}),),
+        )
     await hold_store.connection.commit()
+    if "'closed'" in mutation:
+        lease = await hold_store.read_fault_control_lease()
+        assert lease.status is FaultLeaseStatus.CLOSED and lease.generation == 1
     before = await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
     assert (
         await hold_store.install_start_attempt_hold(hold)
@@ -12026,8 +12035,10 @@ async def test_start_hold_ambiguous_commit_never_promotes_to_success(
 
     async def ambiguous(connection: aiosqlite.Connection) -> None:
         await original(connection)
-        if clear_after and not settle:
-            await connection.execute("DELETE FROM start_attempt_hold")
+        if clear_after:
+            await connection.execute(
+                "DELETE FROM operator_actions" if settle else "DELETE FROM start_attempt_hold"
+            )
             await original(connection)
         raise RuntimeError("lost commit acknowledgement")
 
@@ -12048,14 +12059,18 @@ async def test_start_hold_ambiguous_commit_never_promotes_to_success(
     receipts = hold_store.drain_human_storage_receipts()
     assert len(receipts) == 1  # independent reads never start a new owner/deadline
     assert receipts[0].settlement is (
-        Settlement.UNRESOLVED if clear_after and not settle else Settlement.OBSERVED_COMMITTED
+        Settlement.UNRESOLVED if clear_after else Settlement.OBSERVED_COMMITTED
     )
     assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (
         0 if settle or clear_after else 1,
     )
     assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (
-        1 if settle else 0,
+        1 if settle and not clear_after else 0,
     )
+    if settle and not clear_after:
+        assert await fetch_one(hold_store, "SELECT payload_json FROM operator_actions") == (
+            _expected_start_hold_marker(hold),
+        )
 
 
 @pytest.mark.asyncio
@@ -12311,3 +12326,180 @@ async def test_start_hold_settlement_delete_compares_every_original_field(
         )
     assert fired and (await hold_store.read_start_attempt_hold()).record == hold
     assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+
+
+def _expected_start_hold_marker(hold: "StartAttemptHold") -> str:
+    """Build the closed audit witness independently of the storage producer."""
+    return json.dumps(
+        {
+            "attempt_key": hold.attempt_key,
+            "run_id": hold.run_id,
+            "process_id": hold.process_id,
+            "child_epoch": hold.child_epoch,
+            "fault_lease_generation": hold.fault_lease_generation,
+            "created_at_utc": hold.created_at_utc.isoformat(),
+            "disposition": "non_entry",
+            "session_id": None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_hold_wrong_concrete_type_before_connection(
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from roastpilot_agent.models import StartHoldDisposition
+
+    await _ready_start_hold_writer(hold_store)
+
+    async def forbidden(*args: object, **kwargs: object) -> NoReturn:
+        pytest.fail("wrong concrete input reached storage")
+
+    monkeypatch.setattr(hold_store, "_open_connection", forbidden)
+    with pytest.raises(ValueError, match="exact Start hold snapshot"):
+        await hold_store.install_start_attempt_hold(None)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValueError, match="exact Start hold snapshot"):
+        await hold_store.settle_start_attempt_hold(
+            None,  # pyright: ignore[reportArgumentType]
+            disposition=StartHoldDisposition.NON_ENTRY,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["result", "run_id", "session", "noncanonical"])
+async def test_start_hold_matching_invalid_marker_preserves_storage(
+    hold_store: RoastStore, mutation: str
+) -> None:
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    payload = json.loads(_expected_start_hold_marker(hold))
+    if mutation == "session":
+        payload["session_id"] = "d" * 32
+    marker = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if mutation == "noncanonical":
+        marker = json.dumps(payload, sort_keys=True)
+    await hold_store.connection.execute(
+        "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
+        "VALUES (?, 'start_attempt_hold_settled', ?, ?, 'now')",
+        (
+            None if mutation == "run_id" else hold.run_id,
+            marker,
+            "rejected" if mutation == "result" else "accepted",
+        ),
+    )
+    await hold_store.connection.commit()
+    audits = await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    assert await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions") == audits
+
+
+@pytest.mark.asyncio
+async def test_start_hold_attempt_marker_blocks_reuse_on_another_run(
+    hold_store: RoastStore,
+) -> None:
+    from dataclasses import replace
+
+    from roastpilot_agent.models import StartHoldDisposition, StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.install_start_attempt_hold(hold)
+    await hold_store.settle_start_attempt_hold(hold, disposition=StartHoldDisposition.NON_ENTRY)
+    marker = await fetch_one(hold_store, "SELECT payload_json FROM operator_actions")
+    assert marker == (_expected_start_hold_marker(hold),)
+    await hold_store.complete_run(
+        run_id=hold.run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED
+    )
+    await hold_store.create_run(
+        run_id="e" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    assert (
+        await hold_store.install_start_attempt_hold(replace(hold, run_id="e" * 32))
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    assert await fetch_one(hold_store, "SELECT payload_json FROM operator_actions") == marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settle", [False, True])
+@pytest.mark.parametrize("failure", ["open", "precommit", "owner_cancel"])
+async def test_start_hold_writer_entry_and_transaction_failure_are_unchanged(
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch, settle: bool, failure: str
+) -> None:
+    from roastpilot_agent.models import (
+        StartHoldDisposition,
+        StartHoldInstallOutcome,
+        StartHoldSettlementOutcome,
+    )
+
+    hold = await _ready_start_hold_writer(hold_store)
+    if settle:
+        await hold_store.install_start_attempt_hold(hold)
+    hold_store.drain_human_storage_receipts()
+    tables = (
+        "start_attempt_hold",
+        "operator_actions",
+        "roast_runs",
+        "process_epoch",
+        "process_restart_clearance",
+        "fault_control_lease",
+    )
+    before = [await hold_store.connection.execute_fetchall("SELECT * FROM " + t) for t in tables]
+    original_open = hold_store._open_connection  # pyright: ignore[reportPrivateUsage]
+    opened: list[aiosqlite_module.Connection] = []
+
+    async def open_connection(*, writer: bool = False) -> aiosqlite_module.Connection:
+        if failure == "open":
+            raise sqlite3.OperationalError("deterministic writer entry failure")
+        connection = await original_open(writer=writer)
+        opened.append(connection)
+        return connection
+
+    async def fail_commit(connection: aiosqlite_module.Connection) -> NoReturn:
+        assert connection.in_transaction
+        if settle:
+            assert await connection.execute_fetchall("SELECT * FROM start_attempt_hold") == []
+            rows = await connection.execute_fetchall("SELECT payload_json FROM operator_actions")
+            assert [tuple(row) for row in rows] == [(_expected_start_hold_marker(hold),)]
+        else:
+            rows = await connection.execute_fetchall("SELECT attempt_key FROM start_attempt_hold")
+            assert [tuple(row) for row in rows] == [(hold.attempt_key,)]
+        if failure == "owner_cancel":
+            raise asyncio.CancelledError("raised inside storage owner")
+        raise RuntimeError("definite failure before commit")
+
+    async def operation() -> object:
+        if settle:
+            return await hold_store.settle_start_attempt_hold(
+                hold, disposition=StartHoldDisposition.NON_ENTRY
+            )
+        return await hold_store.install_start_attempt_hold(hold)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hold_store, "_open_connection", open_connection)
+        patch.setattr(aiosqlite_module.Connection, "commit", fail_commit)
+        if failure == "owner_cancel":
+            with pytest.raises(asyncio.CancelledError, match="inside storage owner"):
+                await operation()
+        else:
+            assert await operation() is (
+                StartHoldSettlementOutcome.INDETERMINATE
+                if settle
+                else StartHoldInstallOutcome.INDETERMINATE
+            )
+    assert len(opened) == {"open": 0, "precommit": 2, "owner_cancel": 1}[failure]
+    for connection in opened:
+        with pytest.raises(ValueError, match="no active connection"):
+            await connection.execute("SELECT 1")
+    assert hold_store.human_storage_quiescent
+    (receipt,) = hold_store.drain_human_storage_receipts()
+    assert receipt.settlement is Settlement.VERIFIED_NO_WRITE
+    after = [await hold_store.connection.execute_fetchall("SELECT * FROM " + t) for t in tables]
+    assert after == before

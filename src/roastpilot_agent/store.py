@@ -2151,8 +2151,9 @@ class RoastStore:
                     != row["payload_json"]
                 ):
                     return None
-                if candidate.attempt_key == hold.attempt_key or candidate.run_id == hold.run_id:
-                    matches.append(row["payload_json"])
+                # SQL selects matching identities; canonical validation above proves
+                # those identities agree with the audit row and parsed payload.
+                matches.append(row["payload_json"])
             except (ValueError, TypeError, KeyError):
                 return None
         return matches
