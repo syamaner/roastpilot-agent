@@ -8,7 +8,7 @@ import ast
 import asyncio
 import json
 import sqlite3
-from collections.abc import Callable, Iterable
+from collections.abc import AsyncIterator, Callable, Iterable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +17,7 @@ from unittest import mock
 
 import aiosqlite as aiosqlite_module
 import pytest
+import pytest_asyncio
 
 from roastpilot_agent import human_persistence, roast_landmarks
 from roastpilot_agent import store as store_module
@@ -593,8 +594,9 @@ async def test_v21_migration_preserves_clearance_rows_and_process_epoch(
             is RestartClearanceState.REQUIRED
         )
         await old.connection.execute(
-            "UPDATE process_restart_clearance SET state = 'cleared' WHERE process_id = ?",
-            ("cleared-process",),
+            "UPDATE process_restart_clearance SET state = ?, updated_at_utc = ? "
+            "WHERE process_id = ? AND state = ?",
+            ("cleared", datetime.now(UTC).isoformat(), "cleared-process", "required"),
         )
         await old.connection.commit()
         assert await old.begin_process_epoch("v20-process")
@@ -11405,6 +11407,16 @@ async def test_human_clean_epoch_cannot_verify_an_uncommitted_marker(
         await tmp_store.close()
 
 
+@pytest_asyncio.fixture
+async def hold_store(tmp_path: Path) -> AsyncIterator[RoastStore]:
+    """Own each new hold case's connection through assertion and cancellation failures."""
+    store = RoastStore(tmp_path / "hold.sqlite3")
+    try:
+        yield store
+    finally:
+        await store.close()
+
+
 async def _seed_start_hold(store: RoastStore) -> tuple[object, ...]:
     """Create a synthetic terminal run and its unresolved attempt evidence."""
     run_id = "b" * 32
@@ -11422,24 +11434,24 @@ async def _seed_start_hold(store: RoastStore) -> tuple[object, ...]:
 
 @pytest.mark.asyncio
 async def test_start_hold_empty_and_committed_read_ignores_shared_deletion(
-    tmp_store: RoastStore,
+    hold_store: RoastStore,
 ) -> None:
     """Only committed absence clears; the read never observes an uncommitted delete."""
     from roastpilot_agent.models import StartAttemptHoldState
 
-    await tmp_store.initialize()
-    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
-    values = await _seed_start_hold(tmp_store)
-    held = await tmp_store.read_start_attempt_hold()
+    await hold_store.initialize()
+    assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+    values = await _seed_start_hold(hold_store)
+    held = await hold_store.read_start_attempt_hold()
     assert held.state is StartAttemptHoldState.HELD and held.record is not None
     assert held.record.attempt_key == values[1]
     assert held.record.run_id == values[2]
     assert held.record.process_id == values[3]
     assert held.record.child_epoch == 1 and held.record.fault_lease_generation == 0
     assert held.record.created_at_utc == datetime(2026, 11, 19, 10, tzinfo=UTC)
-    await tmp_store.connection.execute("DELETE FROM start_attempt_hold")
-    assert await tmp_store.read_start_attempt_hold() == held
-    await tmp_store.connection.rollback()
+    await hold_store.connection.execute("DELETE FROM start_attempt_hold")
+    assert await hold_store.read_start_attempt_hold() == held
+    await hold_store.connection.rollback()
 
 
 @pytest.mark.asyncio
@@ -11464,13 +11476,13 @@ async def test_start_hold_empty_and_committed_read_ignores_shared_deletion(
     ],
 )
 async def test_start_hold_corrupt_producer_is_unknown(
-    tmp_store: RoastStore, column: str, value: object
+    hold_store: RoastStore, column: str, value: object
 ) -> None:
     """Compromised constraints cannot turn invalid or orphan evidence into CLEAR."""
     from roastpilot_agent.models import StartAttemptHoldState
 
-    await tmp_store.initialize()
-    values = list(await _seed_start_hold(tmp_store))
+    await hold_store.initialize()
+    values = list(await _seed_start_hold(hold_store))
     names = [
         "singleton",
         "attempt_key",
@@ -11481,25 +11493,27 @@ async def test_start_hold_corrupt_producer_is_unknown(
         "created_at_utc",
     ]
     values[names.index(column)] = value
-    await tmp_store.connection.execute("DROP TABLE start_attempt_hold")
-    await tmp_store.connection.execute("CREATE TABLE start_attempt_hold (" + ", ".join(names) + ")")
-    await tmp_store.connection.execute(
+    await hold_store.connection.execute("DROP TABLE start_attempt_hold")
+    await hold_store.connection.execute(
+        "CREATE TABLE start_attempt_hold (" + ", ".join(names) + ")"
+    )
+    await hold_store.connection.execute(
         "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
     )
-    await tmp_store.connection.commit()
-    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+    await hold_store.connection.commit()
+    assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("shape", ["missing", "extra", "reordered", "duplicate", "truncated"])
 async def test_start_hold_unknown_inventory_or_multiple_rows(
-    tmp_store: RoastStore, shape: str
+    hold_store: RoastStore, shape: str
 ) -> None:
     """The full table inventory and at most two rows are validated even when empty."""
     from roastpilot_agent.models import StartAttemptHoldState
 
-    await tmp_store.initialize()
-    values = await _seed_start_hold(tmp_store)
+    await hold_store.initialize()
+    values = await _seed_start_hold(hold_store)
     names = [
         "singleton",
         "attempt_key",
@@ -11509,7 +11523,7 @@ async def test_start_hold_unknown_inventory_or_multiple_rows(
         "fault_lease_generation",
         "created_at_utc",
     ]
-    await tmp_store.connection.execute("DROP TABLE start_attempt_hold")
+    await hold_store.connection.execute("DROP TABLE start_attempt_hold")
     if shape != "missing":
         if shape == "extra":
             names.append("surprise")
@@ -11517,55 +11531,55 @@ async def test_start_hold_unknown_inventory_or_multiple_rows(
             names.reverse()
         elif shape == "truncated":
             names.pop()
-        await tmp_store.connection.execute(
+        await hold_store.connection.execute(
             "CREATE TABLE start_attempt_hold (" + ", ".join(names) + ")"
         )
         if shape == "duplicate":
-            await tmp_store.connection.executemany(
+            await hold_store.connection.executemany(
                 "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", [values, values]
             )
-    await tmp_store.connection.commit()
-    assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+    await hold_store.connection.commit()
+    assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
 
 
 @pytest.mark.asyncio
 async def test_start_hold_open_failure_is_unknown_and_cancellation_propagates(
-    tmp_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A failed independent open is unproven, while cancellation remains cancellation."""
     from roastpilot_agent.models import StartAttemptHoldState
 
-    await tmp_store.initialize()
+    await hold_store.initialize()
     with mock.patch.object(
-        tmp_store, "_open_connection", mock.AsyncMock(side_effect=OSError("failed"))
+        hold_store, "_open_connection", mock.AsyncMock(side_effect=OSError("failed"))
     ):
-        assert (await tmp_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+        assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
     with (
         mock.patch.object(
-            tmp_store, "_open_connection", mock.AsyncMock(side_effect=asyncio.CancelledError)
+            hold_store, "_open_connection", mock.AsyncMock(side_effect=asyncio.CancelledError)
         ),
         pytest.raises(asyncio.CancelledError),
     ):
-        await tmp_store.read_start_attempt_hold()
+        await hold_store.read_start_attempt_hold()
 
 
 @pytest.mark.asyncio
-async def test_start_hold_transaction_backstops_preserve_row(tmp_store: RoastStore) -> None:
+async def test_start_hold_transaction_backstops_preserve_row(hold_store: RoastStore) -> None:
     """A hold committed after service proof defeats both actual SQL mutation paths."""
-    await tmp_store.initialize()
-    await tmp_store.begin_process_epoch("current")
-    await tmp_store.begin_process_restart_clearance("current")
-    values = await _seed_start_hold(tmp_store)
-    assert not await tmp_store.confirm_process_restart_clearance("current")
+    await hold_store.initialize()
+    await hold_store.begin_process_epoch("current")
+    await hold_store.begin_process_restart_clearance("current")
+    values = await _seed_start_hold(hold_store)
+    assert not await hold_store.confirm_process_restart_clearance("current")
     assert (
-        await tmp_store.read_process_restart_clearance("current")
+        await hold_store.read_process_restart_clearance("current")
     ) is RestartClearanceState.REQUIRED
-    assert not await tmp_store.initialize_missing_fault_control_safety_record(
+    assert not await hold_store.initialize_missing_fault_control_safety_record(
         process_id="current", generation=1, operation_id="baseline"
     )
-    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
-    assert await fetch_one(tmp_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
-    assert await fetch_one(tmp_store, "SELECT * FROM start_attempt_hold") == values
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM fault_control_lease") == (0,)
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+    assert await fetch_one(hold_store, "SELECT * FROM start_attempt_hold") == values
 
 
 @pytest.mark.asyncio
@@ -11576,26 +11590,28 @@ async def test_v22_upgrade_preserves_all_v21_state(
     path = tmp_path / "v22.sqlite3"
     monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:21])
     old = RoastStore(path)
-    await old.initialize()
-    await old.begin_process_epoch("predecessor")
-    await old.begin_process_restart_clearance("predecessor")
-    await old.create_run(
-        run_id="b" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
-    )
-    await old.complete_run(run_id="b" * 32, outcome="faulted", agent_phase=RoastPhase.FAULTED)
-    await old.connection.execute(
-        "INSERT INTO fault_control_lease "
-        "VALUES (1, ?, 'session', 1, 'open', '2026-11-19T10:00:00+00:00')",
-        ("b" * 32,),
-    )
-    await old.connection.commit()
-    tables = ["roast_runs", "process_epoch", "process_restart_clearance", "fault_control_lease"]
-    before = [await fetch_one(old, "SELECT * FROM " + table) for table in tables]
-    await old.close()
+    try:
+        await old.initialize()
+        await old.begin_process_epoch("predecessor")
+        await old.begin_process_restart_clearance("predecessor")
+        await old.create_run(
+            run_id="b" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+        )
+        await old.complete_run(run_id="b" * 32, outcome="faulted", agent_phase=RoastPhase.FAULTED)
+        await old.connection.execute(
+            "INSERT INTO fault_control_lease "
+            "VALUES (1, ?, 'session', 1, 'open', '2026-11-19T10:00:00+00:00')",
+            ("b" * 32,),
+        )
+        await old.connection.commit()
+        tables = ["roast_runs", "process_epoch", "process_restart_clearance", "fault_control_lease"]
+        before = [await fetch_one(old, "SELECT * FROM " + table) for table in tables]
+    finally:
+        await old.close()
     monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
     new = RoastStore(path)
-    await new.initialize()
     try:
+        await new.initialize()
         assert await new.schema_version() == 22
         assert [await fetch_one(new, "SELECT * FROM " + table) for table in tables] == before
         assert await fetch_one(new, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
@@ -11619,19 +11635,19 @@ async def test_v22_upgrade_preserves_all_v21_state(
     ],
 )
 async def test_v22_start_hold_constraints_reject_invalid_writer_values(
-    tmp_store: RoastStore, index: int, value: object
+    hold_store: RoastStore, index: int, value: object
 ) -> None:
     """The closed schema prevents malformed identities, epochs, generations and orphans."""
-    await tmp_store.initialize()
-    values = list(await _seed_start_hold(tmp_store))
-    await tmp_store.connection.execute("DELETE FROM start_attempt_hold")
-    await tmp_store.connection.commit()
+    await hold_store.initialize()
+    values = list(await _seed_start_hold(hold_store))
+    await hold_store.connection.execute("DELETE FROM start_attempt_hold")
+    await hold_store.connection.commit()
     values[index] = value
     with pytest.raises(sqlite3.IntegrityError):
-        await tmp_store.connection.execute(
+        await hold_store.connection.execute(
             "INSERT INTO start_attempt_hold VALUES (?, ?, ?, ?, ?, ?, ?)", values
         )
-    await tmp_store.connection.rollback()
+    await hold_store.connection.rollback()
 
 
 def test_start_hold_read_record_invariant() -> None:
@@ -11652,3 +11668,47 @@ def test_start_hold_read_record_invariant() -> None:
         StartAttemptHoldRead(StartAttemptHoldState.HELD)
     with pytest.raises(FrozenInstanceError):
         record.child_epoch = 2  # pyright: ignore[reportAttributeAccessIssue]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_start_hold_independent_connection_closes_after_invalid_row_or_cancellation(
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch, cancel: bool
+) -> None:
+    """The real owned read connection closes on malformed data and post-open cancellation."""
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    await hold_store.initialize()
+    await _seed_start_hold(hold_store)
+    await hold_store.connection.execute("PRAGMA ignore_check_constraints = ON")
+    await hold_store.connection.execute("UPDATE start_attempt_hold SET child_epoch = 0")
+    await hold_store.connection.commit()
+    opened: list[aiosqlite_module.Connection] = []
+    real_open = hold_store._open_connection  # pyright: ignore[reportPrivateUsage]
+    entered = asyncio.Event()
+
+    async def tracked_open() -> aiosqlite_module.Connection:
+        connection = await real_open()
+        opened.append(connection)
+        return connection
+
+    async def parked_configuration(connection: aiosqlite_module.Connection) -> None:
+        assert connection is opened[0]
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(hold_store, "_open_connection", tracked_open)
+    if cancel:
+        monkeypatch.setattr(hold_store, "_configure_durable_connection", parked_configuration)
+        task = asyncio.create_task(hold_store.read_start_attempt_hold())
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+    else:
+        assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.UNKNOWN
+    assert len(opened) == 1
+    with pytest.raises(ValueError, match="no active connection"):
+        await opened[0].execute("SELECT 1")
