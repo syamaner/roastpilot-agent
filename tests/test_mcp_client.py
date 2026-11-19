@@ -6425,24 +6425,26 @@ async def test_c2b_concurrent_attempt_and_emergency_during_metadata() -> None:
     async def call(name: str, arguments: dict[str, object] | None = None) -> object:
         if name == "set_recording_metadata":
             entered.set()
-            await release.wait()
+            await asyncio.wait_for(release.wait(), 5)
         return await original(name, arguments)
 
     double.call_tool = call
     double.replies["emergency_stop"] = _hs_raw({"session_id": "existing-owner"})
     first = asyncio.create_task(_hs_attempt(process, evidence, origin="brazil-santos", roast_num=0))
     try:
-        await entered.wait()
+        await asyncio.wait_for(entered.wait(), 5)
+        assert _hs_state(process) is hb.StartAttemptState.RESERVED
         assert await _hs_attempt(process, evidence) == hb.HumanStartRefused(
             hb.StartRefusal.ALREADY_ATTEMPTED
         )
+        assert _hs_state(process) is hb.StartAttemptState.RESERVED
         assert await asyncio.wait_for(
             process.call_tool("emergency_stop", {"expected_session_id": "existing-owner"}), 1
         ) == {"session_id": "existing-owner"}
         assert not first.done()
     finally:
         release.set()
-    assert isinstance(await first, hb.HumanStartAccepted)
+    assert isinstance(await asyncio.wait_for(first, 5), hb.HumanStartAccepted)
     assert [n for n, _ in double.calls] == [
         "emergency_stop",
         "set_recording_metadata",
@@ -6937,3 +6939,147 @@ def test_c2b_scalar_leaf_at_depth_sixteen_is_permitted(leaf: object) -> None:
         nested = [nested]
     cast("dict[str, object]", payload["session"])["diagnostic"] = nested
     assert _hs_decode(payload) == "a" * 32
+
+
+@pytest.mark.asyncio
+async def test_c2b_final_gate_reaches_original_sdk_before_scheduled_replacement() -> None:
+    """Claim and original-session SDK entry precede callbacks queued by the gate."""
+    process, double, evidence = await _hs_ready()
+    original = double.call_tool
+    order: list[str] = []
+    entries: list[tuple[object, hb.StartAttemptState]] = []
+    gates = 0
+
+    def replace() -> None:
+        order.append("replacement")
+        process._replace_session(None)  # pyright: ignore[reportPrivateUsage]
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        order.append("gate")
+        asyncio.get_running_loop().call_soon(replace)
+        return True
+
+    async def call(name: str, arguments: dict[str, object] | None = None) -> object:
+        # Record synchronously, before the fake's first suspension.
+        order.append("sdk-entry")
+        entries.append((process._session, _hs_state(process)))  # pyright: ignore[reportPrivateUsage]
+        return await original(name, arguments)
+
+    double.call_tool = call
+    assert await _hs_attempt(process, evidence, gate) == hb.HumanStartUncertain(
+        hb.StartUncertainty.DISPLACED_AFTER_CLAIM
+    )
+    assert len(entries) == 1
+    assert entries[0][0] is double, "stale session entered SDK after gate"
+    assert entries[0][1] is hb.StartAttemptState.CLAIMED
+    assert order == ["gate", "sdk-entry", "replacement"]
+    assert double.calls == [
+        ("start_roast_session", {"purpose": "roast", "first_crack_observer_ack": "manual/v1"})
+    ]
+    assert gates == 1
+
+
+@pytest.mark.asyncio
+async def test_c2b_reread_clears_proof_before_first_suspension() -> None:
+    process, double, evidence = await _hs_ready()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = double.call_tool
+    gates = 0
+
+    async def call(name: str, arguments: dict[str, object] | None = None) -> object:
+        if name == "get_server_info":
+            entered.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return await original(name, arguments)
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        return True
+
+    double.call_tool = call
+    read = asyncio.create_task(_bs_read(process))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert await _hs_attempt(process, evidence, gate) == hb.HumanStartRefused(
+            hb.StartRefusal.NO_PROOF
+        )
+        assert gates == 0 and double.calls == []
+    finally:
+        release.set()
+        result = await asyncio.wait_for(read, 5)
+    assert isinstance(result, HumanBootstrapEvidence)
+    assert double.calls == _BS_ORDER
+
+
+@pytest.mark.asyncio
+async def test_c2b_equal_value_reread_displaces_claimed_start() -> None:
+    process, double, evidence = await _hs_ready()
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = double.call_tool
+    gates = 0
+
+    async def call(name: str, arguments: dict[str, object] | None = None) -> object:
+        if name == "start_roast_session":
+            entered.set()
+            await asyncio.wait_for(release.wait(), 5)
+        return await original(name, arguments)
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        return True
+
+    double.call_tool = call
+    attempt = asyncio.create_task(_hs_attempt(process, evidence, gate))
+    try:
+        await asyncio.wait_for(entered.wait(), 5)
+        assert _hs_state(process) is hb.StartAttemptState.CLAIMED
+        fresh = await _bs_read(process)
+        assert isinstance(fresh, HumanBootstrapEvidence)
+        assert fresh == evidence and fresh is not evidence
+        assert gates == 1
+    finally:
+        release.set()
+        result = await asyncio.wait_for(attempt, 5)
+    assert result == hb.HumanStartUncertain(hb.StartUncertainty.DISPLACED_AFTER_CLAIM)
+    assert gates == 1
+    assert double.calls == [
+        *_BS_ORDER,
+        ("start_roast_session", {"purpose": "roast", "first_crack_observer_ack": "manual/v1"}),
+    ]
+    assert await _hs_attempt(process, fresh, gate) == hb.HumanStartRefused(
+        hb.StartRefusal.ALREADY_ATTEMPTED
+    )
+    assert gates == 1
+    assert sum(name == "start_roast_session" for name, _ in double.calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stale", [False, True])
+async def test_c2b_invalid_proof_precedes_malformed_metadata(stale: bool) -> None:
+    process, double, evidence = await _hs_ready()
+    if stale:
+        fresh = await _bs_read(process)
+        assert isinstance(fresh, HumanBootstrapEvidence) and fresh is not evidence
+        double.calls.clear()
+    else:
+        evidence = dataclasses.replace(evidence)
+    gates = 0
+
+    def gate() -> bool:
+        nonlocal gates
+        gates += 1
+        return True
+
+    assert await _hs_attempt(process, evidence, gate, origin="", roast_num=0) == (
+        hb.HumanStartRefused(hb.StartRefusal.NO_PROOF)
+    )
+    assert gates == 0 and double.calls == []
+    control, control_double, issued = await _hs_ready()
+    assert await _hs_attempt(control, issued, gate, origin="", roast_num=0) == (
+        hb.HumanStartRefused(hb.StartRefusal.INVALID_METADATA_REQUEST)
+    )
+    assert gates == 0 and control_double.calls == []
