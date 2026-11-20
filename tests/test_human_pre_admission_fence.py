@@ -95,7 +95,11 @@ def fresh_boundary(h: HumanHarness) -> None:
 
 def test_claim_is_read_only_sessionless_and_blocks_same_id_replacement() -> None:
     assert HumanRunAdmission.__bases__ == (Enum,)
-    assert set(HumanRunAdmission) == {HumanRunAdmission.PREPARED, HumanRunAdmission.ADMITTED}
+    assert set(HumanRunAdmission) == {
+        HumanRunAdmission.PREPARED,
+        HumanRunAdmission.ADMITTED,
+        HumanRunAdmission.SESSION_BOUND,
+    }
     assert HumanRunState("default").admission is HumanRunAdmission.ADMITTED
     h = prepared()
     run = run_of(h)

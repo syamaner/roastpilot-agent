@@ -19,6 +19,19 @@ class HumanRunAdmission(Enum):
 
     PREPARED = auto()
     ADMITTED = auto()
+    SESSION_BOUND = auto()
+
+
+class HumanSessionBinding(Enum):
+    """Private handoff outcomes; entered-unbound never proves non-entry.
+
+    NO_ISSUED_RECEIPT is receiver-scoped: an unrelated receiver cannot prove
+    producer non-entry or release the original accepted attempt for retry.
+    """
+
+    BOUND = auto()
+    NO_ISSUED_RECEIPT = auto()
+    ENTERED_UNBOUND = auto()
 
 
 class PendingHumanCall(Enum):
@@ -110,10 +123,11 @@ class HumanRunState:
     command: CommandDisposition = CommandDisposition.SETTLED
     containment: ContainmentAttempt = ContainmentAttempt.AVAILABLE
     durably_closed: bool = False
+    _session_handoff_prepared: bool = False
 
     @property
     def admission(self) -> HumanRunAdmission:
-        """Return the immutable admission value chosen when ownership was claimed."""
+        """Return authority, including the one-way private session binding."""
         return self._admission
 
     @property

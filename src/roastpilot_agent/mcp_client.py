@@ -1491,6 +1491,27 @@ class RoasterControlAdapter:
         self._ambient_token_change_monotonic = None
         self._last_containment_result = None
 
+    def _human_session_id(self) -> str | None:
+        """Project the exact adapter identity for private B2 composition."""
+        return self.latest_fault_session_id
+
+    def _human_child_epoch(self) -> int | None:
+        """Project this adapter's current attached child for private B2 composition."""
+        transport = self._fixed_zero_transport
+        return None if transport is None else transport.child_epoch
+
+    def _prepare_human_session_identity(self) -> bool:
+        """Reset only before this transport's private one-shot Start is attempted."""
+        transport = self._fixed_zero_transport
+        if transport is None or transport._human_start_state is not StartAttemptState.UNATTEMPTED:  # pyright: ignore[reportPrivateUsage]
+            return False
+        self.reset_session_identity_for_new_run()
+        return (
+            self._started_session_id is None
+            and self._started_child_epoch is None
+            and self._last_state is None
+        )
+
     def _identity_snapshot(self) -> _IdentitySnapshot:
         transport = self._fixed_zero_transport
         return _IdentitySnapshot(
@@ -2759,6 +2780,9 @@ class MCPServerProcess:
         self._start_proof: _StartProof | None = None
         self._bootstrap_read_generation = 0
         self._human_start_attempt = StartAttemptState.UNATTEMPTED
+        self._human_start_receipt: HumanStartAccepted | None = None
+        self._human_start_receipt_proof: _StartProof | None = None
+        self._human_start_receipt_spent = False
         #: The launch record bound at the current attach epoch (cleared on any
         #: session change); ``None`` for a legacy builder or injected session.
         self._launch_record: LaunchRecord | None = None
@@ -3718,6 +3742,19 @@ class MCPServerProcess:
             and self._bootstrap_framed(proof.session, proof.epoch, proof.record)
         )
 
+    def _consume_human_start_receipt(self, receipt: object) -> tuple[bool, _StartProof | None]:
+        """Resolve exact issuer eligibility before any validation or observer.
+
+        A foreign presentation neither spends another issuer's receipt nor
+        supplies evidence that its original Start did not enter.
+        """
+        if self._human_start_receipt is None or receipt is not self._human_start_receipt:
+            return False, None
+        if self._human_start_receipt_spent:
+            return True, None
+        self._human_start_receipt_spent = True
+        return True, self._human_start_receipt_proof
+
     async def _attempt_human_start(
         self,
         evidence: HumanBootstrapEvidence,
@@ -3802,7 +3839,10 @@ class MCPServerProcess:
         if ident is None:
             return HumanStartUncertain(StartUncertainty.INVALID_REPLY)
         self._human_start_attempt = StartAttemptState.ACCEPTED
-        return HumanStartAccepted(ident, proof.epoch)
+        receipt = HumanStartAccepted(ident, proof.epoch)
+        self._human_start_receipt = receipt
+        self._human_start_receipt_proof = proof
+        return receipt
 
     async def call_tool(self, name: str, arguments: dict[str, object]) -> object:
         """ToolCaller implementation: timeout-bounded, typed failures only."""
