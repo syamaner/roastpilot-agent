@@ -1346,6 +1346,7 @@ from roastpilot_agent.models import (  # noqa: E402
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
+    StartAttemptHold,
     recording_origin_slug,
 )
 from roastpilot_agent.roast_termination import (  # noqa: E402
@@ -11712,3 +11713,793 @@ async def test_start_hold_independent_connection_closes_after_invalid_row_or_can
     assert len(opened) == 1
     with pytest.raises(ValueError, match="no active connection"):
         await opened[0].execute("SELECT 1")
+
+
+async def _ready_start_hold_writer(
+    store: RoastStore,
+    *,
+    clock: Callable[[], float] | None = None,
+    interval: float = 1.0,
+) -> "StartAttemptHold":
+    """Prepare only synthetic HUMAN process/run prerequisites."""
+    from datetime import UTC, datetime
+
+    from roastpilot_agent.models import StartAttemptHold
+    from tests.conftest import FakeClock
+
+    await store.initialize()
+    await store.begin_process_epoch("c" * 32)
+    await store.begin_process_restart_clearance("c" * 32)
+    assert await store.confirm_process_restart_clearance("c" * 32)
+    await store.create_run(
+        run_id="b" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    store.enable_human_storage(clock if clock is not None else FakeClock(), interval)
+    return StartAttemptHold("a" * 32, "b" * 32, "c" * 32, 1, 0, datetime(2026, 11, 19, tzinfo=UTC))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted", [False, True])
+async def test_start_hold_writer_exact_roundtrip_and_terminal_reuse(
+    hold_store: RoastStore,
+    accepted: bool,
+) -> None:
+    from roastpilot_agent.models import (
+        StartHoldDisposition,
+        StartHoldInstallOutcome,
+        StartHoldSettlementOutcome,
+    )
+
+    hold = await _ready_start_hold_writer(hold_store)
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.INSTALLED_VERIFIED
+    )
+    assert (await hold_store.read_start_attempt_hold()).record == hold
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    disposition = (
+        StartHoldDisposition.ACCEPTED_SESSION if accepted else StartHoldDisposition.NON_ENTRY
+    )
+    session = "d" * 32 if accepted else None
+    assert (
+        await hold_store.settle_start_attempt_hold(
+            hold, disposition=disposition, session_id=session
+        )
+        is StartHoldSettlementOutcome.SETTLED_VERIFIED
+    )
+    row = await fetch_one(hold_store, "SELECT action, payload_json, result FROM operator_actions")
+    assert row is not None and row[0] == "start_attempt_hold_settled" and row[2] == "accepted"
+    import json
+
+    payload = json.loads(str(row[1]))
+    assert payload == dict(
+        attempt_key=hold.attempt_key,
+        run_id=hold.run_id,
+        process_id=hold.process_id,
+        child_epoch=1,
+        fault_lease_generation=0,
+        created_at_utc=hold.created_at_utc.isoformat(),
+        disposition=disposition.value,
+        session_id=session,
+    )
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert (
+        await hold_store.settle_start_attempt_hold(
+            hold, disposition=disposition, session_id=session
+        )
+        is StartHoldSettlementOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (1,)
+    assert (await hold_store.read_timeline(hold.run_id)).events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "DELETE FROM process_epoch",
+        "UPDATE process_epoch SET status = 'clean'",
+        "UPDATE process_epoch SET process_id = 'foreign'",
+        "DELETE FROM process_restart_clearance",
+        "UPDATE process_restart_clearance SET state = 'closure_only'",
+        "UPDATE process_restart_clearance SET state = 'unknown'",
+        "UPDATE roast_runs SET agent_phase = 'idle'",
+        "UPDATE roast_runs SET outcome = 'faulted'",
+        "UPDATE roast_runs SET completed_at_utc = 'terminal'",
+        "DELETE FROM roast_runs",
+        "INSERT INTO fault_control_lease VALUES (1, NULL, NULL, 1, 'open', 'now')",
+        "INSERT INTO fault_control_lease VALUES (1, NULL, NULL, 1, 'closed', 'now')",
+        "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
+        "VALUES (NULL, 'start_attempt_hold_settled', '{}', 'accepted', 'now')",
+    ],
+)
+async def test_start_hold_writer_refused_prerequisites_are_atomic(
+    hold_store: RoastStore,
+    mutation: str,
+) -> None:
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.connection.execute(mutation)
+    if "'closed'" in mutation:
+        await hold_store.connection.execute(
+            "INSERT INTO operator_actions (action, payload_json, result, recorded_at_utc) "
+            "VALUES ('initialize_safety_record', ?, 'accepted', 'now')",
+            (json.dumps({"baseline": "initialised", "generation": 1, "operation_id": "lease"}),),
+        )
+    await hold_store.connection.commit()
+    if "'closed'" in mutation:
+        lease = await hold_store.read_fault_control_lease()
+        assert lease.status is FaultLeaseStatus.CLOSED and lease.generation == 1
+    before = await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    assert await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions") == before
+
+
+@pytest.mark.asyncio
+async def test_start_hold_writer_other_open_run_and_untrusted_absence(
+    hold_store: RoastStore,
+) -> None:
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.create_run(
+        run_id="e" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    await hold_store.connection.execute("DELETE FROM roast_runs WHERE id = ?", ("e" * 32,))
+    await hold_store.connection.commit()
+    # A second unclean process cannot inherit trusted generation-zero absence.
+    assert not await hold_store.begin_process_epoch(hold.process_id)
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("child_epoch", True),
+        ("fault_lease_generation", False),
+        ("attempt_key", "A" * 32),
+        ("run_id", "foreign"),
+        ("process_id", 1),
+        ("created_at_utc", "now"),
+    ],
+)
+async def test_start_hold_writer_input_validation_before_connection(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+    value: object,
+) -> None:
+    from dataclasses import replace
+
+    hold = await _ready_start_hold_writer(hold_store)
+
+    async def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("invalid input reached a connection")
+
+    monkeypatch.setattr(hold_store, "_open_connection", forbidden)
+    with pytest.raises(ValueError):
+        await hold_store.install_start_attempt_hold(replace(hold, **{field: value}))
+
+
+@pytest.mark.asyncio
+async def test_start_hold_writer_human_off_and_disposition_validation(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from roastpilot_agent.models import (
+        StartHoldDisposition,
+        StartHoldInstallOutcome,
+        StartHoldSettlementOutcome,
+    )
+
+    hold = await _ready_start_hold_writer(hold_store)
+
+    async def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("refused input reached a connection")
+
+    monkeypatch.setattr(hold_store, "_open_connection", forbidden)
+    for disposition, session in [
+        (True, None),
+        (StartHoldDisposition.NON_ENTRY, "d" * 32),
+        (StartHoldDisposition.ACCEPTED_SESSION, None),
+        (StartHoldDisposition.ACCEPTED_SESSION, "D" * 32),
+    ]:
+        with pytest.raises(ValueError):
+            await hold_store.settle_start_attempt_hold(
+                hold,
+                disposition=disposition,  # pyright: ignore[reportArgumentType]
+                session_id=session,
+            )
+    monkeypatch.setattr(hold_store, "_history_clock", None)
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert (
+        await hold_store.settle_start_attempt_hold(hold, disposition=StartHoldDisposition.NON_ENTRY)
+        is StartHoldSettlementOutcome.PRECONDITION_REJECTED
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "UPDATE process_epoch SET status = 'clean'",
+        "UPDATE process_epoch SET process_id = 'foreign'",
+        "INSERT INTO fault_control_lease VALUES (1, NULL, NULL, 1, 'closed', 'now')",
+        "UPDATE start_attempt_hold SET child_epoch = 2",
+        "UPDATE start_attempt_hold SET attempt_key = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'",
+        "DELETE FROM start_attempt_hold",
+    ],
+)
+async def test_start_hold_settlement_preserves_foreign_or_stale_state(
+    hold_store: RoastStore,
+    mutation: str,
+) -> None:
+    from roastpilot_agent.models import StartHoldDisposition, StartHoldSettlementOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.install_start_attempt_hold(hold)
+    await hold_store.connection.execute(mutation)
+    if "'closed'" in mutation:
+        await hold_store.connection.execute(
+            "INSERT INTO operator_actions (action, payload_json, result, recorded_at_utc) "
+            "VALUES ('initialize_safety_record', ?, 'accepted', 'now')",
+            (
+                json.dumps(
+                    {"baseline": "initialised", "generation": 1, "operation_id": "lease-change"},
+                    sort_keys=True,
+                ),
+            ),
+        )
+    await hold_store.connection.commit()
+    if "'closed'" in mutation:
+        assert (await hold_store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    before_audits = await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
+    before = await hold_store.connection.execute_fetchall("SELECT * FROM start_attempt_hold")
+    assert (
+        await hold_store.settle_start_attempt_hold(hold, disposition=StartHoldDisposition.NON_ENTRY)
+        is StartHoldSettlementOutcome.PRECONDITION_REJECTED
+    )
+    assert (
+        await hold_store.connection.execute_fetchall("SELECT * FROM start_attempt_hold") == before
+    )
+    assert (
+        await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
+        == before_audits
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_hold_settlement_preserves_exact_raw_timestamp(hold_store: RoastStore) -> None:
+    import json
+
+    from roastpilot_agent.models import StartHoldDisposition, StartHoldSettlementOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.install_start_attempt_hold(hold)
+    raw = "2026-11-19T00:00:00.000000Z"
+    await hold_store.connection.execute("UPDATE start_attempt_hold SET created_at_utc = ?", (raw,))
+    await hold_store.connection.commit()
+    assert (
+        await hold_store.settle_start_attempt_hold(hold, disposition=StartHoldDisposition.NON_ENTRY)
+        is StartHoldSettlementOutcome.SETTLED_VERIFIED
+    )
+    row = await fetch_one(hold_store, "SELECT payload_json FROM operator_actions")
+    assert row is not None and json.loads(str(row[0]))["created_at_utc"] == raw
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settle", [False, True])
+@pytest.mark.parametrize("clear_after", [False, True])
+async def test_start_hold_ambiguous_commit_never_promotes_to_success(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    settle: bool,
+    clear_after: bool,
+) -> None:
+    import aiosqlite
+
+    from roastpilot_agent.human_persistence import Settlement
+    from roastpilot_agent.models import (
+        StartHoldDisposition,
+        StartHoldInstallOutcome,
+        StartHoldSettlementOutcome,
+    )
+
+    hold = await _ready_start_hold_writer(hold_store)
+    if settle:
+        await hold_store.install_start_attempt_hold(hold)
+    hold_store.drain_human_storage_receipts()
+    original = aiosqlite.Connection.commit
+
+    async def ambiguous(connection: aiosqlite.Connection) -> None:
+        await original(connection)
+        if clear_after:
+            await connection.execute(
+                "DELETE FROM operator_actions" if settle else "DELETE FROM start_attempt_hold"
+            )
+            await original(connection)
+        raise RuntimeError("lost commit acknowledgement")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "commit", ambiguous)
+        if settle:
+            assert (
+                await hold_store.settle_start_attempt_hold(
+                    hold, disposition=StartHoldDisposition.NON_ENTRY
+                )
+                is StartHoldSettlementOutcome.INDETERMINATE
+            )
+        else:
+            assert (
+                await hold_store.install_start_attempt_hold(hold)
+                is StartHoldInstallOutcome.INDETERMINATE
+            )
+    receipts = hold_store.drain_human_storage_receipts()
+    assert len(receipts) == 1  # independent reads never start a new owner/deadline
+    assert receipts[0].settlement is (
+        Settlement.UNRESOLVED if clear_after else Settlement.OBSERVED_COMMITTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (
+        0 if settle or clear_after else 1,
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (
+        1 if settle and not clear_after else 0,
+    )
+    if settle and not clear_after:
+        assert await fetch_one(hold_store, "SELECT payload_json FROM operator_actions") == (
+            _expected_start_hold_marker(hold),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["rollback", "read", "writer_close", "reader_close"])
+async def test_start_hold_writer_failures_refuse_success(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import aiosqlite
+
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    original_commit = aiosqlite.Connection.commit
+    original_close = aiosqlite.Connection.close
+    original_read = hold_store._read_start_hold_snapshot  # pyright: ignore[reportPrivateUsage]
+    closes = 0
+
+    async def commit(connection: aiosqlite.Connection) -> None:
+        if failure == "rollback":
+            raise RuntimeError("definite pre-commit failure")
+        await original_commit(connection)
+
+    async def close(connection: aiosqlite.Connection) -> None:
+        nonlocal closes
+        closes += 1
+        await original_close(connection)
+        if (failure == "writer_close" and closes == 1) or (
+            failure == "reader_close" and closes == 2
+        ):
+            raise RuntimeError("lost close acknowledgement")
+
+    async def read(connection: aiosqlite.Connection) -> object:
+        if failure == "read":
+            raise RuntimeError("independent read failed")
+        return await original_read(connection)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "commit", commit)
+        patch.setattr(aiosqlite.Connection, "close", close)
+        patch.setattr(hold_store, "_read_start_hold_snapshot", read)
+        assert (
+            await hold_store.install_start_attempt_hold(hold)
+            is StartHoldInstallOutcome.INDETERMINATE
+        )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (
+        0 if failure == "rollback" else 1,
+    )
+    if failure in {"writer_close", "reader_close"}:
+        from roastpilot_agent.human_persistence import HistoryUnavailable
+
+        assert not hold_store.human_storage_quiescent
+        with pytest.raises(HistoryUnavailable, match="teardown is unverified"):
+            await hold_store.close()
+        # The injection actually closed the handles. Release only the test's
+        # deliberately unverified bookkeeping after asserting the refusal.
+        hold_store._history_owner = None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_start_hold_writer_deadline_and_cancellation_keep_original_refusal(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+    cancel: bool,
+) -> None:
+    import asyncio
+
+    import aiosqlite
+
+    from roastpilot_agent.human_persistence import HistoryUnavailable
+    from roastpilot_agent.models import StartAttemptHoldState
+
+    hold = await _ready_start_hold_writer(
+        hold_store, clock=__import__("time").monotonic, interval=0.05
+    )
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = aiosqlite.Connection.commit
+
+    async def delayed(connection: aiosqlite.Connection) -> None:
+        entered.set()
+        await release.wait()
+        await original(connection)
+
+    task: asyncio.Task[object] | None = None
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(aiosqlite.Connection, "commit", delayed)
+            task = asyncio.create_task(hold_store.install_start_attempt_hold(hold))
+            await entered.wait()
+            if cancel:
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(HistoryUnavailable, match="deadline"):
+                    await task
+            assert not hold_store.human_storage_quiescent
+            release.set()
+            assert await hold_store.settle_human_storage_for_teardown()
+        assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
+    finally:
+        release.set()
+        if task is not None and not task.done():
+            await task
+
+
+@pytest.mark.asyncio
+async def test_start_hold_writer_busy_and_restart_history(hold_store: RoastStore) -> None:
+    import time
+
+    import aiosqlite
+
+    from roastpilot_agent.human_persistence import HistoryUnavailable
+    from roastpilot_agent.models import StartAttemptHoldState, StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store, clock=time.monotonic, interval=0.05)
+    async with aiosqlite.connect(hold_store.db_path) as blocker:
+        await blocker.execute("BEGIN IMMEDIATE")
+        try:
+            result = await hold_store.install_start_attempt_hold(hold)
+            assert result is StartHoldInstallOutcome.INDETERMINATE
+        except HistoryUnavailable:
+            pass
+        await blocker.rollback()
+    assert await hold_store.settle_human_storage_for_teardown()
+    if (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR:
+        assert (
+            await hold_store.install_start_attempt_hold(hold)
+            is StartHoldInstallOutcome.INSTALLED_VERIFIED
+        )
+    restarted = RoastStore(hold_store.db_path)
+    try:
+        await restarted.initialize()
+        assert (await restarted.read_start_attempt_hold()).record == hold
+        await restarted.begin_process_epoch("f" * 32)
+        assert (await restarted.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
+        await restarted.complete_run(
+            run_id=hold.run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED
+        )
+        assert (await restarted.read_start_attempt_hold()).record == hold
+        assert await restarted.read_timeline(hold.run_id) is not None
+    finally:
+        await restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_start_hold_writer_plain_insert_never_replaces_competing_row(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aiosqlite
+
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    execute = aiosqlite.Connection.execute
+    fired = False
+
+    async def competing(
+        connection: aiosqlite.Connection, sql: str, parameters: object = ()
+    ) -> object:
+        nonlocal fired
+        if "INTO start_attempt_hold" in sql and not fired:
+            fired = True
+            await execute(
+                connection,
+                "INSERT INTO start_attempt_hold VALUES (1, ?, ?, ?, ?, ?, ?)",
+                ("e" * 32, hold.run_id, hold.process_id, 2, 0, hold.created_at_utc.isoformat()),
+            )
+        return await execute(connection, sql, parameters)  # pyright: ignore[reportArgumentType]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "execute", competing)
+
+        # Intercept only INSERT through an awaitable; all normal SELECT calls
+        # still need aiosqlite's async context-manager object.
+        def route(connection: aiosqlite.Connection, sql: str, parameters: object = ()) -> object:
+            if "INTO start_attempt_hold" in sql:
+                return competing(connection, sql, parameters)
+            return execute(connection, sql, parameters)  # pyright: ignore[reportArgumentType]
+
+        patch.setattr(aiosqlite.Connection, "execute", route)
+        assert (
+            await hold_store.install_start_attempt_hold(hold)
+            is StartHoldInstallOutcome.INDETERMINATE
+        )
+    assert fired
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+
+
+@pytest.mark.asyncio
+async def test_start_hold_postcondition_uses_original_deadline(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aiosqlite
+
+    from roastpilot_agent.human_persistence import HistoryUnavailable
+
+    clock = FakeClock()
+    hold = await _ready_start_hold_writer(hold_store, clock=clock)
+    original = hold_store._read_start_hold_snapshot  # pyright: ignore[reportPrivateUsage]
+
+    async def expired_read(connection: aiosqlite.Connection) -> object:
+        clock.advance(2.0)
+        return await original(connection)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hold_store, "_read_start_hold_snapshot", expired_read)
+        with pytest.raises(HistoryUnavailable, match="deadline"):
+            await hold_store.install_start_attempt_hold(hold)
+    (receipt,) = hold_store.drain_human_storage_receipts()
+    assert receipt.timely is False
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (1,)
+
+
+@pytest.mark.asyncio
+async def test_start_hold_settlement_delete_compares_every_original_field(
+    hold_store: RoastStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aiosqlite
+
+    from roastpilot_agent.models import StartHoldDisposition, StartHoldSettlementOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.install_start_attempt_hold(hold)
+    execute = aiosqlite.Connection.execute
+    fired = False
+
+    async def changed_delete(
+        connection: aiosqlite.Connection, sql: str, parameters: object
+    ) -> object:
+        nonlocal fired
+        fired = True
+        await execute(connection, "UPDATE start_attempt_hold SET child_epoch = 2")
+        return await execute(connection, sql, parameters)  # pyright: ignore[reportArgumentType]
+
+    def route(connection: aiosqlite.Connection, sql: str, parameters: object = ()) -> object:
+        if sql.startswith("DELETE FROM start_attempt_hold"):
+            return changed_delete(connection, sql, parameters)
+        return execute(connection, sql, parameters)  # pyright: ignore[reportArgumentType]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(aiosqlite.Connection, "execute", route)
+        assert (
+            await hold_store.settle_start_attempt_hold(
+                hold, disposition=StartHoldDisposition.NON_ENTRY
+            )
+            is StartHoldSettlementOutcome.INDETERMINATE
+        )
+    assert fired and (await hold_store.read_start_attempt_hold()).record == hold
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM operator_actions") == (0,)
+
+
+def _expected_start_hold_marker(hold: "StartAttemptHold") -> str:
+    """Build the closed audit witness independently of the storage producer."""
+    return json.dumps(
+        {
+            "attempt_key": hold.attempt_key,
+            "run_id": hold.run_id,
+            "process_id": hold.process_id,
+            "child_epoch": hold.child_epoch,
+            "fault_lease_generation": hold.fault_lease_generation,
+            "created_at_utc": hold.created_at_utc.isoformat(),
+            "disposition": "non_entry",
+            "session_id": None,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.asyncio
+async def test_start_hold_wrong_concrete_type_before_connection(
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from roastpilot_agent.models import StartHoldDisposition
+
+    await _ready_start_hold_writer(hold_store)
+
+    async def forbidden(*args: object, **kwargs: object) -> NoReturn:
+        pytest.fail("wrong concrete input reached storage")
+
+    monkeypatch.setattr(hold_store, "_open_connection", forbidden)
+    with pytest.raises(ValueError, match="exact Start hold snapshot"):
+        await hold_store.install_start_attempt_hold(None)  # pyright: ignore[reportArgumentType]
+    with pytest.raises(ValueError, match="exact Start hold snapshot"):
+        await hold_store.settle_start_attempt_hold(
+            None,  # pyright: ignore[reportArgumentType]
+            disposition=StartHoldDisposition.NON_ENTRY,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["result", "run_id", "session", "noncanonical"])
+async def test_start_hold_matching_invalid_marker_preserves_storage(
+    hold_store: RoastStore, mutation: str
+) -> None:
+    from roastpilot_agent.models import StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    payload = json.loads(_expected_start_hold_marker(hold))
+    if mutation == "session":
+        payload["session_id"] = "d" * 32
+    marker = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    if mutation == "noncanonical":
+        marker = json.dumps(payload, sort_keys=True)
+    await hold_store.connection.execute(
+        "INSERT INTO operator_actions (run_id, action, payload_json, result, recorded_at_utc) "
+        "VALUES (?, 'start_attempt_hold_settled', ?, ?, 'now')",
+        (
+            None if mutation == "run_id" else hold.run_id,
+            marker,
+            "rejected" if mutation == "result" else "accepted",
+        ),
+    )
+    await hold_store.connection.commit()
+    audits = await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions")
+    assert (
+        await hold_store.install_start_attempt_hold(hold)
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    assert await hold_store.connection.execute_fetchall("SELECT * FROM operator_actions") == audits
+
+
+@pytest.mark.asyncio
+async def test_start_hold_attempt_marker_blocks_reuse_on_another_run(
+    hold_store: RoastStore,
+) -> None:
+    from dataclasses import replace
+
+    from roastpilot_agent.models import StartHoldDisposition, StartHoldInstallOutcome
+
+    hold = await _ready_start_hold_writer(hold_store)
+    await hold_store.install_start_attempt_hold(hold)
+    await hold_store.settle_start_attempt_hold(hold, disposition=StartHoldDisposition.NON_ENTRY)
+    marker = await fetch_one(hold_store, "SELECT payload_json FROM operator_actions")
+    assert marker == (_expected_start_hold_marker(hold),)
+    await hold_store.complete_run(
+        run_id=hold.run_id, outcome="faulted", agent_phase=RoastPhase.FAULTED
+    )
+    await hold_store.create_run(
+        run_id="e" * 32, profile=PROFILE, config=AppConfig(), agent_phase=RoastPhase.STARTING
+    )
+    assert (
+        await hold_store.install_start_attempt_hold(replace(hold, run_id="e" * 32))
+        is StartHoldInstallOutcome.PRECONDITION_REJECTED
+    )
+    assert await fetch_one(hold_store, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
+    assert await fetch_one(hold_store, "SELECT payload_json FROM operator_actions") == marker
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settle", [False, True])
+@pytest.mark.parametrize("failure", ["open", "precommit", "owner_cancel"])
+async def test_start_hold_writer_entry_and_transaction_failure_are_unchanged(
+    hold_store: RoastStore, monkeypatch: pytest.MonkeyPatch, settle: bool, failure: str
+) -> None:
+    from roastpilot_agent.models import (
+        StartHoldDisposition,
+        StartHoldInstallOutcome,
+        StartHoldSettlementOutcome,
+    )
+
+    hold = await _ready_start_hold_writer(hold_store)
+    if settle:
+        await hold_store.install_start_attempt_hold(hold)
+    hold_store.drain_human_storage_receipts()
+    tables = (
+        "start_attempt_hold",
+        "operator_actions",
+        "roast_runs",
+        "process_epoch",
+        "process_restart_clearance",
+        "fault_control_lease",
+    )
+    before = [await hold_store.connection.execute_fetchall("SELECT * FROM " + t) for t in tables]
+    original_open = hold_store._open_connection  # pyright: ignore[reportPrivateUsage]
+    opened: list[aiosqlite_module.Connection] = []
+
+    async def open_connection(*, writer: bool = False) -> aiosqlite_module.Connection:
+        if failure == "open":
+            raise sqlite3.OperationalError("deterministic writer entry failure")
+        connection = await original_open(writer=writer)
+        opened.append(connection)
+        return connection
+
+    async def fail_commit(connection: aiosqlite_module.Connection) -> NoReturn:
+        assert connection.in_transaction
+        if settle:
+            assert await connection.execute_fetchall("SELECT * FROM start_attempt_hold") == []
+            rows = await connection.execute_fetchall("SELECT payload_json FROM operator_actions")
+            assert [tuple(row) for row in rows] == [(_expected_start_hold_marker(hold),)]
+        else:
+            rows = await connection.execute_fetchall("SELECT attempt_key FROM start_attempt_hold")
+            assert [tuple(row) for row in rows] == [(hold.attempt_key,)]
+        if failure == "owner_cancel":
+            raise asyncio.CancelledError("raised inside storage owner")
+        raise RuntimeError("definite failure before commit")
+
+    async def operation() -> object:
+        if settle:
+            return await hold_store.settle_start_attempt_hold(
+                hold, disposition=StartHoldDisposition.NON_ENTRY
+            )
+        return await hold_store.install_start_attempt_hold(hold)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(hold_store, "_open_connection", open_connection)
+        patch.setattr(aiosqlite_module.Connection, "commit", fail_commit)
+        if failure == "owner_cancel":
+            with pytest.raises(asyncio.CancelledError, match="inside storage owner"):
+                await operation()
+        else:
+            assert await operation() is (
+                StartHoldSettlementOutcome.INDETERMINATE
+                if settle
+                else StartHoldInstallOutcome.INDETERMINATE
+            )
+    assert len(opened) == {"open": 0, "precommit": 2, "owner_cancel": 1}[failure]
+    for connection in opened:
+        with pytest.raises(ValueError, match="no active connection"):
+            await connection.execute("SELECT 1")
+    assert hold_store.human_storage_quiescent
+    (receipt,) = hold_store.drain_human_storage_receipts()
+    assert receipt.settlement is Settlement.VERIFIED_NO_WRITE
+    after = [await hold_store.connection.execute_fetchall("SELECT * FROM " + t) for t in tables]
+    assert after == before

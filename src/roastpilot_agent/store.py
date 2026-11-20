@@ -74,6 +74,9 @@ from roastpilot_agent.models import (
     StartAttemptHold,
     StartAttemptHoldRead,
     StartAttemptHoldState,
+    StartHoldDisposition,
+    StartHoldInstallOutcome,
+    StartHoldSettlementOutcome,
     TastingAttribute,
     TastingDefect,
     TelemetryPoint,
@@ -1927,55 +1930,384 @@ class RoastStore:
             connection.row_factory = aiosqlite.Row
             await self._configure_durable_connection(connection)
             await connection.execute("BEGIN")
-            async with connection.execute("SELECT * FROM start_attempt_hold LIMIT 2") as cursor:
-                expected = (
-                    "singleton",
-                    "attempt_key",
-                    "run_id",
-                    "process_id",
-                    "child_epoch",
-                    "fault_lease_generation",
-                    "created_at_utc",
-                )
-                if tuple(col[0] for col in cursor.description) != expected:
-                    return unknown
-                rows = list(await cursor.fetchmany(2))
-            if not rows:
-                return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
-            if len(rows) != 1:
-                return unknown
-            row = rows[0]
-            if type(row["singleton"]) is not int or row["singleton"] != 1:
-                return unknown
-            for key in ("attempt_key", "run_id", "process_id"):
-                if type(row[key]) is not str or re.fullmatch(r"[0-9a-f]{32}", row[key]) is None:
-                    return unknown
-            for key, minimum in (("child_epoch", 1), ("fault_lease_generation", 0)):
-                if type(row[key]) is not int or row[key] < minimum:
-                    return unknown
-            if type(row["created_at_utc"]) is not str:
-                return unknown
-            created_at = datetime.fromisoformat(row["created_at_utc"])
-            if created_at.tzinfo is None or created_at.utcoffset() != timedelta(0):
-                return unknown
-            async with connection.execute(
-                "SELECT 1 FROM roast_runs WHERE id = ?", (row["run_id"],)
-            ) as cursor:
-                if await cursor.fetchone() is None:
-                    return unknown
-            return StartAttemptHoldRead(
-                StartAttemptHoldState.HELD,
-                StartAttemptHold(
-                    attempt_key=row["attempt_key"],
-                    run_id=row["run_id"],
-                    process_id=row["process_id"],
-                    child_epoch=row["child_epoch"],
-                    fault_lease_generation=row["fault_lease_generation"],
-                    created_at_utc=created_at,
-                ),
-            )
+            return await self._read_start_hold_snapshot(connection)
         except Exception:  # noqa: BLE001 - malformed or absent evidence is not clearance
             return unknown
+        finally:
+            if connection is not None:
+                await self._close_connection(connection)
+
+    async def _read_start_hold_snapshot(
+        self,
+        connection: aiosqlite.Connection,
+    ) -> StartAttemptHoldRead:
+        unknown = StartAttemptHoldRead(StartAttemptHoldState.UNKNOWN)
+
+        async with connection.execute("SELECT * FROM start_attempt_hold LIMIT 2") as cursor:
+            expected = (
+                "singleton",
+                "attempt_key",
+                "run_id",
+                "process_id",
+                "child_epoch",
+                "fault_lease_generation",
+                "created_at_utc",
+            )
+            if tuple(col[0] for col in cursor.description) != expected:
+                return unknown
+            rows = list(await cursor.fetchmany(2))
+        if not rows:
+            return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
+        if len(rows) != 1:
+            return unknown
+        row = rows[0]
+        if type(row["singleton"]) is not int or row["singleton"] != 1:
+            return unknown
+        for key in ("attempt_key", "run_id", "process_id"):
+            if type(row[key]) is not str or re.fullmatch(r"[0-9a-f]{32}", row[key]) is None:
+                return unknown
+        for key, minimum in (("child_epoch", 1), ("fault_lease_generation", 0)):
+            if type(row[key]) is not int or row[key] < minimum:
+                return unknown
+        if type(row["created_at_utc"]) is not str:
+            return unknown
+        created_at = datetime.fromisoformat(row["created_at_utc"])
+        if created_at.tzinfo is None or created_at.utcoffset() != timedelta(0):
+            return unknown
+        async with connection.execute(
+            "SELECT 1 FROM roast_runs WHERE id = ?", (row["run_id"],)
+        ) as cursor:
+            if await cursor.fetchone() is None:
+                return unknown
+        return StartAttemptHoldRead(
+            StartAttemptHoldState.HELD,
+            StartAttemptHold(
+                attempt_key=row["attempt_key"],
+                run_id=row["run_id"],
+                process_id=row["process_id"],
+                child_epoch=row["child_epoch"],
+                fault_lease_generation=row["fault_lease_generation"],
+                created_at_utc=created_at,
+            ),
+        )
+
+    @staticmethod
+    def _validate_start_hold(hold: StartAttemptHold) -> None:
+        if type(hold) is not StartAttemptHold:
+            raise ValueError("expected exact Start hold snapshot")
+        for value in (hold.attempt_key, hold.run_id, hold.process_id):
+            if type(value) is not str or re.fullmatch(r"[0-9a-f]{32}", value) is None:
+                raise ValueError("invalid Start hold identity")
+        for value, minimum in ((hold.child_epoch, 1), (hold.fault_lease_generation, 0)):
+            if type(value) is not int or not minimum <= value <= 9223372036854775807:
+                raise ValueError("invalid Start hold generation")
+        timestamp = hold.created_at_utc
+        if (
+            type(timestamp) is not datetime
+            or timestamp.tzinfo is None
+            or timestamp.utcoffset() != timedelta(0)
+        ):
+            raise ValueError("Start hold timestamp must be UTC")
+
+    async def install_start_attempt_hold(self, hold: StartAttemptHold) -> StartHoldInstallOutcome:
+        """Install one HUMAN-only hold, with exact committed readback.
+
+        ValueError rejects malformed input before admission. HistoryUnavailable
+        reports bounded admission/deadline refusal; cancellation propagates.
+        PRECONDITION_REJECTED means no write; INDETERMINATE grants no send
+        eligibility, even when later evidence proves a durable installation.
+        """
+        self._validate_start_hold(hold)
+        if not self.human_storage_enabled:
+            return StartHoldInstallOutcome.PRECONDITION_REJECTED
+        result = await self._change_start_hold(hold=hold, disposition=None, session_id=None)
+        return StartHoldInstallOutcome(result)
+
+    async def settle_start_attempt_hold(
+        self,
+        hold: StartAttemptHold,
+        *,
+        disposition: StartHoldDisposition,
+        session_id: str | None = None,
+    ) -> StartHoldSettlementOutcome:
+        """Delete only an exact HUMAN hold under a proven terminal disposition.
+
+        ACCEPTED_SESSION requires the exact lowercase 32-hex session identity;
+        NON_ENTRY carries no session. The application owns that proof. Neither
+        historical settlement nor INDETERMINATE grants current Start permission.
+        ValueError, HistoryUnavailable and cancellation retain their meanings.
+        """
+        self._validate_start_hold(hold)
+        if (
+            type(disposition) is not StartHoldDisposition
+            or (disposition is StartHoldDisposition.NON_ENTRY and session_id is not None)
+            or (
+                disposition is StartHoldDisposition.ACCEPTED_SESSION
+                and (
+                    type(session_id) is not str or re.fullmatch(r"[0-9a-f]{32}", session_id) is None
+                )
+            )
+        ):
+            raise ValueError("invalid Start hold settlement disposition")
+        if not self.human_storage_enabled:
+            return StartHoldSettlementOutcome.PRECONDITION_REJECTED
+        result = await self._change_start_hold(
+            hold=hold,
+            disposition=disposition,
+            session_id=session_id,
+        )
+        return StartHoldSettlementOutcome(result)
+
+    @staticmethod
+    def _start_hold_values(hold: StartAttemptHold, raw_timestamp: str) -> tuple[object, ...]:
+        return (
+            hold.attempt_key,
+            hold.run_id,
+            hold.process_id,
+            hold.child_epoch,
+            hold.fault_lease_generation,
+            raw_timestamp,
+        )
+
+    @staticmethod
+    def _start_hold_marker(
+        hold: StartAttemptHold,
+        raw_timestamp: str,
+        disposition: StartHoldDisposition,
+        session_id: str | None,
+    ) -> str:
+        return json.dumps(
+            dict(
+                zip(
+                    (
+                        "attempt_key",
+                        "run_id",
+                        "process_id",
+                        "child_epoch",
+                        "fault_lease_generation",
+                        "created_at_utc",
+                        "disposition",
+                        "session_id",
+                    ),
+                    (
+                        *RoastStore._start_hold_values(hold, raw_timestamp),
+                        disposition.value,
+                        session_id,
+                    ),
+                    strict=True,
+                )
+            ),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    async def _start_hold_markers(
+        self,
+        connection: aiosqlite.Connection,
+        hold: StartAttemptHold,
+    ) -> list[str] | None:
+        # A malformed marker cannot be trusted to identify its own attempt.
+        async with connection.execute(
+            "SELECT run_id, payload_json, result FROM operator_actions "
+            "WHERE action = 'start_attempt_hold_settled' AND ("
+            "run_id = ? OR NOT json_valid(payload_json) OR "
+            "CASE WHEN json_valid(payload_json) THEN "
+            "json_extract(payload_json, '$.attempt_key') IS NULL OR "
+            "json_extract(payload_json, '$.run_id') IS NULL OR "
+            "json_extract(payload_json, '$.attempt_key') = ? OR "
+            "json_extract(payload_json, '$.run_id') = ? ELSE 1 END) LIMIT 2",
+            (hold.run_id, hold.attempt_key, hold.run_id),
+        ) as cursor:
+            rows = list(await cursor.fetchall())
+        matches: list[str] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+                candidate = StartAttemptHold(
+                    payload["attempt_key"],
+                    payload["run_id"],
+                    payload["process_id"],
+                    payload["child_epoch"],
+                    payload["fault_lease_generation"],
+                    datetime.fromisoformat(payload["created_at_utc"]),
+                )
+                self._validate_start_hold(candidate)
+                disposition = StartHoldDisposition(payload["disposition"])
+                session = payload["session_id"]
+                if (
+                    row["result"] != "accepted"
+                    or row["run_id"] != candidate.run_id
+                    or (disposition is StartHoldDisposition.NON_ENTRY and session is not None)
+                    or (
+                        disposition is StartHoldDisposition.ACCEPTED_SESSION
+                        and (
+                            type(session) is not str
+                            or re.fullmatch(r"[0-9a-f]{32}", session) is None
+                        )
+                    )
+                    or self._start_hold_marker(
+                        candidate, payload["created_at_utc"], disposition, session
+                    )
+                    != row["payload_json"]
+                ):
+                    return None
+                # SQL selects matching identities; canonical validation above proves
+                # those identities agree with the audit row and parsed payload.
+                matches.append(row["payload_json"])
+            except (ValueError, TypeError, KeyError):
+                return None
+        return matches
+
+    async def _start_hold_epoch_matches(
+        self,
+        connection: aiosqlite.Connection,
+        hold: StartAttemptHold,
+    ) -> bool:
+        lease = await self._read_fault_control_lease_from_connection(connection)
+        async with connection.execute(
+            "SELECT 1 FROM process_epoch WHERE singleton = 1 AND process_id = ? "
+            "AND status = 'unclean'",
+            (hold.process_id,),
+        ) as cursor:
+            epoch = await cursor.fetchone()
+        return (
+            epoch is not None
+            and lease.status is FaultLeaseStatus.CLOSED
+            and lease.generation == hold.fault_lease_generation
+        )
+
+    @_bounded(_StorageAccess.DEDICATED_WRITE)
+    async def _change_start_hold(
+        self,
+        *,
+        hold: StartAttemptHold,
+        disposition: StartHoldDisposition | None,
+        session_id: str | None,
+    ) -> str:
+        connection: aiosqlite.Connection | None = None
+        committed = False
+        ambiguous = False
+        close_failed = False
+        outcome = "indeterminate"
+        raw_timestamp = hold.created_at_utc.isoformat()
+        marker: str | None = None
+        try:
+            connection = await self._open_connection(writer=True)
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN IMMEDIATE")
+            markers = await self._start_hold_markers(connection, hold)
+            valid = markers == [] and await self._start_hold_epoch_matches(connection, hold)
+            if disposition is None:
+                async with connection.execute("SELECT 1 FROM start_attempt_hold") as cursor:
+                    valid = valid and await cursor.fetchone() is None
+                async with connection.execute(
+                    "SELECT id, agent_phase, outcome FROM roast_runs "
+                    "WHERE completed_at_utc IS NULL LIMIT 2"
+                ) as cursor:
+                    runs = list(await cursor.fetchall())
+                async with connection.execute(
+                    "SELECT 1 FROM process_restart_clearance WHERE process_id = ? AND state = ?",
+                    (hold.process_id, RestartClearanceState.CLEARED.value),
+                ) as cursor:
+                    valid = valid and await cursor.fetchone() is not None
+                valid = (
+                    valid
+                    and len(runs) == 1
+                    and (
+                        runs[0]["id"] == hold.run_id
+                        and runs[0]["agent_phase"] == RoastPhase.STARTING.value
+                        and runs[0]["outcome"] is None
+                    )
+                )
+            else:
+                # Preserve the exact stored spelling, including UTC offsets and precision.
+                read = await self._read_start_hold_snapshot(connection)
+                async with connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+                    rows = list(await cursor.fetchall())
+                valid = valid and read.record == hold and len(rows) == 1
+                if valid:
+                    raw_timestamp = rows[0]["created_at_utc"]
+                    valid = tuple(rows[0]) == (1, *self._start_hold_values(hold, raw_timestamp))
+                    marker = self._start_hold_marker(hold, raw_timestamp, disposition, session_id)
+            if not valid:
+                await self._rollback_connection(connection)
+                outcome = "precondition_rejected"
+            else:
+                values = self._start_hold_values(hold, raw_timestamp)
+                if disposition is None:
+                    await connection.execute(
+                        "INSERT INTO start_attempt_hold VALUES (1, ?, ?, ?, ?, ?, ?)",
+                        values,
+                    )
+                else:
+                    deleted = await connection.execute(
+                        "DELETE FROM start_attempt_hold WHERE singleton = 1 AND attempt_key = ? "
+                        "AND run_id = ? AND process_id = ? AND child_epoch = ? "
+                        "AND fault_lease_generation = ? AND created_at_utc = ?",
+                        values,
+                    )
+                    if deleted.rowcount != 1:
+                        raise ValueError("exact Start hold deletion failed")
+                    await connection.execute(
+                        "INSERT INTO operator_actions "
+                        "(run_id, action, payload_json, result, recorded_at_utc) "
+                        "VALUES (?, 'start_attempt_hold_settled', ?, 'accepted', ?)",
+                        (hold.run_id, marker, _utc_now()),
+                    )
+                await self._commit_connection(connection)
+                committed = True
+        except BaseException as exc:
+            ambiguous = self._storage_commit_ambiguous()
+            if connection is not None:
+                with contextlib.suppress(Exception):
+                    await self._rollback_connection(connection)
+            if not isinstance(exc, Exception):
+                raise
+        finally:
+            if connection is not None:
+                try:
+                    await self._close_connection(connection)
+                except Exception:  # noqa: BLE001 - clean close is required for success
+                    close_failed = True
+        if close_failed or not (committed or ambiguous):
+            return outcome
+        # This read stays inside the original owner and deadline, never re-admits.
+        try:
+            verified = await self._start_hold_postcondition(hold, raw_timestamp, marker)
+        except Exception:  # noqa: BLE001 - read/close failure cannot grant success
+            return "indeterminate"
+        if verified:
+            self._confirm_storage_commit()
+        if verified and committed and not ambiguous:
+            return "installed_verified" if disposition is None else "settled_verified"
+        return "indeterminate"
+
+    async def _start_hold_postcondition(
+        self,
+        hold: StartAttemptHold,
+        raw_timestamp: str,
+        marker: str | None,
+    ) -> bool:
+        connection: aiosqlite.Connection | None = None
+        try:
+            connection = await self._open_connection()
+            connection.row_factory = aiosqlite.Row
+            await self._configure_durable_connection(connection)
+            await connection.execute("BEGIN")
+            async with connection.execute("SELECT * FROM start_attempt_hold") as cursor:
+                rows = list(await cursor.fetchall())
+            markers = await self._start_hold_markers(connection, hold)
+            if marker is None:
+                return (
+                    markers == []
+                    and len(rows) == 1
+                    and tuple(rows[0]) == (1, *self._start_hold_values(hold, raw_timestamp))
+                    and (await self._read_start_hold_snapshot(connection)).record == hold
+                )
+            return not rows and markers == [marker]
+        except Exception:  # noqa: BLE001 - malformed postconditions never grant success
+            return False
         finally:
             if connection is not None:
                 await self._close_connection(connection)
