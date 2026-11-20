@@ -75,9 +75,11 @@ from roastpilot_agent.human_run_ownership import (
     HumanRunAdmission,
     HumanRunOwnership,
     HumanRunState,
+    HumanSessionBinding,
     PendingHumanCall,
     RefusedHumanCall,
 )
+from roastpilot_agent.mcp_client import MCPServerProcess, RoasterControlAdapter
 from roastpilot_agent.models import (
     ACTIVE_ROAST_PHASES,
     AdvisorTraceStatus,
@@ -1766,6 +1768,17 @@ class _FaultDropReadback:
     generation: int
 
 
+@dataclass(frozen=True)
+class _PreparedHumanSession:
+    run: HumanRunState
+    adapter: RoasterControlAdapter
+    transport: MCPServerProcess
+    loop: asyncio.AbstractEventLoop
+    generation: int
+    identity_generation: int
+    child_epoch: int
+
+
 class RoastController:
     """Code-owned deterministic state machine and tick pipeline.
 
@@ -1835,6 +1848,7 @@ class RoastController:
         self._routine_inhibited = False
         self._storage_failure_pending = False
         self._human_confirmed_start_generation: int | None = None
+        self._prepared_human_session: _PreparedHumanSession | None = None
         self._protection_check_pending = False
         self._config = config
         self._safety = safety
@@ -2859,17 +2873,47 @@ class RoastController:
         *,
         fault_cooling: bool,
         close_reservation: int | None,
+        endpoint_owner: EndpointOwner | None = None,
     ) -> bool:
         # These intents never bypass the existing current-owner/settled-command checks.
         # Only the two policy-authorised FAULTED cooling origins supply fault_cooling.
-        return self._routine_owner_admitted() or (
-            write_class is WriteClass.NON_HEAT
-            and (
-                (fault_cooling and self._phase is RoastPhase.FAULTED)
-                or (
-                    close_reservation is not None
-                    and self._arbiter.close_reservation_is_current(close_reservation)
+        run = self._human_run
+        return (
+            self._routine_owner_admitted()
+            or (
+                run is not None
+                and run.admission is HumanRunAdmission.SESSION_BOUND
+                and self._known_human_identity() is not None
+                and (
+                    write_class is WriteClass.CONTAINMENT
+                    or (
+                        write_class is WriteClass.DROP
+                        and self._human_drop_owner_permitted(endpoint_owner)
+                    )
                 )
+            )
+            or (
+                write_class is WriteClass.NON_HEAT
+                and (
+                    (fault_cooling and self._phase is RoastPhase.FAULTED)
+                    or (
+                        close_reservation is not None
+                        and self._arbiter.close_reservation_is_current(close_reservation)
+                    )
+                )
+            )
+        )
+
+    def _human_drop_owner_permitted(self, owner: EndpointOwner | None) -> bool:
+        run = self._human_run
+        return self._routine_owner_admitted() or (
+            run is not None
+            and run.admission is HumanRunAdmission.SESSION_BOUND
+            and owner
+            in (
+                EndpointOwner.PROTECTION,
+                EndpointOwner.OPERATOR_RECOVERY,
+                EndpointOwner.FAULT_CONTROL,
             )
         )
 
@@ -2963,6 +3007,7 @@ class RoastController:
                             write_class,
                             fault_cooling=_fault_cooling,
                             close_reservation=close_reservation,
+                            endpoint_owner=endpoint_owner,
                         )
                         and self._human_routine_permitted(write_class, endpoint_owner)
                     )
@@ -3382,6 +3427,12 @@ class RoastController:
     async def _run_tick_controls(
         self, telemetry: RoastTelemetry | None, *, generation: int
     ) -> None:
+        if (
+            self._human_run is not None
+            and self._human_run.admission is HumanRunAdmission.SESSION_BOUND
+        ):
+            self._advisory_requested = False
+            return
         # D35 §3 (#222): pre-FC the controller deterministically sets heat/fan
         # from the policy — runs AFTER _apply_phase_rules so a tick that just
         # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
@@ -4390,6 +4441,7 @@ class RoastController:
         return (
             not self.human_drop_closed()
             and run is not None
+            and self._human_drop_owner_permitted(EndpointOwner.OPERATOR_RECOVERY)
             and (session_id is None or run.session_id == session_id)
             and self._human_actuation_admitted()
             and self._guarded_human_recovery_drop_evaluation_allows()
@@ -4466,7 +4518,7 @@ class RoastController:
     ) -> bool:
         run = self._human_run
         assert run is not None
-        if not self._routine_owner_admitted():
+        if not self._human_drop_owner_permitted(owner):
             return False
         prior_endpoint = run.endpoint
         admission_phase = self._phase
@@ -6490,6 +6542,161 @@ class RoastController:
 
     # --- E4-S4: run lifecycle and operator actions ---
 
+    def _prepare_run_bookkeeping(self, profile: RoastProfile) -> None:
+        """Initialize the unchanged per-run controller bookkeeping."""
+        self._profile = profile
+        self._run_started_monotonic = self._clock()
+        self._current_heat = 0
+        self._current_fan = 0
+        self._last_telemetry = None  # never carry a prior run's reading into this run
+        self._last_command_monotonic = None  # new run: rate-limit baseline resets
+        # New run: advisory baselines reset too, so the first consult in the
+        # new roast fires on its own merits, not on a previous run's timer.
+        self._advisory_policy = AdvisoryCallPolicy(self._config)
+        self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
+        # D157 (#781 slice 2 fold round): the fan-ceiling release latch is
+        # RUN-scoped, not dwell-scoped — ``transition_to`` deliberately does
+        # NOT clear it, so it must be cleared here instead, once per new run.
+        # A fresh run must start unlatched; a resumed run must not.
+        #
+        # This is the ONLY clear site, and there are TWO places a later reader
+        # is likely to "restore symmetry" by adding a second one. Neither is
+        # correct. The first is ``transition_to``'s per-dwell cluster (see the
+        # comment there). The second is the ``target in (STARTING, PREHEATING)``
+        # per-run cluster further down that same method, whose own comment
+        # declares a recovery-resume into preheating to be "back before
+        # charge" — that reasoning is sound for the pre-T0 guard it was
+        # written for, but adding this field there re-narrows the fan box to
+        # the ceiling on the ``recovery -> preheating -> pre-FC -> development``
+        # resume family, which is precisely the #498 loss run-scoping exists
+        # to prevent (measured, safety review).
+        self._post_fc_fan_ceiling_released = False
+
+    def _prepared_session_conditions(self, run: HumanRunState, generation: int) -> bool:
+        actuation_admitted = self._human_actuation_admitted()
+        return (
+            actuation_admitted
+            and self._human_run is run
+            and run.admission is HumanRunAdmission.PREPARED
+            and run.child_generation is None
+            and self._human_ownership.allows_session_start(run)
+            and self._generation_is_current(generation)
+            and not self._arbiter.emergency_stop_active
+            and not self._emergency_stop_transition_pending
+            and not self._arbiter.close_reservation_is_current(generation)
+            and not self.human_drop_closed()
+        )
+
+    def _human_session_projections_bound(self, adapter: RoasterControlAdapter) -> bool:
+        return (
+            getattr(self._current_session_id, "__self__", None) is adapter
+            and getattr(self._current_session_id, "__func__", None)
+            is RoasterControlAdapter._human_session_id  # pyright: ignore[reportPrivateUsage]
+            and getattr(self._current_child_generation, "__self__", None) is adapter
+            and getattr(self._current_child_generation, "__func__", None)
+            is RoasterControlAdapter._human_child_epoch  # pyright: ignore[reportPrivateUsage]
+        )
+
+    def _prepare_human_session(self, adapter: RoasterControlAdapter, profile: RoastProfile) -> bool:
+        """Record one mock handoff frame before the private Start slot is reserved."""
+        run = self._human_run
+        transport = adapter._fixed_zero_transport  # pyright: ignore[reportPrivateUsage]
+        generation = self._arbiter.generation
+        if (
+            run is None
+            or run._session_handoff_prepared  # pyright: ignore[reportPrivateUsage]
+            or transport is None
+            or self._executor is not adapter
+            or not self._human_session_projections_bound(adapter)
+            or self._phase is not RoastPhase.IDLE
+            or not self.can_transition(RoastPhase.STARTING)
+            or not self._prepared_session_conditions(run, generation)
+        ):
+            return False
+        loop = asyncio.get_running_loop()
+        if not adapter._prepare_human_session_identity():  # pyright: ignore[reportPrivateUsage]
+            return False
+        run._session_handoff_prepared = True  # pyright: ignore[reportPrivateUsage]
+        self._prepared_human_session = _PreparedHumanSession(
+            run,
+            adapter,
+            transport,
+            loop,
+            generation,
+            adapter._identity_generation,  # pyright: ignore[reportPrivateUsage]
+            transport.child_epoch,
+        )
+        self.transition_to(RoastPhase.STARTING)
+        self._prepare_run_bookkeeping(profile)
+        return True
+
+    def _bind_prepared_human_session(
+        self, adapter: RoasterControlAdapter, receipt: object
+    ) -> HumanSessionBinding:
+        """Resolve exact issued acceptance once, with no dispatch or storage settlement."""
+        transport = adapter._fixed_zero_transport  # pyright: ignore[reportPrivateUsage]
+        if transport is None:
+            return HumanSessionBinding.NO_ISSUED_RECEIPT
+        issued, proof = transport._consume_human_start_receipt(receipt)  # pyright: ignore[reportPrivateUsage]
+        if not issued:
+            return HumanSessionBinding.NO_ISSUED_RECEIPT
+        if proof is None:
+            return HumanSessionBinding.ENTERED_UNBOUND
+        # A genuine receipt is terminally spent before any callback can raise.
+        try:
+            accepted = transport._human_start_receipt  # pyright: ignore[reportPrivateUsage]
+            frame = self._prepared_human_session
+            profile = self._profile
+            if not self._human_session_projections_bound(adapter):
+                return HumanSessionBinding.ENTERED_UNBOUND
+            session_id = None if self._current_session_id is None else self._current_session_id()
+            child_epoch = (
+                None if self._current_child_generation is None else self._current_child_generation()
+            )
+            # Run the final callback before all pure identity/currentness checks.
+            admitted = frame is not None and self._prepared_session_conditions(
+                frame.run, frame.generation
+            )
+            if (
+                accepted is None
+                or profile is None
+                or frame is None
+                or frame.adapter is not adapter
+                or self._executor is not adapter
+                or not self._human_session_projections_bound(adapter)
+                or frame.transport is not transport
+                or adapter._fixed_zero_transport is not transport  # pyright: ignore[reportPrivateUsage]
+                or frame.run is not self._human_run
+                or frame.loop is not asyncio.get_running_loop()
+                or self._phase is not RoastPhase.STARTING
+                or not self.can_transition(RoastPhase.PREHEATING)
+                or not admitted
+                or transport.child_epoch != frame.child_epoch
+                or accepted.child_epoch != frame.child_epoch
+                or not transport._start_proof_current(proof)  # pyright: ignore[reportPrivateUsage]
+                or adapter._identity_generation != frame.identity_generation  # pyright: ignore[reportPrivateUsage]
+                or adapter._started_session_id is not None  # pyright: ignore[reportPrivateUsage]
+                or adapter._started_child_epoch is not None  # pyright: ignore[reportPrivateUsage]
+                or adapter.last_state is not None
+                or self._current_session_id is None
+                or session_id is not None
+                or self._current_child_generation is None
+                or child_epoch != frame.child_epoch
+            ):
+                return HumanSessionBinding.ENTERED_UNBOUND
+        except Exception:
+            return HumanSessionBinding.ENTERED_UNBOUND
+        # All identities and authority become visible before transition observers.
+        adapter._started_session_id = accepted.session_id  # pyright: ignore[reportPrivateUsage]
+        adapter._started_child_epoch = accepted.child_epoch  # pyright: ignore[reportPrivateUsage]
+        frame.run.session_id = accepted.session_id
+        frame.run.child_generation = accepted.child_epoch
+        frame.run._admission = HumanRunAdmission.SESSION_BOUND  # pyright: ignore[reportPrivateUsage]
+        self._human_confirmed_start_generation = frame.generation
+        self.transition_to(RoastPhase.PREHEATING)
+        self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
+        return HumanSessionBinding.BOUND
+
     async def start_run(
         self,
         profile: RoastProfile,
@@ -6520,33 +6727,7 @@ class RoastController:
             raise RuntimeError("prepared HUMAN owner cannot start a run")
         generation = self._arbiter.generation
         self.transition_to(RoastPhase.STARTING)  # raises unless idle
-        self._profile = profile
-        self._run_started_monotonic = self._clock()
-        self._current_heat = 0
-        self._current_fan = 0
-        self._last_telemetry = None  # never carry a prior run's reading into this run
-        self._last_command_monotonic = None  # new run: rate-limit baseline resets
-        # New run: advisory baselines reset too, so the first consult in the
-        # new roast fires on its own merits, not on a previous run's timer.
-        self._advisory_policy = AdvisoryCallPolicy(self._config)
-        self._consecutive_advisor_failures = 0  # new run: availability streak resets (D30)
-        # D157 (#781 slice 2 fold round): the fan-ceiling release latch is
-        # RUN-scoped, not dwell-scoped — ``transition_to`` deliberately does
-        # NOT clear it, so it must be cleared here instead, once per new run.
-        # A fresh run must start unlatched; a resumed run must not.
-        #
-        # This is the ONLY clear site, and there are TWO places a later reader
-        # is likely to "restore symmetry" by adding a second one. Neither is
-        # correct. The first is ``transition_to``'s per-dwell cluster (see the
-        # comment there). The second is the ``target in (STARTING, PREHEATING)``
-        # per-run cluster further down that same method, whose own comment
-        # declares a recovery-resume into preheating to be "back before
-        # charge" — that reasoning is sound for the pre-T0 guard it was
-        # written for, but adding this field there re-narrows the fan box to
-        # the ceiling on the ``recovery -> preheating -> pre-FC -> development``
-        # resume family, which is precisely the #498 loss run-scoping exists
-        # to prevent (measured, safety review).
-        self._post_fc_fan_ceiling_released = False
+        self._prepare_run_bookkeeping(profile)
         # v0.1.9 recording metadata (#176): derive an origin slug from the bean
         # profile + a per-origin roast number, and hand them to start_session so
         # set_recording_metadata fires BEFORE start_roast_session (the MCP applies
@@ -6802,6 +6983,8 @@ class RoastController:
         if target in (RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING):
             self._commit_operator_resume(target)
             return True
+        if not self._routine_owner_admitted():
+            return False
         identity = self._known_human_identity()
         generation = self._arbiter.generation
         evaluation = self._human_continuation_evaluation(
