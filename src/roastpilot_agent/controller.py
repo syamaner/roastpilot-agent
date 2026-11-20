@@ -6576,6 +6576,8 @@ class RoastController:
         actuation_admitted = self._human_actuation_admitted()
         return (
             actuation_admitted
+            # The teardown callback can close admission after its initial check.
+            and (self._human_admission is None or self._human_admission.closed_reason is None)
             and self._human_run is run
             and run.admission is HumanRunAdmission.PREPARED
             and run.child_generation is None

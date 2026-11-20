@@ -965,3 +965,69 @@ async def test_prepare_callback_invalidation_precedes_reset_and_publication(
     assert not run_of(h)._session_handoff_prepared
     assert h.controller._prepared_human_session is h.controller._profile is None
     assert h.commands == h.sink.evaluations == []
+
+
+async def test_prepare_callback_closing_admission_refuses_before_reset() -> None:
+    h = prepared()
+    process, _, _ = await _hs_ready()
+    adapter = RoasterControlAdapter.from_process(process)
+    h.controller._executor = adapter
+    h.controller._current_session_id = adapter._human_session_id
+    h.controller._current_child_generation = adapter._human_child_epoch
+    calls = 0
+
+    def close_admission() -> bool:
+        nonlocal calls
+        calls += 1
+        assert h.fence.closed_reason is None
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        return False
+
+    h.controller._teardown_unconfirmed = close_admission
+    before = h.controller.snapshot(), adapter._identity_generation, list(h.emitter.events)
+    assert not h.controller._prepare_human_session(adapter, PROFILE)
+    assert calls == 1
+    assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+    assert (h.controller.snapshot(), adapter._identity_generation, h.emitter.events) == before
+    assert not run_of(h)._session_handoff_prepared
+    assert h.controller._prepared_human_session is h.controller._profile is None
+    assert adapter._started_session_id is adapter._started_child_epoch is adapter.last_state is None
+    assert process._human_start_state is StartAttemptState.UNATTEMPTED
+    assert h.commands == h.sink.evaluations == []
+
+
+async def test_bind_callback_closing_admission_spends_receipt_without_publication(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, adapter, process, receipt = await setup(monkeypatch)
+    calls = 0
+
+    def close_admission() -> bool:
+        nonlocal calls
+        calls += 1
+        assert process._human_start_receipt_spent
+        assert h.fence.closed_reason is None
+        h.fence.close(AdmissionCloseReason.APPLICATION_TEARDOWN)
+        return False
+
+    h.controller._teardown_unconfirmed = close_admission
+    before = h.controller.snapshot(), adapter._identity_generation, list(h.emitter.events)
+    assert (
+        h.controller._bind_prepared_human_session(adapter, receipt)
+        is HumanSessionBinding.ENTERED_UNBOUND
+    )
+    assert calls == 1
+    assert h.fence.closed_reason is AdmissionCloseReason.APPLICATION_TEARDOWN
+    assert process._human_start_receipt is receipt
+    assert process._human_start_receipt_spent
+    assert (h.controller.snapshot(), adapter._identity_generation, h.emitter.events) == before
+    assert run_of(h).session_id is run_of(h).child_generation is None
+    assert run_of(h).admission is HumanRunAdmission.PREPARED
+    assert adapter._started_session_id is adapter._started_child_epoch is adapter.last_state is None
+    assert h.controller.phase is RoastPhase.STARTING
+    assert (
+        h.controller._bind_prepared_human_session(adapter, receipt)
+        is HumanSessionBinding.ENTERED_UNBOUND
+    )
+    assert calls == 1
+    assert h.commands == h.sink.evaluations == []
