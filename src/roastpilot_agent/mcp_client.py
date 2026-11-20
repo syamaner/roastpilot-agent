@@ -3743,7 +3743,11 @@ class MCPServerProcess:
         )
 
     def _consume_human_start_receipt(self, receipt: object) -> tuple[bool, _StartProof | None]:
-        """Consume exact issuance before any handoff validation or observer."""
+        """Resolve exact issuer eligibility before any validation or observer.
+
+        A foreign presentation neither spends another issuer's receipt nor
+        supplies evidence that its original Start did not enter.
+        """
         if self._human_start_receipt is None or receipt is not self._human_start_receipt:
             return False, None
         if self._human_start_receipt_spent:

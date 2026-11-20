@@ -6613,6 +6613,17 @@ class RoastController:
             or not self._prepared_session_conditions(run, generation)
         ):
             return False
+        # The admission callback above can revoke phase, generation or projection.
+        # Recheck pure currentness before reset or any preparation publication.
+        if (
+            self._phase is not RoastPhase.IDLE
+            or not self._generation_is_current(generation)
+            or self._human_run is not run
+            or self._executor is not adapter
+            or not self._human_session_projections_bound(adapter)
+            or adapter._fixed_zero_transport is not transport  # pyright: ignore[reportPrivateUsage]
+        ):
+            return False
         loop = asyncio.get_running_loop()
         if not adapter._prepare_human_session_identity():  # pyright: ignore[reportPrivateUsage]
             return False
@@ -6983,7 +6994,7 @@ class RoastController:
         if target in (RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING):
             self._commit_operator_resume(target)
             return True
-        if not self._routine_owner_admitted():
+        if run.admission is HumanRunAdmission.SESSION_BOUND:
             return False
         identity = self._known_human_identity()
         generation = self._arbiter.generation

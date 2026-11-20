@@ -23,7 +23,11 @@ class HumanRunAdmission(Enum):
 
 
 class HumanSessionBinding(Enum):
-    """Private handoff outcomes; entered-unbound never proves non-entry."""
+    """Private handoff outcomes; entered-unbound never proves non-entry.
+
+    NO_ISSUED_RECEIPT is receiver-scoped: an unrelated receiver cannot prove
+    producer non-entry or release the original accepted attempt for retry.
+    """
 
     BOUND = auto()
     NO_ISSUED_RECEIPT = auto()

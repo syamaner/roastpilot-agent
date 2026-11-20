@@ -30,7 +30,7 @@ from roastpilot_agent.safety import SafetyVerdict
 from tests.test_controller import PROFILE, reading
 from tests.test_controller_human_mode import HumanHarness
 from tests.test_human_pre_admission_fence import fresh_boundary, prepared, run_of
-from tests.test_mcp_client import _hs_attempt, _hs_ready
+from tests.test_mcp_client import _hs_attempt, _hs_raw, _hs_ready
 
 pytestmark = pytest.mark.asyncio
 
@@ -751,14 +751,15 @@ async def test_genuine_refusal_cannot_retry_after_original_conditions_return(
 
 
 @pytest.mark.parametrize("target", [RoastPhase.IDLE, RoastPhase.COMPLETE, RoastPhase.COOLING])
+@pytest.mark.parametrize("admission", [HumanRunAdmission.PREPARED, HumanRunAdmission.SESSION_BOUND])
 async def test_bound_terminal_continuation_keeps_existing_guards(
-    monkeypatch: pytest.MonkeyPatch, target: RoastPhase
+    monkeypatch: pytest.MonkeyPatch, target: RoastPhase, admission: HumanRunAdmission
 ) -> None:
-    h, _ = await bound(monkeypatch)
+    h = prepared() if admission is HumanRunAdmission.PREPARED else (await bound(monkeypatch))[0]
     h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
     assert await h.controller.human_operator_continue(target)
     assert h.controller.phase is target
-    assert run_of(h).admission is HumanRunAdmission.SESSION_BOUND
+    assert run_of(h).admission is admission
     assert not run_of(h).durably_closed
     assert h.sink.evaluations == h.commands == []
 
@@ -811,3 +812,156 @@ async def test_callback_cannot_displace_bound_projection_during_validation(
     )
     assert run_of(h).session_id is None
     assert adapter.latest_fault_session_id is None
+
+
+async def test_exact_run_prepared_marker_survives_ack_and_reconstruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, _, _, _ = await setup(monkeypatch)
+    run = run_of(h)
+    assert await h.controller.operator_emergency_stop()
+    assert h.controller.phase is RoastPhase.FAULTED
+    h.controller.note_fault_acknowledged()
+    h.controller.transition_to(RoastPhase.IDLE)
+    # Reconstruct only the controller ports around the untouched exact owner.
+    rebuilt = prepared()
+    rebuilt.controller._human_run = run
+    rebuilt.controller._human_ownership = h.ownership
+    rebuilt.controller._arbiter = h.arbiter
+    process, _, _ = await _hs_ready()
+    adapter = RoasterControlAdapter.from_process(process)
+    controller = rebuilt.controller
+    controller._executor = adapter
+    controller._current_session_id = adapter._human_session_id
+    controller._current_child_generation = adapter._human_child_epoch
+    assert h.ownership.is_current(run)
+    assert run._session_handoff_prepared
+    assert controller.phase is RoastPhase.IDLE
+    assert controller.can_transition(RoastPhase.STARTING)
+    assert controller._prepared_session_conditions(run, h.arbiter.generation)
+    assert controller._human_session_projections_bound(adapter)
+    assert process._human_start_state is StartAttemptState.UNATTEMPTED
+    before = controller.snapshot(), adapter._identity_generation, list(rebuilt.emitter.events)
+    assert not controller._prepare_human_session(adapter, PROFILE)
+    assert (controller.snapshot(), adapter._identity_generation, rebuilt.emitter.events) == before
+    assert controller._prepared_human_session is None
+    assert run is run_of(h) and run.session_id is None
+    assert rebuilt.sink.evaluations == rebuilt.commands == []
+
+
+@pytest.mark.parametrize("admission", [HumanRunAdmission.PREPARED, HumanRunAdmission.SESSION_BOUND])
+async def test_active_continuation_preserves_prepared_evaluation(
+    monkeypatch: pytest.MonkeyPatch, admission: HumanRunAdmission
+) -> None:
+    h = prepared() if admission is HumanRunAdmission.PREPARED else (await bound(monkeypatch))[0]
+    h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    for target in (
+        RoastPhase.PREHEATING,
+        RoastPhase.ROASTING_PRE_FIRST_CRACK,
+        RoastPhase.DEVELOPMENT,
+    ):
+        before = len(h.sink.evaluations)
+        assert not await h.controller.human_operator_continue(target)
+        assert len(h.sink.evaluations) == before + (admission is HumanRunAdmission.PREPARED)
+        if admission is HumanRunAdmission.PREPARED:
+            assert h.sink.evaluations[-1].verdict is SafetyVerdict.REJECT
+    assert h.commands == []
+
+
+@pytest.mark.parametrize("charged", [True, False])
+async def test_bound_recovery_projection_matches_actual_fault_dispatch(
+    monkeypatch: pytest.MonkeyPatch, charged: bool
+) -> None:
+    h, _ = await bound(monkeypatch)
+    await h.turn(bean=180)
+    if charged:
+        await h.turn(bean=185, t0=True)
+    h.controller.transition_to(RoastPhase.FAULTED)
+    identity = h.controller._known_human_identity()
+    assert identity is not None
+    assert h.controller.human_recovery_drop_allowed(session_id=identity[0]) is charged
+    writes: list[str] = []
+
+    async def write() -> None:
+        writes.append("fault_drop")
+
+    assert (
+        await h.controller.execute_human_fault_drop(
+            identity[0],
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=write,
+        )
+        is charged
+    )
+    assert writes == (["fault_drop"] if charged else [])
+    assert h.commands == []
+
+
+@pytest.mark.parametrize("outcome", ["accepted", "refused", "malformed", "uncertain"])
+async def test_private_a_retains_only_exact_validated_acceptance(outcome: str) -> None:
+    process, peer, evidence = await _hs_ready()
+    proof = process._start_proof
+    assert proof is not None
+    assert process._human_start_receipt is process._human_start_receipt_proof is None
+    if outcome == "malformed":
+        peer.replies["start_roast_session"] = _hs_raw({"session_id": "invalid"})
+    elif outcome == "uncertain":
+        peer.replies["start_roast_session"] = RuntimeError("synthetic transport failure")
+    result = await _hs_attempt(process, evidence, gate=lambda: outcome != "refused")
+    if outcome == "accepted":
+        assert isinstance(result, HumanStartAccepted)
+        assert process._human_start_receipt is result
+        assert process._human_start_receipt_proof is proof
+    else:
+        assert not isinstance(result, HumanStartAccepted)
+        assert process._human_start_receipt is None
+        assert process._human_start_receipt_proof is None
+    assert len(peer.calls) == (0 if outcome == "refused" else 1)
+
+
+async def test_bound_direct_start_refuses_without_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, _ = await bound(monkeypatch)
+    before = h.controller.snapshot(), list(h.sink.evaluations), list(h.commands)
+    with pytest.raises(RuntimeError, match="cannot start a run"):
+        await h.controller.start_run(PROFILE)
+    assert (h.controller.snapshot(), h.sink.evaluations, h.commands) == before
+
+
+@pytest.mark.parametrize(
+    "invalidate", ["phase", "generation", "projector", "owner", "executor", "transport"]
+)
+async def test_prepare_callback_invalidation_precedes_reset_and_publication(
+    monkeypatch: pytest.MonkeyPatch, invalidate: str
+) -> None:
+    h = prepared()
+    process, _, _ = await _hs_ready()
+    adapter = RoasterControlAdapter.from_process(process)
+    h.controller._executor = adapter
+    h.controller._current_session_id = adapter._human_session_id
+    h.controller._current_child_generation = adapter._human_child_epoch
+
+    def revoke() -> bool:
+        if invalidate == "phase":
+            h.controller.transition_to(RoastPhase.FAULTED)
+        elif invalidate == "generation":
+            h.arbiter.admit_emergency_stop()
+        elif invalidate == "projector":
+            h.controller._current_session_id = lambda: None
+        elif invalidate == "owner":
+            h.controller._human_run = replace(run_of(h))
+        elif invalidate == "executor":
+            h.controller._executor = h.actuator
+        else:
+            adapter._fixed_zero_transport = None
+        return False
+
+    h.controller._teardown_unconfirmed = revoke
+    before = adapter._identity_generation
+    assert not h.controller._prepare_human_session(adapter, PROFILE)
+    assert adapter._identity_generation == before
+    assert not run_of(h)._session_handoff_prepared
+    assert h.controller._prepared_human_session is h.controller._profile is None
+    assert h.commands == h.sink.evaluations == []
