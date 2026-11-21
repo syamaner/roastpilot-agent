@@ -87,6 +87,13 @@ from roastpilot_agent.controller import (
     StateReader,
     TickScheduler,
 )
+from roastpilot_agent.human_bootstrap import (
+    HumanBootstrapEvidence,
+    HumanStartAccepted,
+    HumanStartRefused,
+    StartAttemptState,
+    StartRefusal,
+)
 from roastpilot_agent.human_persistence import (
     CommandReference,
     HistoryUnavailable,
@@ -106,12 +113,15 @@ from roastpilot_agent.human_protection import (
 from roastpilot_agent.human_run_ownership import (
     AdmissionCloseReason,
     HumanCallAdmissionFence,
+    HumanRunAdmission,
     HumanRunOwnership,
+    HumanSessionBinding,
 )
 from roastpilot_agent.mcp_client import (
     ExportRoastLogResult,
     MCPConnectionError,
     MCPServerProcess,
+    RoasterControlAdapter,
     RoastSessionState,
     SessionPresence,
     ambient_reading_is_live,
@@ -176,8 +186,12 @@ from roastpilot_agent.models import (
     RoastTimeline,
     SseEvent,
     SseEventType,
+    StartAttemptHold,
     StartAttemptHoldRead,
     StartAttemptHoldState,
+    StartHoldDisposition,
+    StartHoldInstallOutcome,
+    StartHoldSettlementOutcome,
     StrandedFaultRetirementEventData,
     StrandedFaultRetirementEventOutcome,
     StrandedFaultRetirementRequest,
@@ -3163,7 +3177,22 @@ class RoastService:
         run_loop: bool = True,
         clock: Callable[[], float] = time.monotonic,
         authority: ControlAuthority = ControlAuthority.AUTOMATIC,
+        _mock_human_start: bool = False,
     ) -> None:
+        if _mock_human_start:
+            if (
+                roaster is not None
+                or mcp is None
+                or live_serve_mode
+                or recording_replay_mode
+                or authority is not ControlAuthority.HUMAN
+            ):
+                raise ValueError("private mock Start requires exact non-live HUMAN composition")
+            roaster = RoasterControlAdapter.from_process(mcp)
+        self._mock_human_start = _mock_human_start
+        self._mock_start_used = False
+        self._mock_start_unresolved: StartAttemptHold | None = None
+        self._mock_clear_child: tuple[MCPServerProcess, int] | None = None
         if recording_replay_mode and (
             live_serve_mode
             or mcp is not None
@@ -4316,6 +4345,17 @@ class RoastService:
             fault_controls=await self._fault_controls_projection(lease),
         )
 
+    def _private_start_blocks_clearance(self) -> bool:
+        run = self._human_ownership._run  # pyright: ignore[reportPrivateUsage]
+        return self._mock_human_start and (
+            self._mock_start_unresolved is not None
+            or (run is not None and run._private_start_retained)  # pyright: ignore[reportPrivateUsage]
+        )
+
+    def _require_private_clearance_unblocked(self) -> None:
+        if self._private_start_blocks_clearance():
+            raise RoastRunConflictError("private Start ownership remains unresolved")
+
     async def acknowledge_restart_clearance(
         self, request: RestartClearanceRequest
     ) -> RestartClearanceResult:
@@ -4324,6 +4364,7 @@ class RoastService:
         This does not close an OPEN fault lease and therefore cannot by itself
         make Start eligible after a fault.  No MCP write occurs here.
         """
+        self._require_private_clearance_unblocked()
         del request  # literal validation is the explicit operator confirmation
         # Capture before acquiring a lock or awaiting epoch setup. A global
         # no-target e-stop is still a synchronous safety admission and must
@@ -4331,17 +4372,21 @@ class RoastService:
         expected_emergency_stop_admission_epoch = self._emergency_stop_admission_epoch
         async with self._restart_clearance_lock:
             await self._ensure_restart_epoch()
+            self._require_private_clearance_unblocked()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
             lease = await self._read_fault_lease_fail_closed()
+            self._require_private_clearance_unblocked()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
             hold = await self._read_start_attempt_hold_fail_closed()
+            self._require_private_clearance_unblocked()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
             if hold.state is not StartAttemptHoldState.CLEAR:
                 raise RoastRunConflictError("unresolved Start attempt clearance is required")
             active = await self._store.active_run()
+            self._require_private_clearance_unblocked()
             if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
                 raise RoastRunConflictError("restart clearance evidence became stale")
             expected_cached_lease = self._fault_lease_cache
@@ -4407,6 +4452,16 @@ class RoastService:
                 expected_emergency_stop_admission_epoch,
             ):
                 raise RoastRunConflictError("restart clearance evidence became stale")
+            private_controls = (
+                await self._fault_controls_projection(lease) if self._mock_human_start else None
+            )
+            if self._mock_human_start and not self._restart_clearance_admission_is_current(
+                expected_cached_lease,
+                expected_child,
+                expected_child_epoch,
+                expected_emergency_stop_admission_epoch,
+            ):
+                raise RoastRunConflictError("restart clearance evidence became stale")
             try:
                 confirmed = await self._store.confirm_process_restart_clearance(self.instance_id)
             except Exception as exc:  # noqa: BLE001 - do not retain an uncertain clear
@@ -4428,12 +4483,18 @@ class RoastService:
                 self._restart_clearance_state = RestartClearanceState.UNKNOWN
                 raise RoastRunConflictError("restart clearance evidence became stale")
             self._restart_clearance_state = RestartClearanceState.CLEARED
+            if self._mock_human_start and expected_child is not None:
+                self._mock_clear_child = (expected_child, expected_child.child_epoch)
             return RestartClearanceResult(
                 outcome="confirmed",
                 cleared=True,
                 restart_clearance_required=not self._restart_clearance_projection(lease).eligible,
                 restart_clearance=self._restart_clearance_projection(lease),
-                fault_controls=await self._fault_controls_projection(lease),
+                fault_controls=(
+                    private_controls
+                    if private_controls is not None
+                    else await self._fault_controls_projection(lease)
+                ),
             )
 
     async def initialize_missing_fault_control_safety_record(
@@ -4445,6 +4506,8 @@ class RoastService:
         task is retained after HTTP cancellation so its exact operation-id can
         reconcile only its own ambiguous durable commit.
         """
+        if self._private_start_blocks_clearance():
+            return await self._safety_record_initialization_result("rejected")
         del request  # strict literal validation is the operator confirmation
         # D220's generation reservation must never begin for a request that
         # predates a global e-stop admission, including while this handler is
@@ -4458,14 +4521,21 @@ class RoastService:
                 else:
                     return await self._safety_record_initialization_result("rejected")
             await self._ensure_restart_epoch()
-            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+            if (
+                self._private_start_blocks_clearance()
+                or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
+            ):
                 return await self._safety_record_initialization_result("rejected")
             lease = await self._read_fault_lease_fail_closed()
-            if self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch:
+            if (
+                self._private_start_blocks_clearance()
+                or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
+            ):
                 return await self._safety_record_initialization_result("rejected")
             hold = await self._read_start_attempt_hold_fail_closed()
             if (
-                self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
+                self._private_start_blocks_clearance()
+                or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
                 or hold.state is not StartAttemptHoldState.CLEAR
             ):
                 return await self._safety_record_initialization_result("rejected")
@@ -4475,7 +4545,8 @@ class RoastService:
                 return await self._safety_record_initialization_result("rejected")
             child = self._mcp
             if (
-                self._shutdown_started
+                self._private_start_blocks_clearance()
+                or self._shutdown_started
                 or not self._restart_epoch_initialized
                 or self._restart_clearance_state is not RestartClearanceState.REQUIRED
                 or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
@@ -4526,7 +4597,8 @@ class RoastService:
     ) -> bool:
         """Return whether a D220 proof still has its no-await local fences."""
         return (
-            not self._shutdown_started
+            not self._private_start_blocks_clearance()
+            and not self._shutdown_started
             and self._restart_epoch_initialized
             and self._restart_clearance_state is RestartClearanceState.REQUIRED
             and self._safety_record_initialization is not None
@@ -5339,7 +5411,8 @@ class RoastService:
         replacement.
         """
         if (
-            not self._restart_epoch_initialized
+            self._private_start_blocks_clearance()
+            or not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
             or self._fault_lease_cache != expected_cached_lease
             or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
@@ -5362,7 +5435,8 @@ class RoastService:
     ) -> bool:
         """Recheck clearance admission context immediately before durable confirmation."""
         if (
-            not self._restart_epoch_initialized
+            self._private_start_blocks_clearance()
+            or not self._restart_epoch_initialized
             or self._restart_clearance_state is not RestartClearanceState.REQUIRED
             or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
         ):
@@ -5373,13 +5447,15 @@ class RoastService:
             _log.exception("could not recheck restart gate for clearance")
             return False
         if (
-            persisted_state is not RestartClearanceState.REQUIRED
+            self._private_start_blocks_clearance()
+            or persisted_state is not RestartClearanceState.REQUIRED
             or self._emergency_stop_admission_epoch != expected_emergency_stop_admission_epoch
         ):
             return False
         lease = await self._read_fault_lease_fail_closed()
         if (
-            lease.generation != expected_lease.generation
+            self._private_start_blocks_clearance()
+            or lease.generation != expected_lease.generation
             or lease.status is not expected_lease.status
             or lease.run_id != expected_lease.run_id
             or lease.mcp_session_id != expected_lease.mcp_session_id
@@ -5393,11 +5469,13 @@ class RoastService:
             return False
         if expected_active_run_id is None:
             return (
-                active is None
+                not self._private_start_blocks_clearance()
+                and active is None
                 and self._emergency_stop_admission_epoch == expected_emergency_stop_admission_epoch
             )
         return (
-            active is not None
+            not self._private_start_blocks_clearance()
+            and active is not None
             and active.run_id == expected_active_run_id
             and active.agent_phase is RoastPhase.FAULTED
             and self._emergency_stop_admission_epoch == expected_emergency_stop_admission_epoch
@@ -6465,6 +6543,10 @@ class RoastService:
 
     def _require_current_start_admission(self, admission_generation: int) -> None:
         """Reject a Start superseded by a later global emergency-stop attempt."""
+        if self._mock_human_start or self._mock_start_unresolved:
+            raise RoastRunConflictError(
+                "ordinary Start is unavailable for private mock composition"
+            )
         self._require_human_runner_admission()
         if self._start_admission_generation != admission_generation:
             raise RoastRunConflictError("roast start was superseded by an emergency-stop attempt")
@@ -6488,6 +6570,384 @@ class RoastService:
             outcome="aborted",
             agent_phase=RoastPhase.STARTING,
         )
+
+    def _mock_start_context_current(
+        self,
+        generation: int,
+        adapter: RoasterControlAdapter,
+        child: MCPServerProcess,
+        process_id: str,
+        epoch: int,
+        lease_generation: int,
+    ) -> bool:
+        return (
+            self._mock_human_start
+            and self._authority is ControlAuthority.HUMAN
+            and not self._live_serve_mode
+            and not self._shutdown_started
+            and not self._mock_start_unresolved
+            and self.instance_id == process_id
+            and self._restart_epoch_initialized
+            and self._restart_clearance_state is RestartClearanceState.CLEARED
+            and self._mock_clear_child == (child, epoch)
+            and self._mcp is child
+            and self._roaster is adapter
+            and adapter._fixed_zero_transport is child  # pyright: ignore[reportPrivateUsage]
+            and child.running
+            and child.child_epoch == epoch
+            and not child.stop_unconfirmed
+            and self._human_admission.closed_reason is None
+            and self._start_admission_generation == generation
+            and self._fault_lease_cache.generation == lease_generation
+            and self._fault_lease_cache.status is FaultLeaseStatus.CLOSED
+            and not self._fault_acknowledgement_gate.fault_finalization_started
+            and not self._command_arbiter.emergency_stop_active
+            and not self._command_arbiter.close_reservation_is_current(
+                self._command_arbiter.generation
+            )
+            and self._detached_recovery_loop is None
+        )
+
+    async def _start_mock_human_roast(self, profile: RoastProfile) -> RoastDetail:
+        """Exercise one isolated mock Start; no production caller may select this seam."""
+        generation = self._start_admission_generation
+        child, adapter, process_id = self._mcp, self._roaster, self.instance_id
+        if (
+            not self._mock_human_start
+            or self._mock_start_used
+            or self._mock_start_unresolved
+            or child is None
+            or not isinstance(adapter, RoasterControlAdapter)
+        ):
+            raise RoastRunConflictError("private mock Start is unavailable")
+        epoch = child.child_epoch
+        lease_generation = self._fault_lease_cache.generation
+
+        def context() -> bool:
+            return self._mock_start_context_current(
+                generation, adapter, child, process_id, epoch, lease_generation
+            )
+
+        def no_run() -> None:
+            if (
+                not context()
+                or self._mock_start_used
+                or self.active_run_id is not None
+                or self._starting_run_id is not None
+                or self._unpublished_start_run_id is not None
+                or self.runner is not None
+                or self._loop_task is not None
+                or self._human_ownership.lifecycle_blocked
+                or child._human_start_state is not StartAttemptState.UNATTEMPTED  # pyright: ignore[reportPrivateUsage]
+            ):
+                raise RoastRunConflictError("private no-run admission changed")
+
+        no_run()
+        async with self._start_lock:
+            no_run()
+            lease = await self._read_fault_lease_fail_closed()
+            no_run()
+            if lease.generation != lease_generation or lease.status is not FaultLeaseStatus.CLOSED:
+                raise RoastRunConflictError("private lease is unavailable")
+            hold_read = await self._read_start_attempt_hold_fail_closed()
+            no_run()
+            if hold_read.state is not StartAttemptHoldState.CLEAR:
+                raise RoastRunConflictError("unresolved Start attempt clearance is required")
+            durable = await self._store.read_process_restart_clearance(process_id)
+            no_run()
+            if durable is not RestartClearanceState.CLEARED:
+                raise RoastRunConflictError("private durable clearance is unavailable")
+            active = await self._store.active_run()
+            no_run()
+            if active is not None:
+                raise RoastRunConflictError("a persisted run remains active")
+            evidence = await child._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
+            no_run()
+            proof = child._start_proof  # pyright: ignore[reportPrivateUsage]
+            if (
+                not isinstance(evidence, HumanBootstrapEvidence)
+                or proof is None
+                or proof.evidence is not evidence
+                or not child._start_proof_current(proof)  # pyright: ignore[reportPrivateUsage]
+            ):
+                raise RoastRunConflictError("strict current mock bootstrap is required")
+            self._require_explicit_ambient_cadence(self._config)
+            self._mock_start_used = True
+            run_id = uuid.uuid4().hex
+            self._unpublished_start_run_id = run_id
+            try:
+                await self._store.create_run(
+                    run_id=run_id,
+                    profile=profile,
+                    config=self._config,
+                    agent_phase=RoastPhase.STARTING,
+                )
+                if not context() or not child._start_proof_current(proof):  # pyright: ignore[reportPrivateUsage]
+                    await self._retire_never_dispatched_start(run_id)
+                    raise RoastRunConflictError("private Start was superseded during creation")
+                self.active_run_id = run_id
+                self._starting_run_id = run_id
+            finally:
+                self._unpublished_start_run_id = None
+        runner: RoastRunner | None = None
+        installed = False
+        bound = False
+        settled = False
+        receipt: object = None
+        history_interrupted = False
+        prepared_owner = None
+        preparation_generation = self._command_arbiter.generation
+        try:
+            runner = await self._build_runner(run_id, profile)
+            if runner is None:
+                raise RoastRunConflictError("private runner was not constructed")
+            prepared_owner = self._human_ownership._run  # pyright: ignore[reportPrivateUsage]
+            controller = runner.controller_for_human_fault_drop()
+            if controller is None:
+                raise RoastRunConflictError("private controller is unavailable")
+            run = controller._human_run  # pyright: ignore[reportPrivateUsage]
+
+            if (
+                not context()
+                or self.runner is not runner
+                or self.active_run_id != run_id
+                or self._starting_run_id != run_id
+                or not child._start_proof_current(proof)  # pyright: ignore[reportPrivateUsage]
+            ):
+                raise RoastRunConflictError("private runner construction was superseded")
+            if not controller._prepare_human_session(adapter, profile):  # pyright: ignore[reportPrivateUsage]
+                raise RoastRunConflictError("private preparation was refused")
+            frame = controller._prepared_human_session  # pyright: ignore[reportPrivateUsage]
+            if frame is None or run is None:
+                raise RoastRunConflictError("private preparation frame is unavailable")
+
+            def owned(*, published: bool = False) -> bool:
+                if (
+                    not context()
+                    or self.runner is not runner
+                    or self.active_run_id != run_id
+                    or self._starting_run_id != run_id
+                    or runner.finalized
+                    or controller._human_run is not run  # pyright: ignore[reportPrivateUsage]
+                    or not self._human_ownership.is_current(run)
+                    or not child._start_proof_current(proof)  # pyright: ignore[reportPrivateUsage]
+                    or controller._executor is not adapter  # pyright: ignore[reportPrivateUsage]
+                    or not controller._human_session_projections_bound(adapter)  # pyright: ignore[reportPrivateUsage]
+                    or not self._store.human_storage_quiescent
+                ):
+                    return False
+                if published:
+                    return (
+                        controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
+                        and controller.phase is RoastPhase.PREHEATING
+                        and controller._generation_is_current(frame.generation)  # pyright: ignore[reportPrivateUsage]
+                        and run.command is CommandDisposition.SETTLED
+                    )
+                return (
+                    run.admission is HumanRunAdmission.PREPARED
+                    and self._human_ownership.allows_session_start(run)
+                    and controller.phase is RoastPhase.STARTING
+                    and controller._prepared_session_conditions(run, frame.generation)  # pyright: ignore[reportPrivateUsage]
+                    and controller.phase is RoastPhase.STARTING
+                    and controller._executor is adapter  # pyright: ignore[reportPrivateUsage]
+                    and context()
+                    and not controller._emergency_stop_transition_pending  # pyright: ignore[reportPrivateUsage]
+                    and not controller.human_drop_closed()
+                )
+
+            if not owned():
+                raise RoastRunConflictError("private prepared owner was superseded")
+            hold = StartAttemptHold(
+                uuid.uuid4().hex, run_id, process_id, epoch, lease_generation, datetime.now(UTC)
+            )
+
+            def unresolved(*, unknown: bool) -> None:
+                if self._mock_start_unresolved is None:
+                    self._mock_start_unresolved = hold
+                run._private_start_retained = True  # pyright: ignore[reportPrivateUsage]
+                if unknown:
+                    run.command = CommandDisposition.UNKNOWN
+                controller._routine_inhibited = True  # pyright: ignore[reportPrivateUsage]
+
+            try:
+                outcome = await self._store.install_start_attempt_hold(hold)
+            except BaseException:
+                unresolved(unknown=False)
+                raise
+            if outcome is StartHoldInstallOutcome.PRECONDITION_REJECTED:
+                raise RoastRunConflictError("private hold was not installed")
+            run._private_start_retained = True  # pyright: ignore[reportPrivateUsage]
+            if outcome is not StartHoldInstallOutcome.INSTALLED_VERIFIED:
+                unresolved(unknown=False)
+                raise RoastRunConflictError("private hold installation is unresolved")
+            installed = True
+            if not owned() or child._human_start_state is not StartAttemptState.UNATTEMPTED:  # pyright: ignore[reportPrivateUsage]
+                unresolved(unknown=False)
+                raise RoastRunConflictError("private installed owner was superseded")
+            try:
+                number = await self._recording_roast_num(profile)
+                if not owned() or child._human_start_state is not StartAttemptState.UNATTEMPTED:  # pyright: ignore[reportPrivateUsage]
+                    unresolved(
+                        unknown=cast(StartAttemptState, child._human_start_state)  # pyright: ignore[reportPrivateUsage]
+                        in (StartAttemptState.CLAIMED, StartAttemptState.ACCEPTED)
+                    )
+                    raise RoastRunConflictError("private metadata owner was superseded")
+                origin = recording_origin_slug(profile) if number is not None else None
+                unattempted = child._human_start_state is StartAttemptState.UNATTEMPTED  # pyright: ignore[reportPrivateUsage]
+                result = await child._attempt_human_start(  # pyright: ignore[reportPrivateUsage]
+                    evidence, gate=owned, origin=origin, roast_num=number if origin else None
+                )
+                # No await between receipt return, classification and B2 publication.
+                receipt = result
+                observer_error: BaseException | None = None
+                try:
+                    binding = controller._bind_prepared_human_session(adapter, result)  # pyright: ignore[reportPrivateUsage]
+                except BaseException as exc:
+                    observer_error = exc
+                    history_interrupted = True
+                    binding = (
+                        HumanSessionBinding.BOUND
+                        if controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
+                        else HumanSessionBinding.ENTERED_UNBOUND
+                    )
+                bound = binding is HumanSessionBinding.BOUND and controller._published_mock_session(  # pyright: ignore[reportPrivateUsage]
+                    adapter, receipt
+                )
+                non_entry = (
+                    unattempted
+                    and type(result) is HumanStartRefused
+                    and result.reason
+                    in (
+                        StartRefusal.NO_PROOF,
+                        StartRefusal.INVALID_METADATA_REQUEST,
+                        StartRefusal.DISPLACED_BEFORE_CLAIM,
+                        StartRefusal.METADATA_FAILED,
+                        StartRefusal.GATE_REFUSED,
+                    )
+                    and cast(StartAttemptState, child._human_start_state)  # pyright: ignore[reportPrivateUsage]
+                    is StartAttemptState.REFUSED_BEFORE_CLAIM  # pyright: ignore[reportPrivateUsage]
+                )
+                if not bound and not non_entry:
+                    unresolved(unknown=True)
+                    raise RoastRunConflictError("private Start may have entered without binding")
+                if not owned(published=bound):
+                    unresolved(unknown=not bound and not non_entry)
+                    raise RoastRunConflictError("private settlement owner was superseded")
+                settlement = await self._store.settle_start_attempt_hold(
+                    hold,
+                    disposition=(
+                        StartHoldDisposition.ACCEPTED_SESSION
+                        if bound
+                        else StartHoldDisposition.NON_ENTRY
+                    ),
+                    session_id=result.session_id
+                    if isinstance(result, HumanStartAccepted)
+                    else None,
+                )
+                if settlement is not StartHoldSettlementOutcome.SETTLED_VERIFIED or not owned(
+                    published=bound
+                ):
+                    unresolved(unknown=False)
+                    raise RoastRunConflictError("private hold settlement is unresolved")
+                settled = True
+                if observer_error is not None:
+                    controller._routine_inhibited = True  # pyright: ignore[reportPrivateUsage]
+                    raise observer_error
+                if not bound:
+                    raise RoastRunConflictError("private Start was refused before claim")
+                history_interrupted = True
+                if not await runner._flush_events():  # pyright: ignore[reportPrivateUsage]
+                    raise HistoryUnavailable("private Start history is unavailable")
+                if not owned(published=True):
+                    raise RoastRunConflictError("private history owner was superseded")
+                await runner._persist_phase_if_changed()  # pyright: ignore[reportPrivateUsage]
+                if not owned(published=True):
+                    raise RoastRunConflictError("private phase owner was superseded")
+                self._store.note_human_history_pass(run_id)
+                history_interrupted = False
+                detail = await self._store.read_run(run_id)
+                if not owned(published=True) or detail is None:
+                    raise RoastRunConflictError("private response owner was superseded")
+                if self._run_loop:
+                    self._supervise_current_failed_human_start(runner, run_id)
+                return detail.model_copy(update={"instance_id": self.instance_id})
+            except BaseException:
+                if not settled:
+                    unresolved(
+                        unknown=not bound
+                        and child._human_start_state  # pyright: ignore[reportPrivateUsage]
+                        not in (
+                            StartAttemptState.UNATTEMPTED,
+                            StartAttemptState.REFUSED_BEFORE_CLAIM,
+                        )
+                    )
+                controller._routine_inhibited = True  # pyright: ignore[reportPrivateUsage]
+                raise
+        except BaseException:
+            failed_controller = runner.controller_for_human_fault_drop() if runner else None
+
+            def never_started_owner() -> bool:
+                return (
+                    not installed
+                    and self._mock_start_unresolved is None
+                    and context()
+                    and self.active_run_id == run_id
+                    and self._starting_run_id == run_id
+                    and self.runner is runner
+                    and self._command_arbiter.generation == preparation_generation
+                    and self._human_ownership._run is prepared_owner  # pyright: ignore[reportPrivateUsage]
+                    and child._human_start_state is StartAttemptState.UNATTEMPTED  # pyright: ignore[reportPrivateUsage]
+                    and (
+                        prepared_owner is None
+                        or (
+                            prepared_owner.run_id == run_id
+                            and prepared_owner.admission is HumanRunAdmission.PREPARED
+                            and not prepared_owner._private_start_retained  # pyright: ignore[reportPrivateUsage]
+                            and self._human_ownership.allows_session_start(prepared_owner)
+                        )
+                    )
+                    and (
+                        failed_controller is None
+                        or (
+                            failed_controller.phase is RoastPhase.IDLE
+                            and failed_controller._human_run is prepared_owner  # pyright: ignore[reportPrivateUsage]
+                        )
+                    )
+                )
+
+            try:
+                if never_started_owner():
+                    await self._retire_never_dispatched_start(run_id)
+                    if never_started_owner():
+                        if prepared_owner is not None:
+                            prepared_owner.durably_closed = True
+                        self.runner = None
+                        self.active_run_id = None
+                elif failed_controller is not None:
+                    if (
+                        bound
+                        and history_interrupted
+                        and self.runner is runner
+                        and self.active_run_id == run_id
+                        and failed_controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
+                    ):
+                        await failed_controller.contain_unconfirmed_human_start_history()
+                    elif not bound:
+                        failed_controller._fail_mock_start()  # pyright: ignore[reportPrivateUsage]
+            except BaseException:
+                # Failure observers cannot replace the original Start exception.
+                _log.exception("private Start failure disposition did not complete")
+            finally:
+                if (
+                    runner is not None
+                    and failed_controller is not None
+                    and failed_controller.phase is not RoastPhase.IDLE
+                ):
+                    self._supervise_current_failed_human_start(runner, run_id)
+            raise
+        finally:
+            if self._starting_run_id == run_id:
+                self._starting_run_id = None
 
     async def start_roast(self, profile: RoastProfile) -> RoastDetail:
         """Start a roast: reload saved config, respawn MCP if needed, persist the run.
@@ -6770,6 +7230,7 @@ class RoastService:
             RoastRunConflictError: A run is active/recovering, MCP is absent,
                 or its generation is not safe and eligible to clear.
         """
+        self._require_private_clearance_unblocked()
         now = self._clock()
         last_attempt = self._last_hardware_clear_attempt_at
         if self._hardware_clear_request_in_flight or (
@@ -6784,7 +7245,9 @@ class RoastService:
         self._last_hardware_clear_attempt_at = now
         try:
             async with self._start_lock:
+                self._require_private_clearance_unblocked()
                 active = await self._store.active_run()
+                self._require_private_clearance_unblocked()
 
                 if active is not None:
                     message = (
@@ -6810,6 +7273,7 @@ class RoastService:
                         "teardown_incident_id": request.teardown_incident_id,
                     },
                 )
+                self._require_private_clearance_unblocked()
                 try:
                     self._mcp.acknowledge_hardware_clear(request.teardown_incident_id)
                 except MCPConnectionError as exc:
@@ -7101,8 +7565,17 @@ class RoastService:
             human_ownership=self._human_ownership,
             human_admission=self._human_admission,
             teardown_unconfirmed=self._human_child_teardown_unconfirmed,
-            current_session_id=lambda: roaster.latest_fault_session_id,
-            current_child_generation=lambda: None if self._mcp is None else self._mcp.child_epoch,
+            current_session_id=(
+                roaster._human_session_id  # pyright: ignore[reportPrivateUsage]
+                if self._mock_human_start and isinstance(roaster, RoasterControlAdapter)
+                else lambda: roaster.latest_fault_session_id
+            ),
+            current_child_generation=(
+                roaster._human_child_epoch  # pyright: ignore[reportPrivateUsage]
+                if self._mock_human_start and isinstance(roaster, RoasterControlAdapter)
+                else lambda: None if self._mcp is None else self._mcp.child_epoch
+            ),
+            _prepare_human_owner=self._mock_human_start,
             containment_discovered=lambda: (
                 self._mcp is not None and self._mcp.fixed_zero_discovery is ToolDiscovery.DISCOVERED
             ),
@@ -7307,6 +7780,8 @@ class RoastService:
           where explicit operator action (resume/drop/cool/end) is required and
           emergency stop stays available. UNCHANGED by #331.
         """
+        if self._mock_human_start:
+            raise RoastRunConflictError("private mock composition cannot recover a runner")
         self._require_human_runner_admission()
         if self._roaster is None:
             return

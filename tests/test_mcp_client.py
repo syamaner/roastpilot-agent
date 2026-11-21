@@ -6009,13 +6009,27 @@ def test_c2a_bootstrap_path_never_uses_the_legacy_parser_or_discovery() -> None:
 
 def test_c2a_reader_has_no_production_caller() -> None:
     package = Path(mcp_client_module.__file__).parent
-    references: list[str] = []
+    references: list[tuple[str, str]] = []
     importers: set[str] = set()
     for path in sorted(package.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node.attr == "_read_human_bootstrap":
-                references.append(path.name)
+            if isinstance(node, ast.Constant):
+                assert node.value != "_read_human_bootstrap", (path, node.lineno)
+            if isinstance(node, ast.Attribute | ast.Name):
+                name = node.attr if isinstance(node, ast.Attribute) else node.id
+                if name == "_read_human_bootstrap":
+                    function = parents.get(node)
+                    while function is not None and not isinstance(
+                        function, ast.FunctionDef | ast.AsyncFunctionDef
+                    ):
+                        function = parents.get(function)
+                    assert isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+                    assert isinstance(node.ctx, ast.Load)
+                    references.append((path.name, function.name))
             if (
                 isinstance(node, ast.ImportFrom)
                 and node.module == "roastpilot_agent.human_bootstrap"
@@ -6025,8 +6039,8 @@ def test_c2a_reader_has_no_production_caller() -> None:
                 alias.name == "roastpilot_agent.human_bootstrap" for alias in node.names
             ):
                 importers.add(path.name)
-    assert references == []
-    assert importers == {"mcp_client.py"}
+    assert references == [("api.py", "_start_mock_human_roast")]
+    assert importers == {"mcp_client.py", "api.py"}
 
 
 _ALLOWED_BOOTSTRAP_IMPORTS = {
@@ -6580,6 +6594,7 @@ def test_c2b_start_envelope_requires_exact_success(error: object) -> None:
 
 def test_c2b_private_start_has_no_production_caller() -> None:
     """Pin direct and static reflective references, not arbitrary dynamic indirection."""
+    attempt_references: list[tuple[str, str]] = []
     run_references: list[tuple[str, str]] = []
     strict_references: list[tuple[str, str]] = []
     for path in sorted(Path(mcp_client_module.__file__).parent.rglob("*.py")):
@@ -6588,6 +6603,7 @@ def test_c2b_private_start_has_no_production_caller() -> None:
             assert not (
                 isinstance(node, ast.Attribute)
                 and node.attr == "_attempt_human_start"
+                and path.name != "api.py"
                 or isinstance(node, ast.Name)
                 and node.id == "_attempt_human_start"
                 or isinstance(node, ast.Constant)
@@ -6595,16 +6611,35 @@ def test_c2b_private_start_has_no_production_caller() -> None:
             ), path
             if isinstance(node, ast.Constant):
                 assert node.value not in ("_run_human_start", "_call_strict_sdk"), path
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in {
+                "_attempt_human_start",
+                "_run_human_start",
+                "_call_strict_sdk",
+            }:
+                assert path.name == "mcp_client.py"
+            if not isinstance(node, ast.Attribute | ast.Name):
                 continue
-            for node in ast.walk(function):
-                if isinstance(node, ast.Attribute | ast.Name):
-                    name = node.attr if isinstance(node, ast.Attribute) else node.id
-                    if name == "_run_human_start":
-                        run_references.append((path.name, function.name))
-                    if name == "_call_strict_sdk":
-                        strict_references.append((path.name, function.name))
+            name = node.attr if isinstance(node, ast.Attribute) else node.id
+            if name not in {"_attempt_human_start", "_run_human_start", "_call_strict_sdk"}:
+                continue
+            function = parents.get(node)
+            while function is not None and not isinstance(
+                function, ast.FunctionDef | ast.AsyncFunctionDef
+            ):
+                function = parents.get(function)
+            assert isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef), (path, name)
+            assert isinstance(node.ctx, ast.Load), (path, name)
+            if name == "_attempt_human_start":
+                attempt_references.append((path.name, function.name))
+            if name == "_run_human_start":
+                run_references.append((path.name, function.name))
+            if name == "_call_strict_sdk":
+                strict_references.append((path.name, function.name))
+    assert attempt_references == [("api.py", "_start_mock_human_roast")]
     assert run_references == [("mcp_client.py", "_attempt_human_start")]
     assert strict_references == [
         ("mcp_client.py", "_call_bootstrap_sdk"),
