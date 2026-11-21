@@ -136,6 +136,13 @@ from roastpilot_agent.models import (
     OperatorAction,
     RoastTelemetry,
 )
+from roastpilot_agent.timing_evidence import (
+    TimingEvidencePin,
+    TimingEvidenceRead,
+    TimingEvidenceReadOutcome,
+    admit_record,
+    decode_timing_evidence_reply,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -1440,6 +1447,7 @@ class RoasterControlAdapter:
         self._client = client
         self._clock = clock
         self._fixed_zero_transport: MCPServerProcess | None = None
+        self._timing_evidence_pin: TimingEvidencePin | None = None
         self._identity_generation: int = 0
         self._started_child_epoch: int | None = None
         self._last_containment_result: ContainmentResult | None = None
@@ -1481,6 +1489,7 @@ class RoasterControlAdapter:
         Clearing synchronously prevents an e-stop in that interval from
         attaching a prior run's cached session to the new run.
         """
+        self._timing_evidence_pin = None
         self._identity_generation += 1
         self._last_state = None
         self._started_session_id = None
@@ -1895,6 +1904,31 @@ class RoasterControlAdapter:
         """Return diagnostic evidence of the latest attempt in this generation."""
         return self._last_containment_result
 
+    async def read_timing_evidence(self) -> TimingEvidenceRead:
+        """Read synthetic evidence for the exact started identity, without dispatch."""
+        transport = self._fixed_zero_transport
+        session_id = self._started_session_id
+        outcome = TimingEvidenceReadOutcome
+        if (
+            transport is None
+            or transport.timing_evidence_discovery is not ToolDiscovery.DISCOVERED
+            or self._started_child_epoch != transport.child_epoch
+            or type(session_id) is not str
+            or not 1 <= len(session_id) <= 128
+        ):
+            return TimingEvidenceRead(outcome.NOT_ATTEMPTED)
+        generation = self._identity_generation
+        snapshot = self._identity_snapshot()
+        result = await transport._read_timing_evidence(session_id)  # pyright: ignore[reportPrivateUsage]
+        if generation != self._identity_generation or snapshot != self._identity_snapshot():
+            return TimingEvidenceRead(outcome.IDENTITY_REJECTED)
+        if result.outcome is outcome.EVIDENCE:
+            admitted, pin = admit_record(result.record, self._timing_evidence_pin)
+            if admitted is not outcome.EVIDENCE:
+                return TimingEvidenceRead(admitted)
+            self._timing_evidence_pin = pin
+        return result
+
     async def contain_heat_fixed_zero(self) -> ContainmentResult:
         """Send one safety-approved fixed-zero request for the exact started session."""
         transport = self._fixed_zero_transport
@@ -2297,6 +2331,48 @@ def _semantic_schema_matches(schema: dict[str, object], fields: set[str]) -> boo
         len(schema) <= len(fields) + 2
         and fields <= schema.keys()
         and all(key in fields or key in {"title", "description"} for key in schema)
+    )
+
+
+def _advertises_timing_evidence(inventory: object) -> bool:
+    if not isinstance(inventory, ListToolsResult) or inventory.nextCursor is not None:
+        return False
+    matches = (tool for tool in inventory.tools if tool.name == "get_timing_evidence")
+    match = next(matches, None)
+    if match is None or next(matches, None) is not None:
+        return False
+    schema: dict[str, object] = match.inputSchema
+    if (
+        not _semantic_schema_matches(
+            schema, {"type", "additionalProperties", "required", "properties"}
+        )
+        or schema.get("type") != "object"
+        or schema.get("additionalProperties") is not False
+    ):
+        return False
+    required = schema.get("required")
+    if type(required) is not list or required not in (
+        ["expected_session_id", "evidence_protocol"],
+        ["evidence_protocol", "expected_session_id"],
+    ):
+        return False
+    properties = _json_object(schema.get("properties"))
+    if properties is None or properties.keys() != {"expected_session_id", "evidence_protocol"}:
+        return False
+    identity = _json_object(properties["expected_session_id"])
+    protocol = _json_object(properties["evidence_protocol"])
+    return (
+        identity is not None
+        and _semantic_schema_matches(identity, {"type", "minLength", "maxLength"})
+        and identity.get("type") == "string"
+        and type(identity.get("minLength")) is int
+        and identity.get("minLength") == 1
+        and type(identity.get("maxLength")) is int
+        and identity.get("maxLength") == 128
+        and protocol is not None
+        and _semantic_schema_matches(protocol, {"type", "const"})
+        and protocol.get("type") == "string"
+        and protocol.get("const") == "timing_evidence/v1"
     )
 
 
@@ -2796,6 +2872,7 @@ class MCPServerProcess:
         #: a stop or replacement changes it before durable confirmation.
         self._child_epoch = 1 if session is not None else 0
         self._fixed_zero_discovery: ToolDiscovery | None = None
+        self._timing_evidence_discovery: ToolDiscovery | None = None
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
         )
@@ -3081,6 +3158,7 @@ class MCPServerProcess:
         self._session = session
         self._child_epoch += 1
         self._fixed_zero_discovery = None
+        self._timing_evidence_discovery = None
 
     def launch_record_for_epoch(self, epoch: object) -> LaunchRecord | None:
         """Return the launch record only for the exact current attach epoch.
@@ -3144,6 +3222,31 @@ class MCPServerProcess:
         if _advertises_fixed_zero(inventory):
             self._fixed_zero_discovery = ToolDiscovery.DISCOVERED
         return self.fixed_zero_discovery
+
+    @property
+    def timing_evidence_discovery(self) -> ToolDiscovery:
+        """Return the cached timing advertisement for this child."""
+        return self._timing_evidence_discovery or ToolDiscovery.ABSENT
+
+    async def discover_timing_evidence(self) -> ToolDiscovery:
+        """Reserve one explicit terminal discovery attempt per child."""
+        session = self._session
+        if session is None or self._timing_evidence_discovery is not None:
+            return self.timing_evidence_discovery
+        epoch = self._child_epoch
+        self._timing_evidence_discovery = ToolDiscovery.ABSENT
+        if not isinstance(session, ToolDiscoverySession):
+            return ToolDiscovery.ABSENT
+        try:
+            async with asyncio.timeout(self._config.call_timeout_seconds):
+                inventory = await session.list_tools()
+            if epoch != self._child_epoch or session is not self._session:
+                return ToolDiscovery.ABSENT
+            if _advertises_timing_evidence(inventory):
+                self._timing_evidence_discovery = ToolDiscovery.DISCOVERED
+        except Exception:
+            return ToolDiscovery.ABSENT
+        return self.timing_evidence_discovery
 
     @property
     def stop_unconfirmed(self) -> bool:
@@ -3624,6 +3727,27 @@ class MCPServerProcess:
                 "no force-terminate hook registered for wedged MCP child — "
                 "child may survive agent exit"
             )
+
+    async def _read_timing_evidence(self, session_id: str) -> TimingEvidenceRead:
+        """Perform one strict bounded read, fencing displaced children."""
+        session, epoch = self._session, self._child_epoch
+        outcome = TimingEvidenceReadOutcome
+        if session is None:
+            return TimingEvidenceRead(outcome.TRANSPORT_UNAVAILABLE)
+        try:
+            async with asyncio.timeout(self._config.call_timeout_seconds):
+                error, content, structured = await _call_strict_sdk(
+                    session,
+                    "get_timing_evidence",
+                    {"expected_session_id": session_id, "evidence_protocol": "timing_evidence/v1"},
+                )
+        except ValidationError:
+            return TimingEvidenceRead(outcome.MALFORMED_RESPONSE)
+        except Exception:
+            return TimingEvidenceRead(outcome.TRANSPORT_UNAVAILABLE)
+        if session is not self._session or epoch != self._child_epoch:
+            return TimingEvidenceRead(outcome.TRANSPORT_UNAVAILABLE)
+        return decode_timing_evidence_reply(error, content, structured, session_id, epoch)
 
     async def _contain_heat_fixed_zero(self, session_id: str) -> ContainmentResult:
         """Classify one bounded SDK call without legacy parsing or cleanup."""
