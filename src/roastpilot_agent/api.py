@@ -6748,6 +6748,7 @@ class RoastService:
                     and self._human_ownership.allows_session_start(run)
                     and controller.phase is RoastPhase.STARTING
                     and controller._prepared_session_conditions(run, frame.generation)  # pyright: ignore[reportPrivateUsage]
+                    and controller.phase is RoastPhase.STARTING
                     and controller._executor is adapter  # pyright: ignore[reportPrivateUsage]
                     and context()
                     and not controller._emergency_stop_transition_pending  # pyright: ignore[reportPrivateUsage]

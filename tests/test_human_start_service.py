@@ -1200,7 +1200,7 @@ async def test_no_target_emergency_after_install_returns_while_metadata_parked(
     with pytest.raises(RoastRunConflictError):
         await task
     assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
-    assert not any(n == "start_roast_session" for n, _ in double.calls)
+    assert not any(n in ("start_roast_session", "set_heat", "set_fan") for n, _ in double.calls)
 
 
 async def test_bound_ambiguity_later_clear_cannot_clear_via_guarded_entries(
@@ -1734,3 +1734,35 @@ async def test_missing_runner_supersession_does_not_retire_foreign_generation(
     assert service.runner is None and service.active_run_id is not None
     assert (await service._store.active_run()) is not None
     assert not any(n == "start_roast_session" for n, _ in double.calls)
+
+
+async def test_post_callback_phase_gate_never_invokes_a(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, _ = fixture
+    assert service._mcp is not None
+    observed: list[str] = []
+    attempt = Mock(side_effect=AssertionError("A invocation crossed changed callback phase"))
+
+    async def metadata(profile: object) -> None:
+        assert service.runner is not None
+        controller = service.runner.controller_for_human_fault_drop()
+        assert controller is not None
+
+        def teardown() -> bool:
+            if not observed:
+                observed.append("phase changed")
+                controller.transition_to(RoastPhase.FAULTED)
+            return False
+
+        monkeypatch.setattr(controller, "_teardown_unconfirmed", teardown)
+
+    monkeypatch.setattr(service, "_recording_roast_num", metadata)
+    monkeypatch.setattr(service._mcp, "_attempt_human_start", attempt)
+    with pytest.raises(RoastRunConflictError, match="metadata owner"):
+        await service._start_mock_human_roast(PROFILE)
+    assert observed == ["phase changed"]
+    attempt.assert_not_called()
+    assert service._mock_start_unresolved is not None
+    assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
