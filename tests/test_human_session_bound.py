@@ -464,28 +464,77 @@ async def test_model_event_does_not_set_operational_fc_or_dtr(
 async def test_no_production_caller_of_private_handoff() -> None:
     root = Path(__file__).parents[1] / "src"
     references: list[tuple[str, str, str]] = []
+    handoffs = {"_prepare_human_session", "_bind_prepared_human_session"}
+    private = handoffs | {"_start_mock_human_roast", "_mock_human_start"}
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                assert node.value not in private, (path, node.lineno)
+            if isinstance(node, ast.Call) and (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "RoastService"
+                or isinstance(node.func, ast.Attribute)
+                and node.func.attr == "RoastService"
+            ):
+                assert all(
+                    k.arg is not None and k.arg != "_mock_human_start" for k in node.keywords
+                )
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in private:
+                assert (path.name, node.name) in {
+                    ("controller.py", "_prepare_human_session"),
+                    ("controller.py", "_bind_prepared_human_session"),
+                    ("api.py", "_start_mock_human_roast"),
+                }
+            if not isinstance(node, ast.Attribute | ast.Name | ast.arg):
                 continue
-            for node in ast.walk(function):
-                if (
-                    isinstance(node, ast.Call)
-                    and isinstance(node.func, ast.Attribute)
-                    and node.func.attr in {"_prepare_human_session", "_bind_prepared_human_session"}
-                ):
-                    references.append((path.name, function.name, node.func.attr))
-        assert not any(
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr == "_start_mock_human_roast"
-            for node in ast.walk(tree)
-        )
-        assert not any(
-            isinstance(node, ast.keyword) and node.arg == "_mock_human_start"
-            for node in ast.walk(tree)
-        )
+            name = (
+                node.attr
+                if isinstance(node, ast.Attribute)
+                else node.id
+                if isinstance(node, ast.Name)
+                else node.arg
+            )
+            if name not in private:
+                continue
+            parent = parents.get(node)
+            while parent is not None and not isinstance(
+                parent, ast.FunctionDef | ast.AsyncFunctionDef
+            ):
+                parent = parents.get(parent)
+            assert isinstance(parent, ast.FunctionDef | ast.AsyncFunctionDef)
+            if name == "_mock_human_start":
+                assert path.name == "api.py"
+                owner = parents.get(parent)
+                while owner is not None and not isinstance(owner, ast.ClassDef):
+                    owner = parents.get(owner)
+                assert isinstance(owner, ast.ClassDef) and owner.name == "RoastService"
+                assert parent.name in {
+                    "__init__",
+                    "recover_on_start",
+                    "_private_start_blocks_clearance",
+                    "_require_current_start_admission",
+                    "_mock_start_context_current",
+                    "acknowledge_restart_clearance",
+                    "_start_mock_human_roast",
+                    "_build_runner",
+                }
+                if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+                    assert (
+                        parent.name == "__init__"
+                        and ast.unparse(parents[node])
+                        == "self._mock_human_start = _mock_human_start"
+                    )
+                elif isinstance(node, ast.Name | ast.arg):
+                    assert parent.name == "__init__"
+                else:
+                    assert isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load)
+            else:
+                assert name in handoffs, (path, name)
+                references.append((path.name, parent.name, name))
     assert sorted(references) == [
         ("api.py", "_start_mock_human_roast", "_bind_prepared_human_session"),
         ("api.py", "_start_mock_human_roast", "_prepare_human_session"),

@@ -6597,18 +6597,34 @@ def test_c2b_private_start_has_no_production_caller() -> None:
             ), path
             if isinstance(node, ast.Constant):
                 assert node.value not in ("_run_human_start", "_call_strict_sdk"), path
-        for function in ast.walk(tree):
-            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name in {
+                "_attempt_human_start",
+                "_run_human_start",
+                "_call_strict_sdk",
+            }:
+                assert path.name == "mcp_client.py"
+            if not isinstance(node, ast.Attribute | ast.Name):
                 continue
-            for node in ast.walk(function):
-                if isinstance(node, ast.Attribute | ast.Name):
-                    name = node.attr if isinstance(node, ast.Attribute) else node.id
-                    if name == "_attempt_human_start":
-                        attempt_references.append((path.name, function.name))
-                    if name == "_run_human_start":
-                        run_references.append((path.name, function.name))
-                    if name == "_call_strict_sdk":
-                        strict_references.append((path.name, function.name))
+            name = node.attr if isinstance(node, ast.Attribute) else node.id
+            if name not in {"_attempt_human_start", "_run_human_start", "_call_strict_sdk"}:
+                continue
+            function = parents.get(node)
+            while function is not None and not isinstance(
+                function, ast.FunctionDef | ast.AsyncFunctionDef
+            ):
+                function = parents.get(function)
+            assert isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef), (path, name)
+            assert isinstance(node.ctx, ast.Load), (path, name)
+            if name == "_attempt_human_start":
+                attempt_references.append((path.name, function.name))
+            if name == "_run_human_start":
+                run_references.append((path.name, function.name))
+            if name == "_call_strict_sdk":
+                strict_references.append((path.name, function.name))
     assert attempt_references == [("api.py", "_start_mock_human_roast")]
     assert run_references == [("mcp_client.py", "_attempt_human_start")]
     assert strict_references == [

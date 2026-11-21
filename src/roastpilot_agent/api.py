@@ -6694,10 +6694,14 @@ class RoastService:
         bound = False
         settled = False
         receipt: object = None
+        history_interrupted = False
+        prepared_owner = None
+        preparation_generation = self._command_arbiter.generation
         try:
             runner = await self._build_runner(run_id, profile)
             if runner is None:
                 raise RoastRunConflictError("private runner was not constructed")
+            prepared_owner = self._human_ownership._run  # pyright: ignore[reportPrivateUsage]
             controller = runner.controller_for_human_fault_drop()
             if controller is None:
                 raise RoastRunConflictError("private controller is unavailable")
@@ -6744,7 +6748,6 @@ class RoastService:
                     and self._human_ownership.allows_session_start(run)
                     and controller.phase is RoastPhase.STARTING
                     and controller._prepared_session_conditions(run, frame.generation)  # pyright: ignore[reportPrivateUsage]
-                    and controller.phase is RoastPhase.STARTING
                     and controller._executor is adapter  # pyright: ignore[reportPrivateUsage]
                     and context()
                     and not controller._emergency_stop_transition_pending  # pyright: ignore[reportPrivateUsage]
@@ -6782,8 +6785,11 @@ class RoastService:
                 raise RoastRunConflictError("private installed owner was superseded")
             try:
                 number = await self._recording_roast_num(profile)
-                if not owned():
-                    unresolved(unknown=False)
+                if not owned() or child._human_start_state is not StartAttemptState.UNATTEMPTED:  # pyright: ignore[reportPrivateUsage]
+                    unresolved(
+                        unknown=cast(StartAttemptState, child._human_start_state)  # pyright: ignore[reportPrivateUsage]
+                        in (StartAttemptState.CLAIMED, StartAttemptState.ACCEPTED)
+                    )
                     raise RoastRunConflictError("private metadata owner was superseded")
                 origin = recording_origin_slug(profile) if number is not None else None
                 unattempted = child._human_start_state is StartAttemptState.UNATTEMPTED  # pyright: ignore[reportPrivateUsage]
@@ -6797,6 +6803,7 @@ class RoastService:
                     binding = controller._bind_prepared_human_session(adapter, result)  # pyright: ignore[reportPrivateUsage]
                 except BaseException as exc:
                     observer_error = exc
+                    history_interrupted = True
                     binding = (
                         HumanSessionBinding.BOUND
                         if controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
@@ -6847,6 +6854,7 @@ class RoastService:
                     raise observer_error
                 if not bound:
                     raise RoastRunConflictError("private Start was refused before claim")
+                history_interrupted = True
                 if not await runner._flush_events():  # pyright: ignore[reportPrivateUsage]
                     raise HistoryUnavailable("private Start history is unavailable")
                 if not owned(published=True):
@@ -6873,26 +6881,67 @@ class RoastService:
                     )
                 controller._routine_inhibited = True  # pyright: ignore[reportPrivateUsage]
                 raise
-        except BaseException as error:
-            if runner is not None:
-                failed_controller = runner.controller_for_human_fault_drop()
-                if failed_controller is not None:
-                    try:
-                        if (
-                            bound
-                            and isinstance(error, HistoryUnavailable | asyncio.CancelledError)
-                            and self.runner is runner
-                            and self.active_run_id == run_id
-                            and failed_controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
-                        ):
-                            await failed_controller.contain_unconfirmed_human_start_history()
-                        elif not bound:
-                            failed_controller._fail_mock_start()  # pyright: ignore[reportPrivateUsage]
-                    finally:
-                        self._supervise_current_failed_human_start(runner, run_id)
-            elif not installed and self.active_run_id == run_id and context():
-                await self._retire_never_dispatched_start(run_id)
-                self.active_run_id = None
+        except BaseException:
+            failed_controller = runner.controller_for_human_fault_drop() if runner else None
+
+            def never_started_owner() -> bool:
+                return (
+                    not installed
+                    and self._mock_start_unresolved is None
+                    and context()
+                    and self.active_run_id == run_id
+                    and self._starting_run_id == run_id
+                    and self.runner is runner
+                    and self._command_arbiter.generation == preparation_generation
+                    and self._human_ownership._run is prepared_owner  # pyright: ignore[reportPrivateUsage]
+                    and child._human_start_state is StartAttemptState.UNATTEMPTED  # pyright: ignore[reportPrivateUsage]
+                    and (
+                        prepared_owner is None
+                        or (
+                            prepared_owner.run_id == run_id
+                            and prepared_owner.admission is HumanRunAdmission.PREPARED
+                            and not prepared_owner._private_start_retained  # pyright: ignore[reportPrivateUsage]
+                            and self._human_ownership.allows_session_start(prepared_owner)
+                        )
+                    )
+                    and (
+                        failed_controller is None
+                        or (
+                            failed_controller.phase is RoastPhase.IDLE
+                            and failed_controller._human_run is prepared_owner  # pyright: ignore[reportPrivateUsage]
+                        )
+                    )
+                )
+
+            try:
+                if never_started_owner():
+                    await self._retire_never_dispatched_start(run_id)
+                    if never_started_owner():
+                        if prepared_owner is not None:
+                            prepared_owner.durably_closed = True
+                        self.runner = None
+                        self.active_run_id = None
+                elif failed_controller is not None:
+                    if (
+                        bound
+                        and history_interrupted
+                        and self.runner is runner
+                        and self.active_run_id == run_id
+                        and failed_controller._published_mock_session(adapter, receipt)  # pyright: ignore[reportPrivateUsage]
+                    ):
+                        await failed_controller.contain_unconfirmed_human_start_history()
+                    elif not bound:
+                        failed_controller._fail_mock_start()  # pyright: ignore[reportPrivateUsage]
+            except BaseException:
+                # Failure observers cannot replace the original Start exception.
+                _log.exception("private Start failure disposition did not complete")
+            finally:
+                if (
+                    runner is not None
+                    and failed_controller is not None
+                    and failed_controller.phase is not RoastPhase.IDLE
+                ):
+                    self._supervise_current_failed_human_start(runner, run_id)
             raise
         finally:
             if self._starting_run_id == run_id:
