@@ -463,14 +463,33 @@ async def test_model_event_does_not_set_operational_fc_or_dtr(
 
 async def test_no_production_caller_of_private_handoff() -> None:
     root = Path(__file__).parents[1] / "src"
+    references: list[tuple[str, str, str]] = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text())
+        for function in ast.walk(tree):
+            if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+                continue
+            for node in ast.walk(function):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"_prepare_human_session", "_bind_prepared_human_session"}
+                ):
+                    references.append((path.name, function.name, node.func.attr))
         assert not any(
-            isinstance(n, ast.Call)
-            and isinstance(n.func, ast.Attribute)
-            and n.func.attr in {"_prepare_human_session", "_bind_prepared_human_session"}
-            for n in ast.walk(tree)
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_start_mock_human_roast"
+            for node in ast.walk(tree)
         )
+        assert not any(
+            isinstance(node, ast.keyword) and node.arg == "_mock_human_start"
+            for node in ast.walk(tree)
+        )
+    assert sorted(references) == [
+        ("api.py", "_start_mock_human_roast", "_bind_prepared_human_session"),
+        ("api.py", "_start_mock_human_roast", "_prepare_human_session"),
+    ]
 
 
 @pytest.mark.parametrize("origin", ["fault_cooling", "d212"])

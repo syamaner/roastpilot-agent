@@ -6710,6 +6710,50 @@ class RoastController:
         self._events.emit(RoastEventKind.RUN_STARTED, {"profile": profile.name})
         return HumanSessionBinding.BOUND
 
+    def _published_mock_session(self, adapter: RoasterControlAdapter, original: object) -> bool:
+        """Prove exact private publication independently of observer completion."""
+        frame = self._prepared_human_session
+        transport = adapter._fixed_zero_transport  # pyright: ignore[reportPrivateUsage]
+        receipt = None if transport is None else transport._human_start_receipt  # pyright: ignore[reportPrivateUsage]
+        return (
+            frame is not None
+            and transport is not None
+            and receipt is not None
+            and receipt is original
+            and transport._human_start_receipt_spent  # pyright: ignore[reportPrivateUsage]
+            and frame.transport is transport
+            and frame.loop is asyncio.get_running_loop()
+            and frame.adapter is adapter
+            and frame.run is self._human_run
+            and self._human_ownership.is_current(frame.run)
+            and self._executor is adapter
+            and self._human_session_projections_bound(adapter)
+            and frame.run.admission is HumanRunAdmission.SESSION_BOUND
+            and frame.run.session_id == receipt.session_id
+            and frame.run.child_generation == receipt.child_epoch == frame.child_epoch
+            and adapter._started_session_id == receipt.session_id  # pyright: ignore[reportPrivateUsage]
+            and adapter._started_child_epoch == receipt.child_epoch  # pyright: ignore[reportPrivateUsage]
+            and adapter._identity_generation == frame.identity_generation  # pyright: ignore[reportPrivateUsage]
+            and self._human_confirmed_start_generation == frame.generation
+        )
+
+    def _fail_mock_start(self) -> None:
+        """Notify failed preparation without replacing a superseding emergency."""
+        frame = self._prepared_human_session
+        if (
+            self._phase is RoastPhase.STARTING
+            and frame is not None
+            and self._generation_is_current(frame.generation)
+            and self._human_ownership.is_current(frame.run)
+        ):
+            try:
+                self._events.emit(RoastEventKind.COMMAND_FAILED, {"command": "start_roast_session"})
+            finally:
+                if self._phase is RoastPhase.STARTING and self._generation_is_current(
+                    frame.generation
+                ):
+                    self.transition_to(RoastPhase.FAULTED)
+
     async def start_run(
         self,
         profile: RoastProfile,

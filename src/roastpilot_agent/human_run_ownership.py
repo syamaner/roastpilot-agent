@@ -124,6 +124,7 @@ class HumanRunState:
     containment: ContainmentAttempt = ContainmentAttempt.AVAILABLE
     durably_closed: bool = False
     _session_handoff_prepared: bool = False
+    _private_start_retained: bool = False
 
     @property
     def admission(self) -> HumanRunAdmission:
@@ -134,7 +135,8 @@ class HumanRunState:
     def unresolved(self) -> bool:
         """Return whether this run must block lifecycle replacement."""
         return (
-            not self.durably_closed
+            self._private_start_retained
+            or not self.durably_closed
             or self.command is CommandDisposition.UNKNOWN
             or self.endpoint
             in (

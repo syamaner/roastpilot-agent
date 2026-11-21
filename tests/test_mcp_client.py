@@ -6025,8 +6025,8 @@ def test_c2a_reader_has_no_production_caller() -> None:
                 alias.name == "roastpilot_agent.human_bootstrap" for alias in node.names
             ):
                 importers.add(path.name)
-    assert references == []
-    assert importers == {"mcp_client.py"}
+    assert references == ["api.py"]
+    assert importers == {"mcp_client.py", "api.py"}
 
 
 _ALLOWED_BOOTSTRAP_IMPORTS = {
@@ -6580,6 +6580,7 @@ def test_c2b_start_envelope_requires_exact_success(error: object) -> None:
 
 def test_c2b_private_start_has_no_production_caller() -> None:
     """Pin direct and static reflective references, not arbitrary dynamic indirection."""
+    attempt_references: list[tuple[str, str]] = []
     run_references: list[tuple[str, str]] = []
     strict_references: list[tuple[str, str]] = []
     for path in sorted(Path(mcp_client_module.__file__).parent.rglob("*.py")):
@@ -6588,6 +6589,7 @@ def test_c2b_private_start_has_no_production_caller() -> None:
             assert not (
                 isinstance(node, ast.Attribute)
                 and node.attr == "_attempt_human_start"
+                and path.name != "api.py"
                 or isinstance(node, ast.Name)
                 and node.id == "_attempt_human_start"
                 or isinstance(node, ast.Constant)
@@ -6601,10 +6603,13 @@ def test_c2b_private_start_has_no_production_caller() -> None:
             for node in ast.walk(function):
                 if isinstance(node, ast.Attribute | ast.Name):
                     name = node.attr if isinstance(node, ast.Attribute) else node.id
+                    if name == "_attempt_human_start":
+                        attempt_references.append((path.name, function.name))
                     if name == "_run_human_start":
                         run_references.append((path.name, function.name))
                     if name == "_call_strict_sdk":
                         strict_references.append((path.name, function.name))
+    assert attempt_references == [("api.py", "_start_mock_human_roast")]
     assert run_references == [("mcp_client.py", "_attempt_human_start")]
     assert strict_references == [
         ("mcp_client.py", "_call_bootstrap_sdk"),
