@@ -12186,6 +12186,7 @@ async def test_start_hold_writer_deadline_and_cancellation_keep_original_refusal
 
 @pytest.mark.asyncio
 async def test_start_hold_writer_busy_and_restart_history(hold_store: RoastStore) -> None:
+    import asyncio
     import time
 
     import aiosqlite
@@ -12201,7 +12202,13 @@ async def test_start_hold_writer_busy_and_restart_history(hold_store: RoastStore
             assert result is StartHoldInstallOutcome.INDETERMINATE
         except HistoryUnavailable:
             pass
+        owner = hold_store._history_owner  # pyright: ignore[reportPrivateUsage]
         await blocker.rollback()
+    if owner is not None:
+        assert owner.task is not None
+        # Join only the retained write. The lock-admission budget is not a cleanup deadline.
+        await asyncio.wait({owner.task}, timeout=2.0)
+        assert owner.task.done()
     assert await hold_store.settle_human_storage_for_teardown()
     if (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR:
         assert (
