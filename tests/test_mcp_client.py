@@ -6643,6 +6643,7 @@ def test_c2b_private_start_has_no_production_caller() -> None:
     assert run_references == [("mcp_client.py", "_attempt_human_start")]
     assert strict_references == [
         ("mcp_client.py", "_call_bootstrap_sdk"),
+        ("mcp_client.py", "_read_timing_evidence"),
         ("mcp_client.py", "_run_human_start"),
         ("mcp_client.py", "_run_human_start"),
     ]
