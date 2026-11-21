@@ -98,6 +98,11 @@ from roastpilot_agent.human_bootstrap import (
     start_arguments,
     valid_start_metadata,
 )
+from roastpilot_agent.human_pre_fc_permission import (
+    LeverReceipt,
+    MarkReceipt,
+    decode_private_receipt,
+)
 from roastpilot_agent.human_protection import (
     ContainmentOutcome,
     ContainmentReason,
@@ -1959,6 +1964,62 @@ class RoasterControlAdapter:
     async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
         await self._client.set_heat(heat_percent)
         await self._client.set_fan(fan_percent)
+
+    async def _private_pre_fc_call(
+        self, name: Literal["set_heat", "set_fan", "mark_first_crack"], value: int | None = None
+    ) -> LeverReceipt | MarkReceipt:
+        """Retain strict acknowledgements on the exact private started child."""
+        if type(name) is not str or name not in ("set_heat", "set_fan", "mark_first_crack"):
+            raise ValueError("private tool is unavailable")
+        if name == "mark_first_crack":
+            if value is not None:
+                raise ValueError("private mark takes no lever value")
+        elif type(value) is not int or not 0 <= value <= 100:
+            raise ValueError("private lever requires an exact percentage")
+        transport = self._fixed_zero_transport
+        session_id = self._started_session_id
+        if (
+            transport is None
+            or session_id is None
+            or self._started_child_epoch != transport.child_epoch
+            or transport._session is None  # pyright: ignore[reportPrivateUsage]
+        ):
+            raise MCPConnectionError("private command identity unavailable")
+        session = transport._session  # pyright: ignore[reportPrivateUsage]
+        snapshot = self._identity_snapshot()
+        arguments: dict[str, object] = {}
+        if name == "set_heat":
+            arguments = {"heat_level_percent": value}
+        elif name == "set_fan":
+            arguments = {"fan_level_percent": value}
+        async with asyncio.timeout(transport._config.call_timeout_seconds):  # pyright: ignore[reportPrivateUsage]
+            error, content, structured = await _call_strict_sdk(session, name, arguments)
+        if (
+            transport is not self._fixed_zero_transport
+            or session is not transport._session  # pyright: ignore[reportPrivateUsage]
+            or snapshot != self._identity_snapshot()
+        ):
+            raise MCPConnectionError("private command identity displaced")
+        raw = decode_private_receipt(name, error, content, structured, session_id, value)
+        if raw is None:
+            raise MCPConnectionError("private command acknowledgement invalid")
+        if name == "mark_first_crack":
+            typed = EventCommandResult.model_validate(raw)
+            return MarkReceipt(
+                session_id,
+                typed.event.monotonic_seconds,
+                typed.event_count,
+                typed.event.recorded_at_utc,
+                tuple(typed.event.payload.items()),
+            )
+        control = ControlCommandResult.model_validate(raw)
+        return LeverReceipt(
+            control.session_id,
+            control.phase,
+            control.heat_level_percent,
+            control.fan_level_percent,
+            control.cooling_on,
+        )
 
     async def set_heat(self, heat_percent: int) -> None:
         """Set heat as one arbiter-visible MCP command."""

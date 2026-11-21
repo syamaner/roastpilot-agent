@@ -6608,8 +6608,12 @@ class RoastService:
             and self._detached_recovery_loop is None
         )
 
-    async def _start_mock_human_roast(self, profile: RoastProfile) -> RoastDetail:
+    async def _start_mock_human_roast(
+        self, profile: RoastProfile, *, pre_fc_mock: bool = False
+    ) -> RoastDetail:
         """Exercise one isolated mock Start; no production caller may select this seam."""
+        if type(pre_fc_mock) is not bool:
+            raise ValueError("private pre-FC opt-in must be an exact boolean")
         generation = self._start_admission_generation
         child, adapter, process_id = self._mcp, self._roaster, self.instance_id
         if (
@@ -6661,6 +6665,11 @@ class RoastService:
             no_run()
             if active is not None:
                 raise RoastRunConflictError("a persisted run remains active")
+            if pre_fc_mock:
+                discovered = await child.discover_timing_evidence()
+                no_run()
+                if discovered is not ToolDiscovery.DISCOVERED:
+                    raise RoastRunConflictError("private timing tool is unavailable")
             evidence = await child._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
             no_run()
             proof = child._start_proof  # pyright: ignore[reportPrivateUsage]
@@ -6868,9 +6877,21 @@ class RoastService:
                 detail = await self._store.read_run(run_id)
                 if not owned(published=True) or detail is None:
                     raise RoastRunConflictError("private response owner was superseded")
+                if pre_fc_mock and (
+                    detail.id != run_id
+                    or detail.agent_phase is not RoastPhase.PREHEATING
+                    or detail.outcome is not None
+                    or detail.completed_at_utc is not None
+                ):
+                    raise RoastRunConflictError("private persisted Start readback disagrees")
                 if self._run_loop:
                     self._supervise_current_failed_human_start(runner, run_id)
-                return detail.model_copy(update={"instance_id": self.instance_id})
+                response = detail.model_copy(update={"instance_id": self.instance_id})
+                if pre_fc_mock:
+                    if not owned(published=True):
+                        raise RoastRunConflictError("private grant owner was superseded")
+                    controller._grant_private_pre_fc(adapter)  # pyright: ignore[reportPrivateUsage]
+                return response
             except BaseException:
                 if not settled:
                     unresolved(

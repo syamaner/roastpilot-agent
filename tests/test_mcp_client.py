@@ -6040,7 +6040,7 @@ def test_c2a_reader_has_no_production_caller() -> None:
             ):
                 importers.add(path.name)
     assert references == [("api.py", "_start_mock_human_roast")]
-    assert importers == {"mcp_client.py", "api.py"}
+    assert importers == {"mcp_client.py", "api.py", "human_pre_fc_permission.py"}
 
 
 _ALLOWED_BOOTSTRAP_IMPORTS = {
@@ -6643,6 +6643,7 @@ def test_c2b_private_start_has_no_production_caller() -> None:
     assert run_references == [("mcp_client.py", "_attempt_human_start")]
     assert strict_references == [
         ("mcp_client.py", "_call_bootstrap_sdk"),
+        ("mcp_client.py", "_private_pre_fc_call"),
         ("mcp_client.py", "_read_timing_evidence"),
         ("mcp_client.py", "_run_human_start"),
         ("mcp_client.py", "_run_human_start"),
