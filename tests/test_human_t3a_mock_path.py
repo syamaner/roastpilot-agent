@@ -9,9 +9,10 @@ from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
-from mcp.types import ListToolsResult, Tool
+from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from roastpilot_agent.api import RoastRunConflictError, RoastService
+from roastpilot_agent.human_bootstrap import BOOTSTRAP_TOOL_INVENTORY, BootstrapRead
 from roastpilot_agent.human_pre_fc_permission import PairOutcome, PermitState
 from roastpilot_agent.human_protection import (
     CommandDisposition,
@@ -38,9 +39,11 @@ from tests.test_human_pre_fc_permission import control_receipt, mark_receipt, ti
 from tests.test_human_session_bound import setup
 from tests.test_human_start_service import fixture as fixture
 from tests.test_mcp_client import (
+    _BS_SERVER_INFO,
     _BootstrapDouble,
     _BootstrapPeer,
     _bs_process,
+    _bs_raw,
     _hs_payload,
     _hs_raw,
     _sdk_session,
@@ -751,7 +754,18 @@ async def test_inclusive_protection_after_mark_disposition(
 
 
 async def enable_discovery(monkeypatch: pytest.MonkeyPatch, double: _BootstrapDouble) -> AsyncMock:
-    """Advertise only the existing strict timing capability on the current child."""
+    """Supply the exact opted-in inventory and discover the strict timing tool."""
+    server = {
+        **_BS_SERVER_INFO,
+        "available_bootstrap_tools": [
+            *BOOTSTRAP_TOOL_INVENTORY[:9],
+            "drop_beans_exact_session",
+            *BOOTSTRAP_TOOL_INVENTORY[9:],
+        ],
+    }
+    double.replies["get_server_info"] = CallToolResult.model_validate(
+        _bs_raw(BootstrapRead.SERVER_INFO, server)
+    )
     discovery = AsyncMock(
         return_value=ListToolsResult(tools=[Tool(name="get_timing_evidence", inputSchema=schema())])
     )
@@ -785,6 +799,40 @@ async def test_opted_start_grants_after_durable_readback(
         "set_recording_metadata",
         "start_roast_session",
     ]
+
+
+@pytest.mark.parametrize("fault", ["legacy", "reordered", "extra", "missing", "divergent"])
+async def test_opted_inventory_mismatch_never_starts(
+    fixture: tuple[RoastService, _BootstrapDouble], monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    service, double = fixture
+    await enable_discovery(monkeypatch, double)
+    tools = [
+        *BOOTSTRAP_TOOL_INVENTORY[:9],
+        "drop_beans_exact_session",
+        *BOOTSTRAP_TOOL_INVENTORY[9:],
+    ]
+    text_tools = tools.copy()
+    if fault == "legacy":
+        tools = list(BOOTSTRAP_TOOL_INVENTORY)
+    elif fault == "reordered":
+        tools[8], tools[9] = tools[9], tools[8]
+    elif fault == "extra":
+        tools.append("unexpected")
+    elif fault == "missing":
+        tools.pop()
+    else:
+        text_tools = list(BOOTSTRAP_TOOL_INVENTORY)
+    server = {**_BS_SERVER_INFO, "available_bootstrap_tools": tools}
+    text = {**server, "available_bootstrap_tools": text_tools} if fault == "divergent" else server
+    double.replies["get_server_info"] = CallToolResult.model_validate(
+        _bs_raw(BootstrapRead.SERVER_INFO, server, text_value=text)
+    )
+    with pytest.raises(RoastRunConflictError):
+        await service._start_mock_human_roast(PROFILE, pre_fc_mock=True)
+    assert sends(double) == ["get_server_info"]
+    assert not service._mock_start_used
+    assert service._mcp is not None and service._mcp._start_proof is None
 
 
 async def test_fresh_service_start_preserves_synthetic_closed_history(

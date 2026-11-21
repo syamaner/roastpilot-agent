@@ -1,5 +1,11 @@
 # RoastPilot Agent Project State Registry
 
+**21 Nov 2026, D238 T3a (#1111) conditional software completion:**
+
+| Scope | Status |
+|-------|--------|
+| Private manual/mock pre-FC path and exact opt-in bootstrap inventory | Software completion conditional on verified protected merge. Combined focused proof passed; protected producer witness and full gate remain lead-owned and are not claimed here. Physical, deployment, routine Drop, held-mark emergency and winter qualification work remain open. E11-S3 and #954 remain open. |
+
 **18 Nov 2026, D230 A2 software delivery (#1077):**
 Protected S1 (#1092) supplied the server's bounded HUMAN history durability
 projection. S2 renders the current run's validated status on the dashboard

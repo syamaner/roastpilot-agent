@@ -88,6 +88,7 @@ from roastpilot_agent.controller import (
     TickScheduler,
 )
 from roastpilot_agent.human_bootstrap import (
+    BootstrapInventory,
     HumanBootstrapEvidence,
     HumanStartAccepted,
     HumanStartRefused,
@@ -6668,9 +6669,16 @@ class RoastService:
             if pre_fc_mock:
                 discovered = await child.discover_timing_evidence()
                 no_run()
-                if discovered is not ToolDiscovery.DISCOVERED:
+                if (
+                    discovered is not ToolDiscovery.DISCOVERED
+                    or child.timing_evidence_discovery is not ToolDiscovery.DISCOVERED
+                ):
                     raise RoastRunConflictError("private timing tool is unavailable")
-            evidence = await child._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
+                evidence = await child._read_human_bootstrap(  # pyright: ignore[reportPrivateUsage]
+                    inventory=BootstrapInventory.T3A_MANUAL_MOCK
+                )
+            else:
+                evidence = await child._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
             no_run()
             proof = child._start_proof  # pyright: ignore[reportPrivateUsage]
             if (

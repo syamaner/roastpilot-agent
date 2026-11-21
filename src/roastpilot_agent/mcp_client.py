@@ -76,6 +76,7 @@ from pydantic import (
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.human_bootstrap import (
     BOOTSTRAP_READ_ORDER,
+    BootstrapInventory,
     BootstrapRead,
     BootstrapRefusal,
     EnvelopeMember,
@@ -3849,7 +3850,9 @@ class MCPServerProcess:
             and self.launch_record_for_epoch(epoch) is record
         )
 
-    async def _read_human_bootstrap(self) -> HumanBootstrapReadback:
+    async def _read_human_bootstrap(
+        self, *, inventory: BootstrapInventory = BootstrapInventory.LEGACY
+    ) -> HumanBootstrapReadback:
         """Strictly read back one HUMAN manual/mock bootstrap (#1078 C2a).
 
         The session, epoch and launch record are captured before the first
@@ -3857,7 +3860,9 @@ class MCPServerProcess:
         any displacement or refusal stops before the next read and never
         rebinds to a replacement. Each of the three reads is made once, in
         order, bounded by ``call_timeout_seconds`` and without the legacy
-        result parser or implicit discovery. Cancellation propagates.
+        result parser or implicit discovery. The T3a inventory additionally
+        requires explicit timing discovery on this child before any read.
+        Cancellation propagates.
 
         Returns:
             Bootstrap evidence (no control permission) or a value-free refusal.
@@ -3865,6 +3870,10 @@ class MCPServerProcess:
         self._start_proof = None
         self._bootstrap_read_generation += 1
         read_generation = self._bootstrap_read_generation
+        if type(inventory) is not BootstrapInventory:
+            return HumanBootstrapRefused(
+                BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO
+            )
         session = self._session
         epoch = self._child_epoch
         record = self.launch_record_for_epoch(epoch)
@@ -3873,6 +3882,11 @@ class MCPServerProcess:
             return framing
         # A framed record exists only for an attached session at this epoch.
         assert session is not None and record is not None
+        if (
+            inventory is BootstrapInventory.T3A_MANUAL_MOCK
+            and self.timing_evidence_discovery is not ToolDiscovery.DISCOVERED
+        ):
+            return HumanBootstrapRefused(BootstrapRefusal.READ_FAILED, BootstrapRead.SERVER_INFO)
         config_present = record.evidence.config_present
         results: list[dict[str, object]] = []
         for read in BOOTSTRAP_READ_ORDER:
@@ -3905,6 +3919,7 @@ class MCPServerProcess:
                 content=content,
                 structured=structured,
                 config_present=config_present,
+                inventory=inventory,
             )
             if result is None:
                 return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)

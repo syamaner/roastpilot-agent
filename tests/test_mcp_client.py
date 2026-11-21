@@ -42,7 +42,7 @@ from roastpilot_agent.human_bootstrap import (
     HumanBootstrapEvidence,
     HumanBootstrapRefused,
 )
-from roastpilot_agent.human_protection import ControlAuthority
+from roastpilot_agent.human_protection import ControlAuthority, ToolDiscovery
 from roastpilot_agent.launch_composition import (
     AudioSourceKind,
     ChildConfigRead,
@@ -5022,6 +5022,88 @@ async def _bs_read(process: MCPServerProcess) -> hb.HumanBootstrapReadback:
     return await process._read_human_bootstrap()  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("selector", [None, "legacy", "t3a_manual_mock", 1, True])
+async def test_bootstrap_invalid_inventory_invalidates_proof_without_reads(
+    selector: object,
+) -> None:
+    double = _BootstrapDouble()
+    process = _bs_process(double)
+    assert isinstance(await _bs_read(process), HumanBootstrapEvidence)
+    double.calls.clear()
+    result = await process._read_human_bootstrap(inventory=cast("hb.BootstrapInventory", selector))  # pyright: ignore[reportPrivateUsage]
+    assert result == HumanBootstrapRefused(
+        BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO
+    )
+    assert process._start_proof is None  # pyright: ignore[reportPrivateUsage]
+    assert double.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("discovery", [None, ToolDiscovery.ABSENT])
+async def test_t3a_bootstrap_requires_current_child_discovery_without_reads(
+    discovery: ToolDiscovery | None,
+) -> None:
+    double = _BootstrapDouble()
+    process = _bs_process(double)
+    assert isinstance(await _bs_read(process), HumanBootstrapEvidence)
+    double.calls.clear()
+    process._timing_evidence_discovery = discovery  # pyright: ignore[reportPrivateUsage]
+    result = await process._read_human_bootstrap(  # pyright: ignore[reportPrivateUsage]
+        inventory=hb.BootstrapInventory.T3A_MANUAL_MOCK
+    )
+    assert result == HumanBootstrapRefused(BootstrapRefusal.READ_FAILED, BootstrapRead.SERVER_INFO)
+    assert process._start_proof is None  # pyright: ignore[reportPrivateUsage]
+    assert double.calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_only", [False, True])
+async def test_t3a_bootstrap_discovered_inventory_and_all_reads(text_only: bool) -> None:
+    double = _BootstrapDouble()
+    server = {
+        **_BS_SERVER_INFO,
+        "available_bootstrap_tools": [
+            *hb.BOOTSTRAP_TOOL_INVENTORY[:9],
+            "drop_beans_exact_session",
+            *hb.BOOTSTRAP_TOOL_INVENTORY[9:],
+        ],
+    }
+    raw = _bs_raw(BootstrapRead.SERVER_INFO, server)
+    if text_only:
+        del raw["structuredContent"]
+    double.replies["get_server_info"] = CallToolResult.model_validate(raw)
+    process = _bs_process(double)
+    process._timing_evidence_discovery = ToolDiscovery.DISCOVERED  # pyright: ignore[reportPrivateUsage]
+    result = await process._read_human_bootstrap(  # pyright: ignore[reportPrivateUsage]
+        inventory=hb.BootstrapInventory.T3A_MANUAL_MOCK
+    )
+    if text_only:
+        assert result == HumanBootstrapRefused(
+            BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO
+        )
+        assert double.calls == _BS_ORDER[:1]
+    else:
+        assert isinstance(result, HumanBootstrapEvidence)
+        assert double.calls == _BS_ORDER
+
+
+@pytest.mark.asyncio
+async def test_t3a_bootstrap_discovery_does_not_transfer_to_replacement_child() -> None:
+    previous = _BootstrapDouble()
+    process = _bs_process(previous)
+    process._timing_evidence_discovery = ToolDiscovery.DISCOVERED  # pyright: ignore[reportPrivateUsage]
+    replacement = _BootstrapDouble()
+    process._replace_session(replacement)  # pyright: ignore[reportPrivateUsage]
+    _bs_bind(process, _bs_evidence(_bs_capture()))
+    result = await process._read_human_bootstrap(  # pyright: ignore[reportPrivateUsage]
+        inventory=hb.BootstrapInventory.T3A_MANUAL_MOCK
+    )
+    assert result == HumanBootstrapRefused(BootstrapRefusal.READ_FAILED, BootstrapRead.SERVER_INFO)
+    assert process._start_proof is None  # pyright: ignore[reportPrivateUsage]
+    assert previous.calls == replacement.calls == []
+
+
 def _bs_refused(reason: BootstrapRefusal, read: BootstrapRead | None) -> HumanBootstrapRefused:
     return HumanBootstrapRefused(reason, read)
 
@@ -5291,8 +5373,23 @@ async def test_c2a_displacement_at_each_dispatch_boundary_sends_nothing_more(
         original_decode = hb.decode_bootstrap_reply
         target = _BS_READS[index - 1]
 
-        def decode(read: BootstrapRead, **kwargs: object) -> dict[str, object] | None:
-            result = original_decode(read, **cast("dict[str, bool]", kwargs))
+        def decode(
+            read: BootstrapRead,
+            *,
+            is_error: object,
+            content: object,
+            structured: object,
+            config_present: bool,
+            inventory: hb.BootstrapInventory = hb.BootstrapInventory.LEGACY,
+        ) -> dict[str, object] | None:
+            result = original_decode(
+                read,
+                is_error=is_error,
+                content=content,
+                structured=structured,
+                config_present=config_present,
+                inventory=inventory,
+            )
             if read is target:
                 _displace(process, kind, replacement)
             return result
@@ -6039,7 +6136,7 @@ def test_c2a_reader_has_no_production_caller() -> None:
                 alias.name == "roastpilot_agent.human_bootstrap" for alias in node.names
             ):
                 importers.add(path.name)
-    assert references == [("api.py", "_start_mock_human_roast")]
+    assert references == [("api.py", "_start_mock_human_roast")] * 2
     assert importers == {"mcp_client.py", "api.py", "human_pre_fc_permission.py"}
 
 
