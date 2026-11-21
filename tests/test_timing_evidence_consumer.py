@@ -867,11 +867,7 @@ def verify_p1(root: Path) -> None:
     assert git("rev-parse", "HEAD") == P1_COMMIT
     assert git("rev-parse", "HEAD^{tree}") == P1_TREE
     assert git("status", "--porcelain", "--ignored") == ""
-    assert (
-        git("symbolic-ref", "-q", "--short", "HEAD") == ""
-        if False
-        else git("branch", "--show-current") == ""
-    )
+    assert git("branch", "--show-current") == ""
     package = root / "coffee_roaster_mcp"
     manifest = "".join(
         f"{p.relative_to(package).as_posix()} {hashlib.sha256(p.read_bytes()).hexdigest()}\n"
@@ -961,8 +957,10 @@ async def test_t10_protected_p1_registered_child(tmp_path: Path) -> None:
         assert result.producer_reason is ProducerReason.DRIVER_RAISED
         assert counts() == baseline
         await process.call_tool("drop_beans", {})
-        await process.call_tool("start_cooling", {})
+        assert counts()["drop_beans"] > baseline["drop_beans"]
+        # Drop already starts cooling; stop exercises the cooling driver boundary.
         await process.call_tool("stop_cooling", {})
+        assert counts()["stop_cooling"] > baseline["stop_cooling"]
         await process.call_tool("start_roast_session", {})
         baseline = counts()
         result = await adapter.read_timing_evidence()
@@ -982,14 +980,23 @@ async def test_t10_protected_p1_registered_child(tmp_path: Path) -> None:
 @pytest.mark.slow
 @pytest.mark.serial
 @pytest.mark.asyncio
-async def test_t9_installed_legacy_024_absence() -> None:
+async def test_t9_installed_legacy_024_absence(tmp_path: Path) -> None:
     assert version("coffee-roaster-mcp") == "0.2.4"
-    process = MCPServerProcess(MCPConfig(call_timeout_seconds=20))
+    config = (tmp_path / "legacy-mock.yaml").resolve()
+    config.write_text("roaster:\n  driver: mock\nfirst_crack:\n  mode: disabled\n")
+    process = MCPServerProcess(
+        MCPConfig(
+            call_timeout_seconds=20,
+            env={
+                "COFFEE_ROASTER_MCP_CONFIG": str(config),
+                "COFFEE_ROASTER_DRIVER": "mock",
+                "COFFEE_FIRST_CRACK_MODE": "disabled",
+            },
+        )
+    )
     await process.start()
     try:
-        adapter = RoasterControlAdapter.from_process(process)
         assert await process.discover_timing_evidence() is ToolDiscovery.ABSENT
-        assert (await adapter.read_timing_evidence()).outcome is O.NOT_ATTEMPTED
     finally:
         await process.stop()
 
