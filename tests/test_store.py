@@ -12170,7 +12170,12 @@ async def test_start_hold_writer_deadline_and_cancellation_keep_original_refusal
                 with pytest.raises(HistoryUnavailable, match="deadline"):
                     await task
             assert not hold_store.human_storage_quiescent
+            owner = hold_store._history_owner  # pyright: ignore[reportPrivateUsage]
+            assert owner is not None and owner.task is not None
             release.set()
+            # Join the admitted SQLite task before checking teardown. The short caller
+            # budget exercises refusal above; it is not a deadline for test cleanup.
+            await asyncio.wait_for(asyncio.shield(owner.task), timeout=2.0)
             assert await hold_store.settle_human_storage_for_teardown()
         assert (await hold_store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
     finally:
