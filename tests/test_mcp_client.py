@@ -6009,13 +6009,27 @@ def test_c2a_bootstrap_path_never_uses_the_legacy_parser_or_discovery() -> None:
 
 def test_c2a_reader_has_no_production_caller() -> None:
     package = Path(mcp_client_module.__file__).parent
-    references: list[str] = []
+    references: list[tuple[str, str]] = []
     importers: set[str] = set()
     for path in sorted(package.rglob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
+        parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        }
         for node in ast.walk(tree):
-            if isinstance(node, ast.Attribute) and node.attr == "_read_human_bootstrap":
-                references.append(path.name)
+            if isinstance(node, ast.Constant):
+                assert node.value != "_read_human_bootstrap", (path, node.lineno)
+            if isinstance(node, ast.Attribute | ast.Name):
+                name = node.attr if isinstance(node, ast.Attribute) else node.id
+                if name == "_read_human_bootstrap":
+                    function = parents.get(node)
+                    while function is not None and not isinstance(
+                        function, ast.FunctionDef | ast.AsyncFunctionDef
+                    ):
+                        function = parents.get(function)
+                    assert isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef)
+                    assert isinstance(node.ctx, ast.Load)
+                    references.append((path.name, function.name))
             if (
                 isinstance(node, ast.ImportFrom)
                 and node.module == "roastpilot_agent.human_bootstrap"
@@ -6025,7 +6039,7 @@ def test_c2a_reader_has_no_production_caller() -> None:
                 alias.name == "roastpilot_agent.human_bootstrap" for alias in node.names
             ):
                 importers.add(path.name)
-    assert references == ["api.py"]
+    assert references == [("api.py", "_start_mock_human_roast")]
     assert importers == {"mcp_client.py", "api.py"}
 
 

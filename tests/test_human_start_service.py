@@ -5,7 +5,7 @@ import asyncio
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import cast
-from unittest.mock import Mock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -1215,41 +1215,92 @@ async def test_bound_ambiguity_later_clear_cannot_clear_via_guarded_entries(
     fixture: tuple[RoastService, _BootstrapDouble],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from roastpilot_agent.models import HardwareClearAcknowledgementRequest, StartAttemptHoldRead
+    from roastpilot_agent.models import HardwareClearAcknowledgementRequest
 
     service, double = fixture
+    original_settle = service._store.settle_start_attempt_hold
+    settlements: list[StartHoldSettlementOutcome] = []
 
     async def settle(*args: object, **kwargs: object) -> StartHoldSettlementOutcome:
+        outcome = await original_settle(*args, **kwargs)  # type: ignore[arg-type]
+        settlements.append(outcome)
+        assert outcome is StartHoldSettlementOutcome.SETTLED_VERIFIED
+        # The exact test transaction committed, but its returned truth is ambiguous.
         return StartHoldSettlementOutcome.INDETERMINATE
 
     monkeypatch.setattr(service._store, "settle_start_attempt_hold", settle)
     with pytest.raises(RoastRunConflictError):
         await service._start_mock_human_roast(PROFILE)
     retained = service._human_ownership._run
-    assert retained is not None and retained.session_id == "a" * 32
-
-    async def clear() -> StartAttemptHoldRead:
-        return StartAttemptHoldRead(StartAttemptHoldState.CLEAR)
-
-    monkeypatch.setattr(service._store, "read_start_attempt_hold", clear)
+    fence = service._mock_start_unresolved
+    assert retained is not None and retained.session_id == "a" * 32 and fence is not None
+    assert settlements == [StartHoldSettlementOutcome.SETTLED_VERIFIED]
+    hold_read = AsyncMock(wraps=service._store.read_start_attempt_hold)
+    monkeypatch.setattr(service._store, "read_start_attempt_hold", hold_read)
+    # Independently read real SQLite CLEAR. The guarded entries below must not read it.
+    assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+    hold_read.reset_mock()
+    active = AsyncMock(wraps=service._store.active_run)
+    projection = AsyncMock(wraps=service._fault_controls_projection)
+    monkeypatch.setattr(service._store, "active_run", active)
+    monkeypatch.setattr(service, "_fault_controls_projection", projection)
     request = RestartClearanceRequest(physical_confirmation=True)
-    with pytest.raises(RoastRunConflictError):
+    with pytest.raises(RoastRunConflictError, match="private Start ownership remains unresolved"):
         await service.acknowledge_restart_clearance(request)
-    assert (
-        await service.initialize_missing_fault_control_safety_record(request)
-    ).outcome == "rejected"
-    with pytest.raises(RoastRunConflictError):
+    with pytest.raises(RoastRunConflictError, match="private Start ownership remains unresolved"):
         await service.acknowledge_hardware_clear(
             HardwareClearAcknowledgementRequest(
                 hardware_clear=True, teardown_incident_id="b" * 32, reason="synthetic"
             )
         )
+    active.assert_not_awaited()
+    projection.assert_not_awaited()
+    hold_read.assert_not_awaited()
+    assert (
+        await service.initialize_missing_fault_control_safety_record(request)
+    ).outcome == "rejected"
     for start in (service.start_roast, service._start_mock_human_roast):
         with pytest.raises(RoastRunConflictError):
             await start(PROFILE)
+    hold_read.assert_not_awaited()
+    assert service._mock_start_unresolved is fence
     assert service._human_ownership._run is retained and service._human_ownership.lifecycle_blocked
-    assert retained.command is CommandDisposition.SETTLED
+    assert retained.command is CommandDisposition.SETTLED and retained._private_start_retained
     assert sum(n == "start_roast_session" for n, _ in double.calls) == 1
+    assert not any(n in ("set_heat", "set_fan", "contain_heat_fixed_zero") for n, _ in double.calls)
+
+
+async def test_d220_private_refusal_precedes_epoch_despite_existing_baseline(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from roastpilot_agent.models import FaultLeaseStatus
+
+    service, double = fixture
+    await service._start_mock_human_roast(PROFILE)
+    owner = service._human_ownership._run
+    assert owner is not None and owner._private_start_retained
+    assert (await service._store.read_fault_control_lease()).status is FaultLeaseStatus.CLOSED
+    assert service._safety_record_initialization is None
+    before = list(double.calls)
+    epoch = AsyncMock(wraps=service._ensure_restart_epoch)
+    monkeypatch.setattr(service, "_ensure_restart_epoch", epoch)
+    request = RestartClearanceRequest(physical_confirmation=True)
+    assert (
+        await service.initialize_missing_fault_control_safety_record(request)
+    ).outcome == "rejected"
+    epoch.assert_not_awaited()
+    # Isolated negative comparison: the same admission context still rejects,
+    # but enters the epoch boundary when the private predicate is disabled.
+    with monkeypatch.context() as control:
+        control.setattr(service, "_private_start_blocks_clearance", lambda: False)
+        assert (
+            await service.initialize_missing_fault_control_safety_record(request)
+        ).outcome == "rejected"
+        epoch.assert_awaited_once()
+    assert service._human_ownership._run is owner and owner._private_start_retained
+    assert service._human_ownership.lifecycle_blocked
+    assert double.calls == before
 
 
 @pytest.mark.parametrize("kind", ["lease", "held", "unknown", "active"])
@@ -1574,6 +1625,7 @@ async def test_automatic_successor_retains_real_b3_held_record(
 async def test_d212_actual_entry_cannot_release_private_owner(
     fixture: tuple[RoastService, _BootstrapDouble],
     identity: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from roastpilot_agent.models import FaultControlsActionRequest, FaultLeaseStatus, OperatorAction
     from tests.test_mcp_client import _fault_control_state_payload
@@ -1618,6 +1670,46 @@ async def test_d212_actual_entry_cannot_release_private_owner(
     if identity == "exact":
         assert result.result == "accepted" and confirmed
         assert current.status is FaultLeaseStatus.CLOSED and owner.durably_closed
+        from roastpilot_agent.models import HardwareClearAcknowledgementRequest
+
+        before = list(double.calls)
+        for start in (service.start_roast, service._start_mock_human_roast):
+            with pytest.raises(RoastRunConflictError):
+                await start(PROFILE)
+        with pytest.raises(
+            RoastRunConflictError, match="private Start ownership remains unresolved"
+        ):
+            await service.acknowledge_restart_clearance(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        assert (
+            await service.initialize_missing_fault_control_safety_record(
+                RestartClearanceRequest(physical_confirmation=True)
+            )
+        ).outcome == "rejected"
+        with pytest.raises(
+            RoastRunConflictError, match="private Start ownership remains unresolved"
+        ):
+            await service.acknowledge_hardware_clear(
+                HardwareClearAcknowledgementRequest(
+                    hardware_clear=True, teardown_incident_id="b" * 32, reason="synthetic"
+                )
+            )
+        # Start refusal is independently masked by the private selector and
+        # spent service slot. Removing only retention cannot admit either Start.
+        with monkeypatch.context() as control:
+            control.setattr(owner, "_private_start_retained", False)
+            assert not service._human_ownership.lifecycle_blocked
+            for start in (service.start_roast, service._start_mock_human_roast):
+                with pytest.raises(RoastRunConflictError):
+                    await start(PROFILE)
+        assert service._human_ownership._run is owner and owner._private_start_retained
+        assert service._human_ownership.lifecycle_blocked
+        assert await service._store.read_fault_control_lease() == current
+        after = await service._store.read_timeline(owner.run_id)
+        assert after.events == timeline.events
+        assert double.calls == before
+
     else:
         assert not confirmed and current.status is FaultLeaseStatus.OPEN
     assert not any(n in ("set_heat", "set_fan", "stop_cooling") for n, _ in double.calls)

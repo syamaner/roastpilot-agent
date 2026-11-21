@@ -472,6 +472,8 @@ async def test_no_production_caller_of_private_handoff() -> None:
             child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
         }
         for node in ast.walk(tree):
+            if isinstance(node, ast.keyword):
+                assert node.arg != "_mock_human_start", (path, node.lineno)
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
                 assert node.value not in private, (path, node.lineno)
             if isinstance(node, ast.Call) and (
