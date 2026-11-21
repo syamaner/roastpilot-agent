@@ -13,7 +13,7 @@ import pytest_asyncio
 from roastpilot_agent.api import RoastRunConflictError, RoastService
 from roastpilot_agent.human_bootstrap import StartAttemptState
 from roastpilot_agent.human_protection import CommandDisposition, ControlAuthority
-from roastpilot_agent.human_run_ownership import HumanRunAdmission
+from roastpilot_agent.human_run_ownership import HumanRunAdmission, HumanRunState
 from roastpilot_agent.models import (
     RestartClearanceRequest,
     RoastPhase,
@@ -1115,6 +1115,7 @@ async def test_initial_history_boundaries_never_return_success(
     site: str,
 ) -> None:
     service, double = fixture
+    baseline_generation = service._start_admission_generation
     original = service._build_runner
     called: list[str] = []
 
@@ -1165,9 +1166,16 @@ async def test_initial_history_boundaries_never_return_success(
     assert sum(n == "start_roast_session" for n, _ in double.calls) == 1
     assert service.runner is not None
     controller = service.runner.controller_for_human_fault_drop()
-    assert controller is not None
-    assert controller.phase is RoastPhase.OPERATOR_RECOVERY_REQUIRED
-    assert not any(n == "contain_heat_fixed_zero" for n, _ in double.calls)
+    assert controller is not None and service._mcp is not None
+    assert controller._known_human_identity() == ("a" * 32, service._mcp.child_epoch)
+    assert controller._routine_inhibited
+    assert (service._start_admission_generation > baseline_generation) == (site != "flush-false")
+    assert controller.phase is (
+        RoastPhase.PREHEATING
+        if site == "response-displace"
+        else RoastPhase.OPERATOR_RECOVERY_REQUIRED
+    )
+    assert not any(n in ("contain_heat_fixed_zero", "set_heat", "set_fan") for n, _ in double.calls)
 
 
 async def test_no_target_emergency_after_install_returns_while_metadata_parked(
@@ -1766,3 +1774,104 @@ async def test_post_callback_phase_gate_never_invokes_a(
     attempt.assert_not_called()
     assert service._mock_start_unresolved is not None
     assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
+
+
+@pytest.mark.parametrize("failure", ["exception", "cancel"])
+@pytest.mark.parametrize("run_loop", [False, True])
+async def test_response_read_failure_after_history_pass_retains_settled_start(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    run_loop: bool,
+) -> None:
+    service, double = fixture
+    original_read = service._store.read_run
+    original_note = service._store.note_human_history_pass
+    original_build = service._build_runner
+    acknowledged: list[str] = []
+    owners: list[HumanRunState] = []
+    running, release = asyncio.Event(), asyncio.Event()
+    error = (
+        RuntimeError("response-only read failed")
+        if failure == "exception"
+        else asyncio.CancelledError("response-only read cancelled")
+    )
+
+    def note(run_id: str) -> None:
+        original_note(run_id)
+        assert service._store._history_covered
+        acknowledged.append(run_id)
+
+    async def read(run_id: str) -> object:
+        detail = await original_read(run_id)
+        assert detail is not None and detail.agent_phase is RoastPhase.PREHEATING
+        assert acknowledged == [run_id]
+        assert service._store._history_covered
+        assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+        assert service.runner is not None
+        controller = service.runner.controller_for_human_fault_drop()
+        assert controller is not None and controller._human_run is not None
+        assert controller._human_run.admission is HumanRunAdmission.SESSION_BOUND
+        assert controller._human_run.command is CommandDisposition.SETTLED
+        owners.append(controller._human_run)
+        raise error
+
+    async def build(run_id: str, profile: object) -> object:
+        runner = await original_build(run_id, profile)  # type: ignore[arg-type]
+        assert runner is not None
+
+        async def supervised() -> None:
+            running.set()
+            await release.wait()
+
+        monkeypatch.setattr(runner, "run", supervised)
+        return runner
+
+    monkeypatch.setattr(service._store, "note_human_history_pass", note)
+    monkeypatch.setattr(service._store, "read_run", read)
+    monkeypatch.setattr(service, "_build_runner", build)
+    service._run_loop = run_loop
+    try:
+        with pytest.raises(type(error)) as raised:
+            await service._start_mock_human_roast(PROFILE)
+        assert raised.value is error
+        assert len(owners) == 1 and service._human_ownership._run is owners[0]
+        owner = owners[0]
+        assert owner.command is CommandDisposition.SETTLED
+        assert owner.session_id == "a" * 32 and service._mcp is not None
+        assert owner.child_generation == service._mcp.child_epoch
+        assert owner._private_start_retained and service._human_ownership.lifecycle_blocked
+        assert service._mock_start_unresolved is None
+        assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+        assert service.runner is not None
+        controller = service.runner.controller_for_human_fault_drop()
+        assert controller is not None
+        assert controller.phase is RoastPhase.PREHEATING
+        assert controller._routine_inhibited
+        timeline = await service._store.read_timeline(owner.run_id)
+        payloads = [event.payload for event in timeline.events] + [
+            event.payload for event in service.runner._emitter.peek()
+        ]
+        assert not any(
+            isinstance(payload, dict)
+            and cast("dict[str, object]", payload).get("rule") == "human_history_unavailable"
+            for payload in payloads
+        )
+        assert sum(name == "start_roast_session" for name, _ in double.calls) == 1
+        assert not any(
+            name in ("set_heat", "set_fan", "contain_heat_fixed_zero", "emergency_stop")
+            for name, _ in double.calls
+        )
+        if run_loop:
+            await asyncio.wait_for(running.wait(), timeout=1)
+            assert service._loop_task is not None and not service._loop_task.done()
+        else:
+            assert service._loop_task is None
+        for start in (service.start_roast, service._start_mock_human_roast):
+            with pytest.raises(RoastRunConflictError):
+                await start(PROFILE)
+        assert sum(name == "start_roast_session" for name, _ in double.calls) == 1
+    finally:
+        release.set()
+        if service._loop_task is not None:
+            await service._loop_task

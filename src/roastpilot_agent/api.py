@@ -6864,6 +6864,7 @@ class RoastService:
                 if not owned(published=True):
                     raise RoastRunConflictError("private phase owner was superseded")
                 self._store.note_human_history_pass(run_id)
+                history_interrupted = False
                 detail = await self._store.read_run(run_id)
                 if not owned(published=True) or detail is None:
                     raise RoastRunConflictError("private response owner was superseded")
