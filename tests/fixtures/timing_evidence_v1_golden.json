@@ -1,0 +1,59 @@
+{
+  "evidence_protocol": "timing_evidence/v1",
+  "evidence_version": 1,
+  "outcome": "evidence",
+  "reason_code": null,
+  "driver_read": "invoked",
+  "requested_session_id": "schema-session",
+  "record": {
+    "session_id": "schema-session",
+    "session_ownership_sequence": 9007199254740991,
+    "driver": "mock",
+    "clock": {
+      "epoch_id": "00000000000000000000000000000000",
+      "domain": "session_relative_store_monotonic",
+      "suspend_behaviour": "unqualified"
+    },
+    "evidence_sequence": 1,
+    "phase": "development",
+    "charge": {
+      "kind": "beans_added",
+      "event_index": 0,
+      "canonical_seconds": 0.0,
+      "clock_epoch_id": "00000000000000000000000000000000",
+      "source": "manual_mark",
+      "time_basis": "producer_canonical_record",
+      "physical_time_bound": "not_provided"
+    },
+    "first_crack": {
+      "kind": "first_crack_detected",
+      "event_index": 1,
+      "canonical_seconds": 2.0,
+      "clock_epoch_id": "00000000000000000000000000000000",
+      "source": "model_detection",
+      "time_basis": "detector_clock_rebased",
+      "physical_time_bound": "not_provided"
+    },
+    "drop": null,
+    "bean": {
+      "status": "valid",
+      "celsius": 196.00000000000003,
+      "acquisition_lo_seconds": 0.0,
+      "acquisition_hi_seconds": 1.0,
+      "clock_epoch_id": "00000000000000000000000000000000",
+      "basis": "in_call_synthesis",
+      "qualification": "synthetic_software_only"
+    },
+    "environment": {
+      "status": "valid",
+      "celsius": 0.0,
+      "acquisition_lo_seconds": 0.0,
+      "acquisition_hi_seconds": 1.0,
+      "clock_epoch_id": "00000000000000000000000000000000",
+      "basis": "in_call_synthesis",
+      "qualification": "synthetic_software_only"
+    },
+    "time_basis": "canonical_operational_session_relative",
+    "physical_qualification": "none_synthetic_mock_only"
+  }
+}
