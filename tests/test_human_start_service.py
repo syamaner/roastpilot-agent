@@ -1679,3 +1679,58 @@ async def test_metadata_owner_gate_never_invokes_a(
     assert run is not None and run.command is CommandDisposition.SETTLED
     assert service._mock_start_unresolved is not None
     assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.HELD
+
+
+async def test_successful_prepare_superseded_before_hold_install(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, double = fixture
+    original = service._build_runner
+
+    async def build(run_id: str, profile: object) -> object:
+        runner = await original(run_id, profile)  # type: ignore[arg-type]
+        assert runner is not None
+        controller = runner.controller_for_human_fault_drop()
+        assert controller is not None
+        prepare = controller._prepare_human_session
+
+        def superseded(*args: object) -> bool:
+            assert prepare(*args)  # type: ignore[arg-type]
+            service._invalidate_pending_start_admissions_for_emergency_stop()
+            return True
+
+        monkeypatch.setattr(controller, "_prepare_human_session", superseded)
+        return runner
+
+    install = Mock(side_effect=AssertionError("superseded preparation installed a hold"))
+    monkeypatch.setattr(service, "_build_runner", build)
+    monkeypatch.setattr(service._store, "install_start_attempt_hold", install)
+    with pytest.raises(RoastRunConflictError, match="prepared owner was superseded"):
+        await service._start_mock_human_roast(PROFILE)
+    install.assert_not_called()
+    assert service.runner is not None
+    controller = service.runner.controller_for_human_fault_drop()
+    assert controller is not None and controller.phase is RoastPhase.FAULTED
+    assert (await service._store.read_start_attempt_hold()).state is StartAttemptHoldState.CLEAR
+    assert not any(n == "start_roast_session" for n, _ in double.calls)
+
+
+async def test_missing_runner_supersession_does_not_retire_foreign_generation(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, double = fixture
+
+    async def build(*args: object) -> None:
+        service._invalidate_pending_start_admissions_for_emergency_stop()
+
+    retire = Mock(side_effect=AssertionError("superseded missing runner retired"))
+    monkeypatch.setattr(service, "_build_runner", build)
+    monkeypatch.setattr(service, "_retire_never_dispatched_start", retire)
+    with pytest.raises(RoastRunConflictError, match="runner was not constructed"):
+        await service._start_mock_human_roast(PROFILE)
+    retire.assert_not_called()
+    assert service.runner is None and service.active_run_id is not None
+    assert (await service._store.active_run()) is not None
+    assert not any(n == "start_roast_session" for n, _ in double.calls)
