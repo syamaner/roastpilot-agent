@@ -13,7 +13,12 @@ from mcp.types import CallToolResult, ListToolsResult, Tool
 
 from roastpilot_agent.api import RoastRunConflictError, RoastService
 from roastpilot_agent.human_bootstrap import BOOTSTRAP_TOOL_INVENTORY, BootstrapRead
-from roastpilot_agent.human_pre_fc_permission import PairOutcome, PermitState
+from roastpilot_agent.human_pre_fc_permission import (
+    LeverReceipt,
+    MarkReceipt,
+    PairOutcome,
+    PermitState,
+)
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ControlAuthority,
@@ -22,7 +27,7 @@ from roastpilot_agent.human_protection import (
     WriteClass,
 )
 from roastpilot_agent.human_run_ownership import AdmissionCloseReason
-from roastpilot_agent.mcp_client import RoasterControlAdapter
+from roastpilot_agent.mcp_client import MCPConnectionError, RoasterControlAdapter
 from roastpilot_agent.models import (
     RestartClearanceRequest,
     RoastEventKind,
@@ -127,6 +132,22 @@ async def test_grant_is_one_shot_and_default_stays_inert(monkeypatch: pytest.Mon
         h.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
     assert not await h.controller._execute_targets(evaluation())
     assert h.controller._private_pre_fc.state is PermitState.ENDED
+
+
+@pytest.mark.parametrize("fault", ["endpoint", "unknown", "closed", "durable"])
+async def test_grant_refuses_invalid_binding_without_permission(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    h, adapter, process, receipt = await setup(monkeypatch)
+    h.controller._bind_prepared_human_session(adapter, receipt)
+    change(h, adapter, fault)
+    double = cast("_BootstrapDouble", process._session)
+    double.calls.clear()
+    with pytest.raises(RuntimeError, match="grant displaced"):
+        h.controller._grant_private_pre_fc(adapter)
+    assert h.controller._private_pre_fc is None
+    assert not await h.controller._execute_targets(evaluation())
+    assert sends(double) == []
 
 
 @pytest.mark.parametrize("boundary", ["set_heat", "set_fan"])
@@ -364,6 +385,226 @@ async def prepare_mark(
     )
     monkeypatch.setattr(adapter, "read_timing_evidence", read)
     return read
+
+
+@pytest.mark.parametrize("stage", [1, 2], ids=["phase-evaluation", "source-evaluation"])
+@pytest.mark.parametrize("fault", ["run", "phase"])
+async def test_mark_evaluation_await_rechecks_owner_and_phase(
+    monkeypatch: pytest.MonkeyPatch, stage: int, fault: str
+) -> None:
+    h, adapter, double = await granted(monkeypatch)
+    read = await prepare_mark(h, adapter, monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+    original = h.sink.persist_evaluation
+    count = 0
+
+    async def persist(value: SafetyEvaluation) -> int | None:
+        nonlocal count
+        count += 1
+        if count == stage:
+            entered.set()
+            await release.wait()
+        return await original(value)
+
+    monkeypatch.setattr(h.sink, "persist_evaluation", persist)
+    task = asyncio.create_task(h.controller.operator_mark_first_crack())
+    await entered.wait()
+    if fault == "run":
+        change(h, adapter, "run")
+    else:
+        # Both are permitted lever phases, but only roasting admits the mark.
+        h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+        h.controller.transition_to(RoastPhase.PREHEATING)
+    owner = replace(run_of(h))
+    phase = h.controller.phase
+    release.set()
+    await task
+    assert run_of(h) == owner
+    assert h.controller.phase is phase
+    assert not h.controller._canonical_human_fc_confirmed
+    assert sends(double) == [] and read.await_count == 0
+
+
+@pytest.mark.parametrize("action", ["cancel", "displace"])
+async def test_queued_mark_is_withheld_before_operation_entry(
+    monkeypatch: pytest.MonkeyPatch, action: str
+) -> None:
+    h, adapter, double = await granted(monkeypatch)
+    read = await prepare_mark(h, adapter, monkeypatch)
+    occupied, release, preread = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def occupy() -> None:
+        occupied.set()
+        await release.wait()
+
+    async def before() -> TimingEvidenceRead:
+        preread.set()
+        return TimingEvidenceRead(TimingEvidenceReadOutcome.EVIDENCE, record=timing())
+
+    read.side_effect = before
+    blocker = asyncio.create_task(h.arbiter.run_routine(h.arbiter.generation, occupy))
+    await occupied.wait()
+    task = asyncio.create_task(h.controller.operator_mark_first_crack())
+    await preread.wait()
+    assert not task.done()
+    if action == "cancel":
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    else:
+        change(h, adapter, "run")
+    owner = replace(run_of(h))
+    release.set()
+    await blocker
+    if action != "cancel":
+        await task
+    assert run_of(h) == owner and run_of(h).command is CommandDisposition.SETTLED
+    assert sends(double) == [] and read.await_count == 1
+    assert not h.controller._canonical_human_fc_confirmed
+    assert h.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert h.controller._private_pre_fc is not None
+    assert h.controller._private_pre_fc.state is PermitState.ENDED
+    assert h.emitter.events[-1] == (
+        RoastEventKind.FIRST_CRACK,
+        {"source": "operator", "outcome": "withheld", "session_id": "a" * 32},
+    )
+
+
+@pytest.mark.parametrize("operation", ["set_heat", "set_fan", "mark_first_crack"])
+@pytest.mark.parametrize("displace", [False, True])
+async def test_wrong_typed_adapter_acknowledgement_is_scoped_uncertainty(
+    monkeypatch: pytest.MonkeyPatch, operation: str, displace: bool
+) -> None:
+    """Deliberate adapter double violation, not a result the strict SDK can emit."""
+    h, adapter, double = await granted(monkeypatch)
+    await prepare_mark(h, adapter, monkeypatch)
+    original = adapter._private_pre_fc_call
+    origin = run_of(h)
+    calls: list[str] = []
+
+    async def invalid(name: Any, value: int | None = None) -> LeverReceipt | MarkReceipt:
+        calls.append(name)
+        result = await original(name, value)
+        if name != operation:
+            return result
+        if displace:
+            change(h, adapter, "run")
+            run_of(h).run_id = "replacement-run"
+            h.controller._current_heat, h.controller._current_fan = 9, 8
+        return (
+            LeverReceipt("a" * 32, "roasting", 65, 30, False)
+            if name == "mark_first_crack"
+            else MarkReceipt("a" * 32, 2.0, 2)
+        )
+
+    monkeypatch.setattr(adapter, "_private_pre_fc_call", invalid)
+    if operation == "mark_first_crack":
+        await h.controller.operator_mark_first_crack()
+        expected = [operation]
+    else:
+        assert await h.controller._execute_targets(evaluation()) is (
+            operation == "set_fan" and not displace
+        )
+        expected = ["set_heat"] if operation == "set_heat" else ["set_heat", "set_fan"]
+    assert calls == sends(double) == expected
+    assert run_of(h).command is (
+        CommandDisposition.UNKNOWN
+        if operation != "mark_first_crack" and not displace
+        else CommandDisposition.SETTLED
+    )
+    assert h.controller._private_pre_fc is not None
+    assert h.controller._private_pre_fc.state is PermitState.ENDED
+    assert not h.controller._canonical_human_fc_confirmed
+    assert h.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    if displace:
+        assert run_of(h) is not origin and origin.command is CommandDisposition.SETTLED
+        assert run_of(h).run_id == "replacement-run"
+        assert (h.controller._current_heat, h.controller._current_fan) == (9, 8)
+    if operation != "mark_first_crack":
+        assert h.emitter.events[-1] == (
+            RoastEventKind.COMMAND_FAILED,
+            {
+                "command": operation,
+                "outcome": "unknown",
+                "run_id": origin.run_id,
+                "session_id": "a" * 32,
+                "command_generation": h.controller._private_pre_fc.binding.command_generation,
+                "child_epoch": h.controller._private_pre_fc.binding.child_epoch,
+            },
+        )
+    else:
+        assert h.emitter.events[-1] == (
+            RoastEventKind.FIRST_CRACK,
+            {"source": "operator", "outcome": "unresolved", "session_id": "a" * 32},
+        )
+    await h.controller.operator_mark_first_crack()
+    assert not await h.controller._execute_targets(evaluation())
+    assert calls == expected
+
+
+async def test_entered_mark_completion_cannot_advance_replacement_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h, adapter, double = await granted(monkeypatch)
+    read = await prepare_mark(h, adapter, monkeypatch)
+    original = adapter._private_pre_fc_call
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(name: Any, value: int | None = None) -> LeverReceipt | MarkReceipt:
+        result = await original(name, value)
+        entered.set()
+        await release.wait()
+        return result
+
+    monkeypatch.setattr(adapter, "_private_pre_fc_call", held)
+    task = asyncio.create_task(h.controller.operator_mark_first_crack())
+    await entered.wait()
+    change(h, adapter, "run")
+    run_of(h).run_id = "replacement-run"
+    replacement = run_of(h)
+    before = replace(replacement)
+    h.controller._current_heat, h.controller._current_fan = 9, 8
+    release.set()
+    await task
+    assert run_of(h) is replacement and replacement == before
+    assert (h.controller._current_heat, h.controller._current_fan) == (9, 8)
+    assert sends(double) == ["mark_first_crack"] and read.await_count == 1
+    assert h.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert not h.controller._canonical_human_fc_confirmed
+    assert h.controller._private_pre_fc is not None
+    assert h.controller._private_pre_fc.state is PermitState.ENDED
+    assert h.emitter.events[-1] == (
+        RoastEventKind.FIRST_CRACK,
+        {"source": "operator", "outcome": "unresolved", "session_id": "a" * 32},
+    )
+
+
+@pytest.mark.parametrize("fault", ["generation", "expired"])
+async def test_curve_sampling_rechecks_lease_and_evidence_after_lever_await(
+    monkeypatch: pytest.MonkeyPatch, fault: str
+) -> None:
+    h, adapter, double = await granted(monkeypatch)
+    await prepare_mark(h, adapter, monkeypatch)
+    h.controller._trim_latched = True
+    original = adapter._private_pre_fc_call
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def held(name: Any, value: int | None = None) -> LeverReceipt | MarkReceipt:
+        entered.set()
+        await release.wait()
+        return await original(name, value)
+
+    monkeypatch.setattr(adapter, "_private_pre_fc_call", held)
+    before = h.controller._history.curve_window()
+    task = asyncio.create_task(
+        h.controller._run_tick_controls(reading(165), generation=h.arbiter.generation)
+    )
+    await entered.wait()
+    change(h, adapter, fault)
+    release.set()
+    await task
+    assert sends(double) == ["set_heat"]
+    assert h.controller._history.curve_window() == before == []
 
 
 async def test_mark_requires_append_identity_and_never_retries(
@@ -715,6 +956,25 @@ async def test_private_adapter_capability_is_runtime_closed(
     assert double.calls == []
 
 
+@pytest.mark.parametrize("identity", ["session", "child", "sdk-session", "transport"])
+async def test_private_adapter_missing_identity_refuses_before_send(
+    monkeypatch: pytest.MonkeyPatch, identity: str
+) -> None:
+    _, adapter, double = await granted(monkeypatch)
+    assert adapter._fixed_zero_transport is not None
+    if identity == "session":
+        adapter._started_session_id = None
+    elif identity == "child":
+        adapter._started_child_epoch = None
+    elif identity == "sdk-session":
+        adapter._fixed_zero_transport._session = None
+    else:
+        adapter._fixed_zero_transport = None
+    with pytest.raises(MCPConnectionError, match="identity unavailable"):
+        await adapter._private_pre_fc_call("set_heat", 65)
+    assert sends(double) == []
+
+
 @pytest.mark.parametrize("bean", [196.0, 196.1])
 @pytest.mark.parametrize(
     "mark", ["unmarked", "canonical", "withheld", "unresolved", "actuator_unknown"]
@@ -941,7 +1201,9 @@ async def test_timing_discovery_refuses_without_spending_start(
     assert not service._mock_start_used and double.calls == []
 
 
-@pytest.mark.parametrize("fault", ["settle", "history", "phase", "readback"])
+@pytest.mark.parametrize(
+    "fault", ["settle", "history", "phase", "readback", "readback-phase", "outcome", "end", "id"]
+)
 async def test_failed_start_settlement_never_grants(
     fixture: tuple[RoastService, _BootstrapDouble], monkeypatch: pytest.MonkeyPatch, fault: str
 ) -> None:
@@ -969,9 +1231,27 @@ async def test_failed_start_settlement_never_grants(
         )
     elif fault == "readback":
         monkeypatch.setattr(service._store, "read_run", AsyncMock(return_value=None))
+    elif fault in ("readback-phase", "outcome", "end", "id"):
+        original_read = service._store.read_run
+
+        async def inconsistent(run_id: str) -> Any:
+            detail = await original_read(run_id)
+            assert detail is not None
+            cases: dict[str, dict[str, object]] = {
+                "readback-phase": {"agent_phase": RoastPhase.DEVELOPMENT},
+                "outcome": {"outcome": "completed"},
+                "end": {"completed_at_utc": "2026-11-22T00:00:00+00:00"},
+                "id": {"id": "wrong-run"},
+            }
+            return detail.model_copy(update=cases[fault])
+
+        monkeypatch.setattr(service._store, "read_run", inconsistent)
     with pytest.raises((RoastRunConflictError, RuntimeError)):
         await service._start_mock_human_roast(PROFILE, pre_fc_mock=True)
     assert service.runner is not None
     controller = service.runner.controller_for_human_fault_drop()
     assert controller is not None and controller._private_pre_fc is None
     assert sends(double).count("start_roast_session") == 1
+    before = sends(double)
+    assert not await controller._execute_targets(evaluation())
+    assert sends(double) == before
