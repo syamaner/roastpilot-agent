@@ -66,6 +66,20 @@ BOOTSTRAP_TOOL_INVENTORY = (
 )
 
 
+class BootstrapInventory(Enum):
+    """Closed bootstrap inventory grammars, without control authority."""
+
+    LEGACY = "legacy"
+    T3A_MANUAL_MOCK = "t3a_manual_mock"
+
+
+_T3A_MANUAL_MOCK_TOOL_INVENTORY = (
+    *BOOTSTRAP_TOOL_INVENTORY[:9],
+    "drop_beans_exact_session",
+    *BOOTSTRAP_TOOL_INVENTORY[9:],
+)
+
+
 class BootstrapRead(Enum):
     """The three bootstrap reads, valued by their MCP tool name."""
 
@@ -321,23 +335,26 @@ _CAPTURE_EVIDENCE = {
 _CAPTURE_KEYS = frozenset(_CAPTURE_EVIDENCE)
 
 
-def _server_info_shape(value: object) -> bool:
+def _server_info_shape(value: object, *, inventory: BootstrapInventory) -> bool:
     data = _object(value, _SERVER_KEYS)
     if data is None:
         return False
     tools = data["available_bootstrap_tools"]
+    expected_tools = (
+        BOOTSTRAP_TOOL_INVENTORY
+        if inventory is BootstrapInventory.LEGACY
+        else _T3A_MANUAL_MOCK_TOOL_INVENTORY
+    )
     return (
         all(_is_text(data[key], expected) for key, expected in _SERVER_CONSTANTS.items())
         and data["bootstrap_safe"] is False
         and _nonempty_text(data["version"])
         and _nonempty_text(data["started_at_utc"])
         and type(tools) is list
-        and len(cast("list[object]", tools)) == len(BOOTSTRAP_TOOL_INVENTORY)
+        and len(cast("list[object]", tools)) == len(expected_tools)
         and all(
             _is_text(item, expected)
-            for item, expected in zip(
-                cast("list[object]", tools), BOOTSTRAP_TOOL_INVENTORY, strict=True
-            )
+            for item, expected in zip(cast("list[object]", tools), expected_tools, strict=True)
         )
     )
 
@@ -367,7 +384,6 @@ def _capture_evidence_shape(value: object) -> bool:
 
 
 _SHAPES = {
-    BootstrapRead.SERVER_INFO: _server_info_shape,
     BootstrapRead.RUNTIME_CONFIG: _runtime_config_shape,
     BootstrapRead.CAPTURE_EVIDENCE: _capture_evidence_shape,
 }
@@ -399,6 +415,7 @@ def decode_bootstrap_reply(
     content: object,
     structured: object,
     config_present: bool,
+    inventory: BootstrapInventory = BootstrapInventory.LEGACY,
 ) -> dict[str, object] | None:
     """Validate one bootstrap reply against its closed grammar.
 
@@ -411,11 +428,12 @@ def decode_bootstrap_reply(
         content: The decoded ``content`` member, or :attr:`EnvelopeMember.ABSENT`.
         structured: The decoded ``structuredContent`` member, or ``ABSENT``.
         config_present: Whether C1 requested a present child configuration.
+        inventory: The exact inventory grammar; legacy unless explicitly selected.
 
     Returns:
         The validated result object, or ``None`` on any refusal.
     """
-    if is_error is not False:
+    if type(inventory) is not BootstrapInventory or is_error is not False:
         return None
     if read is BootstrapRead.CAPTURE_EVIDENCE:
         wrapper = _object(structured, frozenset({"result"}))
@@ -423,8 +441,14 @@ def decode_bootstrap_reply(
             return None
         structured = wrapper["result"]
     text_value = _single_text(content)
-    shape = _SHAPES[read]
-    if not shape(structured) or not shape(text_value) or not _same(structured, text_value):
+    if read is BootstrapRead.SERVER_INFO:
+        valid_shapes = _server_info_shape(structured, inventory=inventory) and _server_info_shape(
+            text_value, inventory=inventory
+        )
+    else:
+        shape = _SHAPES[read]
+        valid_shapes = shape(structured) and shape(text_value)
+    if not valid_shapes or not _same(structured, text_value):
         return None
     result = cast("dict[str, object]", structured)
     if read is BootstrapRead.RUNTIME_CONFIG and (result["config_source"] is not None) != (

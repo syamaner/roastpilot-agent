@@ -394,6 +394,7 @@ async def test_real_tick_preserves_protection_without_routine_evaluation(
     await h.turn(bean=195.9)
     assert h.controller.phase is phase
     assert h.commands == []
+    assert h.controller._history.curve_window() == []
     assert not advisor.contexts
     assert h.sink.advisor_decisions == []
     assert not evaluate.called

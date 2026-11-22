@@ -76,6 +76,7 @@ from pydantic import (
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
 from roastpilot_agent.human_bootstrap import (
     BOOTSTRAP_READ_ORDER,
+    BootstrapInventory,
     BootstrapRead,
     BootstrapRefusal,
     EnvelopeMember,
@@ -97,6 +98,11 @@ from roastpilot_agent.human_bootstrap import (
     decode_start_reply,
     start_arguments,
     valid_start_metadata,
+)
+from roastpilot_agent.human_pre_fc_permission import (
+    LeverReceipt,
+    MarkReceipt,
+    decode_private_receipt,
 )
 from roastpilot_agent.human_protection import (
     ContainmentOutcome,
@@ -1960,6 +1966,62 @@ class RoasterControlAdapter:
         await self._client.set_heat(heat_percent)
         await self._client.set_fan(fan_percent)
 
+    async def _private_pre_fc_call(
+        self, name: Literal["set_heat", "set_fan", "mark_first_crack"], value: int | None = None
+    ) -> LeverReceipt | MarkReceipt:
+        """Retain strict acknowledgements on the exact private started child."""
+        if type(name) is not str or name not in ("set_heat", "set_fan", "mark_first_crack"):
+            raise ValueError("private tool is unavailable")
+        if name == "mark_first_crack":
+            if value is not None:
+                raise ValueError("private mark takes no lever value")
+        elif type(value) is not int or not 0 <= value <= 100:
+            raise ValueError("private lever requires an exact percentage")
+        transport = self._fixed_zero_transport
+        session_id = self._started_session_id
+        if (
+            transport is None
+            or session_id is None
+            or self._started_child_epoch != transport.child_epoch
+            or transport._session is None  # pyright: ignore[reportPrivateUsage]
+        ):
+            raise MCPConnectionError("private command identity unavailable")
+        session = transport._session  # pyright: ignore[reportPrivateUsage]
+        snapshot = self._identity_snapshot()
+        arguments: dict[str, object] = {}
+        if name == "set_heat":
+            arguments = {"heat_level_percent": value}
+        elif name == "set_fan":
+            arguments = {"fan_level_percent": value}
+        async with asyncio.timeout(transport._config.call_timeout_seconds):  # pyright: ignore[reportPrivateUsage]
+            error, content, structured = await _call_strict_sdk(session, name, arguments)
+        if (
+            transport is not self._fixed_zero_transport
+            or session is not transport._session  # pyright: ignore[reportPrivateUsage]
+            or snapshot != self._identity_snapshot()
+        ):
+            raise MCPConnectionError("private command identity displaced")
+        raw = decode_private_receipt(name, error, content, structured, session_id, value)
+        if raw is None:
+            raise MCPConnectionError("private command acknowledgement invalid")
+        if name == "mark_first_crack":
+            typed = EventCommandResult.model_validate(raw)
+            return MarkReceipt(
+                session_id,
+                typed.event.monotonic_seconds,
+                typed.event_count,
+                typed.event.recorded_at_utc,
+                tuple(typed.event.payload.items()),
+            )
+        control = ControlCommandResult.model_validate(raw)
+        return LeverReceipt(
+            control.session_id,
+            control.phase,
+            control.heat_level_percent,
+            control.fan_level_percent,
+            control.cooling_on,
+        )
+
     async def set_heat(self, heat_percent: int) -> None:
         """Set heat as one arbiter-visible MCP command."""
         await self._client.set_heat(heat_percent)
@@ -3788,7 +3850,9 @@ class MCPServerProcess:
             and self.launch_record_for_epoch(epoch) is record
         )
 
-    async def _read_human_bootstrap(self) -> HumanBootstrapReadback:
+    async def _read_human_bootstrap(
+        self, *, inventory: BootstrapInventory = BootstrapInventory.LEGACY
+    ) -> HumanBootstrapReadback:
         """Strictly read back one HUMAN manual/mock bootstrap (#1078 C2a).
 
         The session, epoch and launch record are captured before the first
@@ -3796,7 +3860,9 @@ class MCPServerProcess:
         any displacement or refusal stops before the next read and never
         rebinds to a replacement. Each of the three reads is made once, in
         order, bounded by ``call_timeout_seconds`` and without the legacy
-        result parser or implicit discovery. Cancellation propagates.
+        result parser or implicit discovery. The T3a inventory additionally
+        requires explicit timing discovery on this child before any read.
+        Cancellation propagates.
 
         Returns:
             Bootstrap evidence (no control permission) or a value-free refusal.
@@ -3804,6 +3870,10 @@ class MCPServerProcess:
         self._start_proof = None
         self._bootstrap_read_generation += 1
         read_generation = self._bootstrap_read_generation
+        if type(inventory) is not BootstrapInventory:
+            return HumanBootstrapRefused(
+                BootstrapRefusal.INVALID_PAYLOAD, BootstrapRead.SERVER_INFO
+            )
         session = self._session
         epoch = self._child_epoch
         record = self.launch_record_for_epoch(epoch)
@@ -3812,6 +3882,11 @@ class MCPServerProcess:
             return framing
         # A framed record exists only for an attached session at this epoch.
         assert session is not None and record is not None
+        if (
+            inventory is BootstrapInventory.T3A_MANUAL_MOCK
+            and self.timing_evidence_discovery is not ToolDiscovery.DISCOVERED
+        ):
+            return HumanBootstrapRefused(BootstrapRefusal.READ_FAILED, BootstrapRead.SERVER_INFO)
         config_present = record.evidence.config_present
         results: list[dict[str, object]] = []
         for read in BOOTSTRAP_READ_ORDER:
@@ -3844,6 +3919,7 @@ class MCPServerProcess:
                 content=content,
                 structured=structured,
                 config_present=config_present,
+                inventory=inventory,
             )
             if result is None:
                 return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)

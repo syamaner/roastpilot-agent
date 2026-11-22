@@ -54,6 +54,17 @@ from roastpilot_agent.human_persistence import (
     current_storage_caller,
     storage_caller,
 )
+from roastpilot_agent.human_pre_fc_permission import (
+    LeverReceipt,
+    MarkClaim,
+    MarkReceipt,
+    PairOutcome,
+    PermitState,
+    PreFcPermission,
+    PrivateBinding,
+    canonical_mark_matches,
+    pre_mark_evidence,
+)
 from roastpilot_agent.human_protection import (
     HUMAN_PROTECTION_BT_C,
     AcceptedReadingTracker,
@@ -121,6 +132,7 @@ from roastpilot_agent.safety import (
     SafetyPolicy,
     SafetyVerdict,
 )
+from roastpilot_agent.timing_evidence import TimingEvidenceReadOutcome
 
 __all__ = [
     "AUTO_ADVICE_PHASES",
@@ -1819,6 +1831,7 @@ class RoastController:
         if _prepare_human_owner and authority is not ControlAuthority.HUMAN:
             raise ValueError("prepared ownership requires HUMAN authority")
         self._authority = authority
+        self._private_pre_fc: PreFcPermission | None = None
         self._human_reader = human_reader
         self._human_ownership = human_ownership or HumanRunOwnership()
         self._human_run = (
@@ -2502,6 +2515,8 @@ class RoastController:
             raise InvalidTransitionError(self._phase, target)
         previous = self._phase
         self._phase = target
+        if target not in _DETERMINISTIC_PRE_FC_PHASES and self._private_pre_fc is not None:
+            self._private_pre_fc.end()
         if target is RoastPhase.FAULTED:
             self._release_emergency_stop_transition_gate_if_safe()
         # Safety-review fix (post-B2, Opus finding, MEDIUM): ``_post_fc_engaged``
@@ -2780,6 +2795,8 @@ class RoastController:
 
     def admit_emergency_stop(self) -> int:
         """Fence outstanding advisory work before an emergency-stop attempt."""
+        if self._private_pre_fc is not None:
+            self._private_pre_fc.end()
         self._pending_fail_safe = None
         self._pending_fail_safe_is_emergency_stop_retry = False
         self._emergency_stop_transition_pending = True
@@ -2861,11 +2878,98 @@ class RoastController:
 
     def note_human_run_durably_closed(self) -> None:
         """Record durable local finalization without resolving unknown commands."""
+        if self._private_pre_fc is not None:
+            self._private_pre_fc.end()
         if self._human_run is not None:
             self._human_run.durably_closed = True
 
     def _routine_owner_admitted(self) -> bool:
         return self._human_run is None or self._human_run.admission is HumanRunAdmission.ADMITTED
+
+    def _grant_private_pre_fc(self, adapter: RoasterControlAdapter) -> None:
+        """Grant only from the service's final verified private Start settlement."""
+        run = self._human_run
+        child = adapter._fixed_zero_transport  # pyright: ignore[reportPrivateUsage]
+        session = None if child is None else child._session  # pyright: ignore[reportPrivateUsage]
+        identity = self._known_human_identity()
+        if (
+            self._private_pre_fc is not None
+            or run is None
+            or child is None
+            or session is None
+            or identity is None
+            or self._executor is not adapter
+            or run.admission is not HumanRunAdmission.SESSION_BOUND
+            or self._routine_inhibited
+            or self._protection_check_pending
+            or self._human_confirmed_start_generation != self._arbiter.generation
+        ):
+            raise RuntimeError("private pre-FC grant unavailable")
+        binding = PrivateBinding(
+            run,
+            adapter,
+            child,
+            session,
+            *identity,
+            adapter._identity_generation,  # pyright: ignore[reportPrivateUsage]
+            self._arbiter.generation,  # pyright: ignore[reportPrivateUsage]
+        )
+        permission = PreFcPermission(binding)
+        if not self._private_binding_current(binding):
+            raise RuntimeError("private pre-FC grant displaced")
+        self._private_pre_fc = permission
+
+    def _private_binding_current(self, binding: PrivateBinding) -> bool:
+        run = self._human_run
+        adapter = self._executor
+        if not isinstance(adapter, RoasterControlAdapter):
+            return False
+        child = adapter._fixed_zero_transport  # pyright: ignore[reportPrivateUsage]
+        return (
+            run is binding.run
+            and run is not None
+            and self._human_ownership.is_current(run)
+            and run.admission is HumanRunAdmission.SESSION_BOUND
+            and adapter is binding.adapter
+            and child is binding.child
+            and child is not None
+            and child._session is binding.sdk_session  # pyright: ignore[reportPrivateUsage]
+            and child.running
+            and not child.stop_unconfirmed
+            and child.child_epoch == binding.child_epoch
+            and adapter._identity_generation == binding.identity_generation  # pyright: ignore[reportPrivateUsage]
+            and adapter._started_session_id == binding.session_id  # pyright: ignore[reportPrivateUsage]
+            and adapter._started_child_epoch == binding.child_epoch  # pyright: ignore[reportPrivateUsage]
+            and self._known_human_identity() == (binding.session_id, binding.child_epoch)
+            and self._generation_is_current(binding.command_generation)
+            and not self._emergency_stop_transition_pending
+            and not self._arbiter.emergency_stop_active
+            and not self._arbiter.close_reservation_is_current(binding.command_generation)
+            and self._human_actuation_admitted()
+            and run.command is CommandDisposition.SETTLED
+            and run.endpoint is EndpointDisposition.NONE
+            and not run.durably_closed
+            and self._phase in _DETERMINISTIC_PRE_FC_PHASES
+        )
+
+    def _private_pre_fc_current(self, claim: MarkClaim | None = None) -> bool:
+        permission = self._private_pre_fc
+        if permission is None or permission.state is PermitState.ENDED:
+            return False
+        if not self._private_binding_current(permission.binding):
+            permission.end()
+            return False
+        if claim is None:
+            return permission.state is PermitState.ACTIVE
+        return permission.state is PermitState.MARK_RESERVED and permission.claim is claim
+
+    def _private_dispatch_current(self, claim: MarkClaim | None = None) -> bool:
+        return (
+            self._private_pre_fc_current(claim)
+            and not self._routine_inhibited
+            and not self._protection_check_pending
+            and self._accepted_readings.recheck() is ReadingFreshness.FRESH
+        )
 
     def _prepared_routine_permitted(
         self,
@@ -2874,12 +2978,22 @@ class RoastController:
         fault_cooling: bool,
         close_reservation: int | None,
         endpoint_owner: EndpointOwner | None = None,
+        private_mark_claim: MarkClaim | None = None,
     ) -> bool:
         # These intents never bypass the existing current-owner/settled-command checks.
         # Only the two policy-authorised FAULTED cooling origins supply fault_cooling.
         run = self._human_run
         return (
             self._routine_owner_admitted()
+            or (
+                write_class in (WriteClass.HEAT, WriteClass.FAN)
+                and self._private_dispatch_current()
+            )
+            or (
+                write_class is WriteClass.NON_HEAT
+                and private_mark_claim is not None
+                and self._private_dispatch_current(private_mark_claim)
+            )
             or (
                 run is not None
                 and run.admission is HumanRunAdmission.SESSION_BOUND
@@ -2989,6 +3103,7 @@ class RoastController:
         close_reservation: int | None = None,
         allow_emergency_stop_transition_for_heat_off: bool = False,
         _fault_cooling: bool = False,
+        _private_mark_claim: MarkClaim | None = None,
     ) -> tuple[bool, _ActuationT | None]:
         """Execute one routine write through the controller-owned arbiter."""
 
@@ -3008,6 +3123,7 @@ class RoastController:
                             fault_cooling=_fault_cooling,
                             close_reservation=close_reservation,
                             endpoint_owner=endpoint_owner,
+                            private_mark_claim=_private_mark_claim,
                         )
                         and self._human_routine_permitted(write_class, endpoint_owner)
                     )
@@ -3432,6 +3548,14 @@ class RoastController:
             and self._human_run.admission is HumanRunAdmission.SESSION_BOUND
         ):
             self._advisory_requested = False
+            if self._private_dispatch_current():
+                await self._apply_deterministic_pre_fc_levers(telemetry, generation=generation)
+                if (
+                    telemetry is not None
+                    and self._generation_is_current(generation)
+                    and self._private_dispatch_current()
+                ):
+                    self._record_curve_history(telemetry)
             return
         # D35 §3 (#222): pre-FC the controller deterministically sets heat/fan
         # from the policy — runs AFTER _apply_phase_rules so a tick that just
@@ -6895,6 +7019,11 @@ class RoastController:
             return False
         if generation is None:
             generation = self._arbiter.generation
+        if (
+            self._human_run is not None
+            and self._human_run.admission is HumanRunAdmission.SESSION_BOUND
+        ):
+            return await self._execute_private_pre_fc_targets(evaluation, generation=generation)
         try:
             dispatched = await self._set_targets(
                 heat_percent=evaluation.adjusted_heat,
@@ -6914,6 +7043,125 @@ class RoastController:
             {"heat_percent": evaluation.adjusted_heat, "fan_percent": evaluation.adjusted_fan},
         )
         return True
+
+    async def _execute_private_pre_fc_targets(
+        self, evaluation: SafetyEvaluation, *, generation: int
+    ) -> bool:
+        """Acknowledge each lever separately; never retry an entered uncertain call.
+
+        Return acknowledged heat for trim damping, including a withheld fan.
+        """
+        permission = self._private_pre_fc
+        adapter = self._executor
+        if (
+            permission is None
+            or not isinstance(adapter, RoasterControlAdapter)
+            or not self._private_dispatch_current()
+            or permission.binding.command_generation != generation
+        ):
+            return False
+        run = self._human_run
+        assert run is not None
+        permission.pair_outcome = PairOutcome.UNSENT
+        heat_confirmed = False
+        commands: tuple[tuple[Literal["set_heat", "set_fan"], int | None, WriteClass], ...] = (
+            ("set_heat", evaluation.adjusted_heat, WriteClass.HEAT),
+            ("set_fan", evaluation.adjusted_fan, WriteClass.FAN),
+        )
+        for name, value, write_class in commands:
+            assert value is not None
+            entered = False
+
+            async def operation(
+                name: Literal["set_heat", "set_fan"] = name, value: int = value
+            ) -> LeverReceipt:
+                nonlocal entered
+                entered = True
+                receipt = await adapter._private_pre_fc_call(name, value)  # pyright: ignore[reportPrivateUsage]
+                if not isinstance(receipt, LeverReceipt):
+                    raise RuntimeError("private lever acknowledgement unavailable")
+                return receipt
+
+            def unknown(name: str = name) -> None:
+                permission.pair_outcome = PairOutcome.UNKNOWN
+                if (
+                    self._human_run is run
+                    and self._human_ownership.is_current(run)
+                    and not run.durably_closed
+                ):
+                    # Emergency admission revokes dispatch authority, but cannot
+                    # resolve an entered command whose acknowledgement was lost.
+                    run.command = CommandDisposition.UNKNOWN
+                permission.end()
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {
+                        "command": name,
+                        "outcome": "unknown",
+                        "run_id": run.run_id,
+                        "session_id": permission.binding.session_id,
+                        "command_generation": generation,
+                        "child_epoch": permission.binding.child_epoch,
+                    },
+                )
+
+            try:
+                dispatched, receipt = await self._run_routine_write(
+                    generation,
+                    operation,
+                    write_class=write_class,
+                    admitted=self._private_dispatch_current,
+                )
+            except BaseException as exc:
+                acknowledged_heat_current = heat_confirmed and self._private_binding_current(
+                    permission.binding
+                )
+                try:
+                    if entered:
+                        unknown()
+                finally:
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise exc
+                if not isinstance(exc, Exception):
+                    raise
+                return acknowledged_heat_current
+            if not dispatched:
+                return heat_confirmed and self._private_binding_current(permission.binding)
+            assert receipt is not None
+            if write_class is WriteClass.HEAT:
+                permission.heat_receipt = receipt
+            else:
+                permission.fan_receipt = receipt
+            if not self._private_binding_current(permission.binding):
+                permission.pair_outcome = PairOutcome.DISPLACED
+                permission.end()
+                self._events.emit(
+                    RoastEventKind.COMMAND_FAILED,
+                    {
+                        "command": name,
+                        "outcome": "displaced",
+                        "run_id": run.run_id,
+                        "session_id": permission.binding.session_id,
+                        "acknowledged_value_percent": value,
+                    },
+                )
+                return False
+            if write_class is WriteClass.HEAT:
+                self._current_heat = value
+                trim = self._config.pre_first_crack_levers.late_maillard_trim
+                if trim.adaptive_depth_enabled and self._trim_latched:
+                    self._trim_depth_applied = value
+                heat_confirmed = True
+                permission.pair_outcome = PairOutcome.HEAT_CONFIRMED
+            else:
+                self._current_fan = value
+                permission.pair_outcome = PairOutcome.BOTH_CONFIRMED
+            self._last_command_monotonic = self._clock()
+            self._events.emit(
+                RoastEventKind.COMMAND_EXECUTED,
+                {"command": name, "value_percent": value, "run_id": run.run_id},
+            )
+        return heat_confirmed and self._private_binding_current(permission.binding)
 
     def restore_charge_clock(self, t0_detected_at_utc: str) -> None:
         """Restore the charge-referenced DTR clock after a restart (#235).
@@ -7172,6 +7420,9 @@ class RoastController:
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
+        if self._private_pre_fc is not None:
+            await self._operator_private_first_crack()
+            return
         if not self._routine_owner_admitted():
             return
         if self._human_run is not None and (
@@ -7224,6 +7475,120 @@ class RoastController:
             self._canonical_human_fc_confirmed = True
         self._events.emit(RoastEventKind.FIRST_CRACK, event_payload)
         self.transition_to(RoastPhase.DEVELOPMENT)
+
+    async def _operator_private_first_crack(self) -> None:
+        """Consume one mark claim and promote only its matching canonical read."""
+        permission = self._private_pre_fc
+        adapter = self._executor
+        assert permission is not None
+        if not isinstance(adapter, RoasterControlAdapter) or not self._private_dispatch_current():
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {
+                    "command": RoastCommand.MARK_FIRST_CRACK.value,
+                    "diagnostic_only": True,
+                    "source": RoastEventSource.OPERATOR.value,
+                    "outcome": "recorded_as_note",
+                    "session_id": permission.binding.session_id,
+                },
+            )
+            return
+        phase = self._safety.evaluate_command_phase(
+            command=RoastCommand.MARK_FIRST_CRACK, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase)
+        if phase.verdict is not SafetyVerdict.ALLOW or not self._private_dispatch_current():
+            return
+        source = self._safety.evaluate_event_source(
+            transition="first_crack", source=RoastEventSource.OPERATOR
+        )
+        await self._snapshots.persist_evaluation(source)
+        if (
+            source.verdict is not SafetyVerdict.ALLOW
+            or not self._private_dispatch_current()
+            or self._phase is not RoastPhase.ROASTING_PRE_FIRST_CRACK
+        ):
+            return
+        claim = permission.reserve_mark()
+        if claim is None:
+            return
+        entered = False
+        outcome = "withheld"
+        cancelled: asyncio.CancelledError | None = None
+
+        def current() -> bool:
+            return (
+                self._private_dispatch_current(claim)
+                and self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            )
+
+        async def operation() -> MarkReceipt:
+            nonlocal entered
+            entered = True
+            result = await adapter._private_pre_fc_call("mark_first_crack")  # pyright: ignore[reportPrivateUsage]
+            if not isinstance(result, MarkReceipt):
+                raise RuntimeError("private mark acknowledgement unavailable")
+            return result
+
+        try:
+            before = await adapter.read_timing_evidence()
+            if (
+                not current()
+                or before.outcome is not TimingEvidenceReadOutcome.EVIDENCE
+                or before.record is None
+                or not pre_mark_evidence(before.record, permission.binding)
+            ):
+                return
+            dispatched, receipt = await self._run_routine_write(
+                permission.binding.command_generation,
+                operation,
+                write_class=WriteClass.NON_HEAT,
+                admitted=current,
+                _private_mark_claim=claim,
+            )
+            if entered:
+                outcome = "unresolved"
+            if not dispatched or receipt is None or not current():
+                return
+            after = await adapter.read_timing_evidence()
+            if (
+                not current()
+                or after.outcome is not TimingEvidenceReadOutcome.EVIDENCE
+                or after.record is None
+                or not canonical_mark_matches(
+                    before.record, after.record, receipt, permission.binding
+                )
+            ):
+                return
+            self._canonical_human_fc_confirmed = True
+            self.transition_to(RoastPhase.DEVELOPMENT)
+            outcome = "canonical"
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            outcome = "unresolved" if entered else "withheld"
+            raise
+        except Exception:
+            outcome = "unresolved" if entered else "withheld"
+        finally:
+            permission.end()
+            try:
+                payload: dict[str, object] = {
+                    "source": RoastEventSource.OPERATOR.value,
+                    "outcome": outcome,
+                    "session_id": permission.binding.session_id,
+                }
+                if outcome != "canonical":
+                    payload["command"] = RoastCommand.MARK_FIRST_CRACK.value
+                    payload["diagnostic_only"] = True
+                self._events.emit(
+                    RoastEventKind.FIRST_CRACK
+                    if outcome == "canonical"
+                    else RoastEventKind.COMMAND_FAILED,
+                    payload,
+                )
+            finally:
+                if cancelled is not None:
+                    raise cancelled
 
     async def operator_drop_beans(self) -> None:
         """Operator drop: matrix-validated, executed, then cooling — EXCEPT from

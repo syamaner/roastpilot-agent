@@ -1,5 +1,22 @@
 # E11 — Packaging
 
+**22 Nov 2026 — #1111 T3a review repair (private mock-only caller):**
+The private service opt-in remains bound to exact mock producer
+`39de5634bc454e546234998a4f6c2e0f7ad4dd21`. An entered heat or fan call
+with a lost reply records UNKNOWN on its exact current, non-closed run even
+after independent emergency admission; replacement and closed ownership are
+untouched. No routine lever is sent after a mark disposition or actuator
+UNKNOWN. The mock can hold its last acknowledged pre-FC heat until an
+independently eligible action; UNKNOWN withholds protective/fault Drop and
+containment while independent emergency eligibility remains.
+T3b recipe Drop, #248 emergency preemption during a held mark, and #256 staged
+Hottop Start are separate work. Any later runner/observer change needs its own
+combined evidence against the exact producer. Completion remains conditional
+on protected delivery, lead-owned full native and protected stdio proof, and
+independent review. This synthetic software repair makes no live-readiness
+claim; #954 and E11-S3 remain open.
+
+
 **5 Nov 2026 — #1069 software-only diagnostic retention:** the normal MCP
 mirror, existing raw-state persistence, existing detail/SSE projection and SPA
 type contract retain four first-crack inference diagnostics as values or
@@ -202,6 +219,7 @@ cold run.
 | D230 A2 (#1077) | Bounded HUMAN run history and current-run durability disclosure | software complete on protected merge; next-roast acceptance and target-hardware qualification remain open |
 | D238 T1 (#1095) | Pure conservative HUMAN recipe timing evaluator | software complete on protected merge; producer qualification, controller integration and physical validation remain open |
 | D238 T2 (#1105) | Read-only consumer of synthetic P1 timing evidence | software complete on protected merge; no caller, producer/physical qualification and T3 remain open |
+| D238 T3a (#1111) | Private manual/mock pre-FC path and exact opt-in bootstrap inventory | software completion conditional on verified protected merge; combined focused proof passed; protected producer witness and full gate remain lead-owned and are not claimed here; physical, deployment, routine Drop, held-mark emergency and winter qualification work remain open |
 
 Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is in progress.**
 The **operator manual tests** (D28) are
