@@ -277,6 +277,100 @@ async def test_mock_start_route_refuses_simulation_inventory() -> None:
 
 
 @pytest.mark.asyncio
+async def test_synchronous_decoder_retirement_prevents_next_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retirement during strict decoding refuses before the next SDK request."""
+    owner = _owner()
+    calls: list[BootstrapRead] = []
+    decoded: list[dict[str, object]] = []
+
+    async def read(_session: object, kind: BootstrapRead) -> tuple[object, object, object]:
+        calls.append(kind)
+        return _members(kind, _payload(kind))
+
+    def retire_after_decode(
+        kind: BootstrapRead,
+        *,
+        is_error: object,
+        content: object,
+        structured: object,
+        config_present: bool,
+        inventory: BootstrapInventory | HottopSimulationInventory,
+    ) -> dict[str, object] | None:
+        result = decode_bootstrap_reply(
+            kind,
+            is_error=is_error,
+            content=content,
+            structured=structured,
+            config_present=config_present,
+            inventory=inventory,
+        )
+        assert result is not None
+        assert result == _payload(BootstrapRead.SERVER_INFO)
+        decoded.append(result)
+        owner._invalidate()
+        return result
+
+    monkeypatch.setattr(mcp_client, "_call_bootstrap_sdk", read)
+    monkeypatch.setattr(mcp_client, "decode_bootstrap_reply", retire_after_decode)
+    result = await owner.read()
+    assert isinstance(result, HumanBootstrapRefused)
+    assert result.reason is BootstrapRefusal.DISPLACED_FRAMING
+    assert result.read is BootstrapRead.RUNTIME_CONFIG
+    assert calls == [BootstrapRead.SERVER_INFO]
+    assert decoded == [_payload(BootstrapRead.SERVER_INFO)]
+
+
+@pytest.mark.asyncio
+async def test_foreign_composition_refuses_before_server_or_sdk_creation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A constructor returning a foreign object cannot enter the SDK lifetime."""
+    from types import SimpleNamespace
+
+    calls: list[str] = []
+
+    class ForeignComposition:
+        """Synthetic constructor which violates the producer's exact type."""
+
+        def __new__(cls, **_kwargs: object) -> object:
+            """Return a foreign value before any server can be constructed."""
+            calls.append("composition")
+            return object()
+
+    def forbidden_entry(**_kwargs: object) -> object:
+        calls.append("server_or_sdk")
+        pytest.fail("foreign composition reached server or SDK creation")
+
+    modules = {
+        "coffee_roaster_mcp.hottop_simulation": SimpleNamespace(
+            HottopSimulationComposition=ForeignComposition
+        ),
+        "coffee_roaster_mcp.mcp_server": SimpleNamespace(
+            create_hottop_simulation_mcp_server=forbidden_entry
+        ),
+        "mcp.shared.memory": SimpleNamespace(
+            create_connected_server_and_client_session=forbidden_entry
+        ),
+    }
+    original_import = importlib.import_module
+
+    def module_import(name: str) -> object:
+        return modules[name] if name in modules else original_import(name)
+
+    monkeypatch.setattr(importlib, "import_module", module_import)
+    with pytest.raises(TypeError, match="Simulation composition identity is invalid"):
+        async with mcp_client.hottop_simulation_bootstrap(
+            config_path=Path("unused.yaml"),
+            clock=lambda: 0.0,
+            receipt_age_bound_seconds=1.0,
+        ):
+            pytest.fail("foreign composition admitted")
+    assert calls == ["composition"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("bound", [0.0, -1.0, float("inf"), float("nan"), True])
 async def test_invalid_bounds_refuse_before_optional_producer_import(bound: float) -> None:
     """Nonpositive, nonfinite and coercible bounds never enter a producer context."""
