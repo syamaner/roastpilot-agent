@@ -12,6 +12,7 @@ from mcp.types import CallToolResult, ListToolsResult, TextContent, Tool
 from test_exact_drop_reply import IDENTITY, ROWS, payload
 from test_timing_evidence_consumer import Session, golden, internal, reply, schema
 
+import roastpilot_agent.mcp_client as mcp_client
 from roastpilot_agent.config import MCPConfig
 from roastpilot_agent.exact_drop_reply import ExactDropDisposition as D
 from roastpilot_agent.exact_drop_reply import ExactDropIdentity
@@ -105,6 +106,7 @@ async def dispatch(adapter: RoasterControlAdapter, identity: ExactDropIdentity =
         "malformed-properties",
         "malformed-inventory",
         "malformed-tools",
+        "malformed-tools-container",
         "malformed-drop",
         "malformed-timing",
         "description-only-extra",
@@ -159,6 +161,8 @@ async def test_discovery_is_independent_and_terminal(case: str) -> None:
         inv = {"tools": []}
     elif case == "malformed-tools":
         inv = ListToolsResult.model_construct(tools=[None])
+    elif case == "malformed-tools-container":
+        inv = ListToolsResult.model_construct(tools=tuple(inventory().tools))
     elif case == "malformed-drop":
         inv.tools[-1] = Tool.model_construct(name="drop_beans_exact_session", inputSchema=None)
     elif case == "malformed-timing":
@@ -175,6 +179,7 @@ async def test_discovery_is_independent_and_terminal(case: str) -> None:
         "paginated",
         "malformed-inventory",
         "malformed-tools",
+        "malformed-tools-container",
         "malformed-drop",
         "malformed-timing",
     ):
@@ -365,16 +370,26 @@ async def test_in_flight_attribution_and_cancellation(change: str) -> None:
 
 
 def test_application_caller_absence() -> None:
-    for path in Path("src").rglob("*.py"):
+    """Keep the private declaration unique and unused throughout application source."""
+    module_path = Path(mcp_client.__file__).resolve()
+    source_paths = set(module_path.parent.rglob("*.py"))
+    assert module_path.name == "mcp_client.py"
+    assert module_path in source_paths
+    declarations: list[tuple[Path, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    private_name = "_drop_beans_exact_session"
+    for path in sorted(source_paths):
         tree = ast.parse(path.read_text())
-        assert not [
-            node
-            for node in ast.walk(tree)
-            if isinstance(node, ast.Call)
-            and (
-                isinstance(node.func, ast.Attribute)
-                and node.func.attr == "_drop_beans_exact_session"
-                or isinstance(node.func, ast.Name)
-                and node.func.id == "_drop_beans_exact_session"
-            )
-        ], path
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                if node.name == private_name:
+                    declarations.append((path, node))
+            elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+                assert node.attr != private_name, (path, node.lineno)
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                assert node.id != private_name, (path, node.lineno)
+            elif isinstance(node, ast.Constant):
+                assert node.value != private_name, (path, node.lineno)
+    assert len(declarations) == 1
+    declaration_path, declaration = declarations[0]
+    assert declaration_path == module_path
+    assert isinstance(declaration, ast.AsyncFunctionDef)
