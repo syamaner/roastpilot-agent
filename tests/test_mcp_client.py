@@ -6741,6 +6741,7 @@ def test_c2b_private_start_has_no_production_caller() -> None:
     assert strict_references == [
         ("mcp_client.py", "_call_bootstrap_sdk"),
         ("mcp_client.py", "_private_pre_fc_call"),
+        ("mcp_client.py", "_drop_beans_exact_session"),
         ("mcp_client.py", "_read_timing_evidence"),
         ("mcp_client.py", "_run_human_start"),
         ("mcp_client.py", "_run_human_start"),
