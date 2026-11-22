@@ -7483,8 +7483,13 @@ class RoastController:
         assert permission is not None
         if not isinstance(adapter, RoasterControlAdapter) or not self._private_dispatch_current():
             self._events.emit(
-                RoastEventKind.FIRST_CRACK,
-                {"source": RoastEventSource.OPERATOR.value, "outcome": "recorded_as_note"},
+                RoastEventKind.COMMAND_FAILED,
+                {
+                    "action": "mark_first_crack",
+                    "source": RoastEventSource.OPERATOR.value,
+                    "outcome": "recorded_as_note",
+                    "session_id": permission.binding.session_id,
+                },
             )
             return
         phase = self._safety.evaluate_command_phase(
@@ -7566,13 +7571,18 @@ class RoastController:
         finally:
             permission.end()
             try:
+                payload: dict[str, object] = {
+                    "source": RoastEventSource.OPERATOR.value,
+                    "outcome": outcome,
+                    "session_id": permission.binding.session_id,
+                }
+                if outcome != "canonical":
+                    payload["action"] = "mark_first_crack"
                 self._events.emit(
-                    RoastEventKind.FIRST_CRACK,
-                    {
-                        "source": RoastEventSource.OPERATOR.value,
-                        "outcome": outcome,
-                        "session_id": permission.binding.session_id,
-                    },
+                    RoastEventKind.FIRST_CRACK
+                    if outcome == "canonical"
+                    else RoastEventKind.COMMAND_FAILED,
+                    payload,
                 )
             finally:
                 if cancelled is not None:

@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.types import CallToolResult, ListToolsResult, Tool
 
-from roastpilot_agent.api import RoastRunConflictError, RoastService
+from roastpilot_agent.api import QueuedOperatorAction, RoastRunConflictError, RoastService
 from roastpilot_agent.human_bootstrap import BOOTSTRAP_TOOL_INVENTORY, BootstrapRead
 from roastpilot_agent.human_pre_fc_permission import (
     LeverReceipt,
@@ -22,6 +22,8 @@ from roastpilot_agent.human_pre_fc_permission import (
 from roastpilot_agent.human_protection import (
     CommandDisposition,
     ControlAuthority,
+    CounterClass,
+    CounterEvidence,
     EndpointDisposition,
     ToolDiscovery,
     WriteClass,
@@ -29,6 +31,7 @@ from roastpilot_agent.human_protection import (
 from roastpilot_agent.human_run_ownership import AdmissionCloseReason
 from roastpilot_agent.mcp_client import MCPConnectionError, RoasterControlAdapter
 from roastpilot_agent.models import (
+    OperatorAction,
     RestartClearanceRequest,
     RoastEventKind,
     RoastEventSource,
@@ -465,8 +468,13 @@ async def test_queued_mark_is_withheld_before_operation_entry(
     assert h.controller._private_pre_fc is not None
     assert h.controller._private_pre_fc.state is PermitState.ENDED
     assert h.emitter.events[-1] == (
-        RoastEventKind.FIRST_CRACK,
-        {"source": "operator", "outcome": "withheld", "session_id": "a" * 32},
+        RoastEventKind.COMMAND_FAILED,
+        {
+            "action": "mark_first_crack",
+            "source": "operator",
+            "outcome": "withheld",
+            "session_id": "a" * 32,
+        },
     )
 
 
@@ -534,8 +542,13 @@ async def test_wrong_typed_adapter_acknowledgement_is_scoped_uncertainty(
         )
     else:
         assert h.emitter.events[-1] == (
-            RoastEventKind.FIRST_CRACK,
-            {"source": "operator", "outcome": "unresolved", "session_id": "a" * 32},
+            RoastEventKind.COMMAND_FAILED,
+            {
+                "action": "mark_first_crack",
+                "source": "operator",
+                "outcome": "unresolved",
+                "session_id": "a" * 32,
+            },
         )
     await h.controller.operator_mark_first_crack()
     assert not await h.controller._execute_targets(evaluation())
@@ -574,8 +587,13 @@ async def test_entered_mark_completion_cannot_advance_replacement_owner(
     assert h.controller._private_pre_fc is not None
     assert h.controller._private_pre_fc.state is PermitState.ENDED
     assert h.emitter.events[-1] == (
-        RoastEventKind.FIRST_CRACK,
-        {"source": "operator", "outcome": "unresolved", "session_id": "a" * 32},
+        RoastEventKind.COMMAND_FAILED,
+        {
+            "action": "mark_first_crack",
+            "source": "operator",
+            "outcome": "unresolved",
+            "session_id": "a" * 32,
+        },
     )
 
 
@@ -708,6 +726,7 @@ async def test_mark_doubt_ends_permit_without_actuator_unknown(
     await h.controller.operator_mark_first_crack()
     assert len(double.calls) <= 1
     assert not await h.controller._execute_targets(evaluation())
+    assert all(kind is not RoastEventKind.FIRST_CRACK for kind, _ in h.emitter.events)
 
 
 async def test_emergency_while_post_read_held_fences_late_transition(
@@ -1009,8 +1028,13 @@ async def test_inclusive_protection_after_mark_disposition(
         await h.controller.operator_mark_first_crack()
     if mark in ("withheld", "unresolved"):
         assert (
-            RoastEventKind.FIRST_CRACK,
-            {"source": "operator", "outcome": mark, "session_id": "a" * 32},
+            RoastEventKind.COMMAND_FAILED,
+            {
+                "action": "mark_first_crack",
+                "source": "operator",
+                "outcome": mark,
+                "session_id": "a" * 32,
+            },
         ) in h.emitter.events
     await h.turn(bean=180, t0=True)
     lever_sends = sends(double)
@@ -1047,6 +1071,82 @@ async def test_inclusive_protection_after_mark_disposition(
         assert h.commands == ["drop_beans"]
         assert h.controller.phase is RoastPhase.COOLING
     assert await h.controller.operator_emergency_stop()
+
+
+@pytest.mark.parametrize("outcome", ["withheld", "unresolved", "canonical"])
+async def test_private_mark_persisted_landmark_and_dispatch_projection(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    """Persist actual controller events through the runner and SQLite history."""
+    service, double = fixture
+    await enable_discovery(monkeypatch, double)
+    detail = await service._start_mock_human_roast(PROFILE, pre_fc_mock=True)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    controller._t0_confirmed = True
+    assert service._mcp is not None
+    for status in (1, 2):
+        controller._accepted_readings.observe(
+            child_epoch=service._mcp.child_epoch,
+            counters=CounterEvidence(status, 0, CounterClass.PRESENT),
+            bean_temp_c=180,
+            env_temp_c=200,
+            request_admitted_at=service._clock(),
+        )
+    assert controller._private_dispatch_current()
+    read = AsyncMock(
+        side_effect=[
+            TimingEvidenceRead(TimingEvidenceReadOutcome.NOT_ATTEMPTED)
+            if outcome == "withheld"
+            else TimingEvidenceRead(TimingEvidenceReadOutcome.EVIDENCE, record=timing()),
+            TimingEvidenceRead(TimingEvidenceReadOutcome.EVIDENCE, record=timing(post=True)),
+        ]
+    )
+    monkeypatch.setattr(service._roaster, "read_timing_evidence", read)
+    double.replies["mark_first_crack"] = (
+        RuntimeError("lost") if outcome == "unresolved" else _hs_raw(mark_receipt())
+    )
+    double.calls.clear()
+    item = QueuedOperatorAction(run_id=detail.id, action=OperatorAction.MARK_FIRST_CRACK)
+    levers = (controller._current_heat, controller._current_fan)
+    await runner._dispatch(item)
+    await runner._dispatch(item)  # A duplicate is diagnostic only.
+    assert await runner._flush_events()
+    timeline = await service._store.read_timeline(detail.id)
+    (summary,) = await service._store.list_runs()
+    landmarks = [event for event in timeline.events if event.kind is RoastEventKind.FIRST_CRACK]
+    diagnostics = [
+        event for event in timeline.events if event.kind is RoastEventKind.COMMAND_FAILED
+    ]
+    assert len(landmarks) == (1 if outcome == "canonical" else 0)
+    assert (summary.first_crack_at_utc is not None) is (outcome == "canonical")
+    if landmarks:
+        assert landmarks[0].source is RoastEventSource.OPERATOR
+        assert landmarks[0].payload == {
+            "source": "operator",
+            "outcome": "canonical",
+            "session_id": "a" * 32,
+        }
+    for event in diagnostics:
+        assert event.source is RoastEventSource.OPERATOR
+        assert event.payload is not None
+        assert event.payload["action"] == "mark_first_crack"
+        assert "command" not in event.payload
+    assert len(diagnostics) == (1 if outcome == "canonical" else 2)
+    assert timeline.commands == []
+    assert sends(double) == ([] if outcome == "withheld" else ["mark_first_crack"])
+    assert read.await_count == (2 if outcome == "canonical" else 1)
+    assert controller.phase is (
+        RoastPhase.DEVELOPMENT if outcome == "canonical" else RoastPhase.ROASTING_PRE_FIRST_CRACK
+    )
+    assert not await controller._execute_targets(evaluation())
+    assert (controller._current_heat, controller._current_fan) == levers
+    assert sends(double) == ([] if outcome == "withheld" else ["mark_first_crack"])
 
 
 async def enable_discovery(monkeypatch: pytest.MonkeyPatch, double: _BootstrapDouble) -> AsyncMock:
@@ -1430,14 +1530,28 @@ async def test_concurrent_mark_during_preread_has_one_claim(
     claim = permission.claim
     await h.controller.operator_mark_first_crack()
     assert permission.claim is claim and read.await_count == 1 and sends(double) == []
+    assert all(kind is not RoastEventKind.FIRST_CRACK for kind, _ in h.emitter.events)
     assert h.emitter.events[-1] == (
-        RoastEventKind.FIRST_CRACK,
-        {"source": "operator", "outcome": "recorded_as_note"},
+        RoastEventKind.COMMAND_FAILED,
+        {
+            "action": "mark_first_crack",
+            "source": "operator",
+            "outcome": "recorded_as_note",
+            "session_id": "a" * 32,
+        },
     )
     release.set()
     await first
     assert read.await_count == 2 and sends(double) == ["mark_first_crack"]
     assert h.controller._canonical_human_fc_confirmed
+    assert [
+        payload for kind, payload in h.emitter.events if kind is RoastEventKind.FIRST_CRACK
+    ] == [{"source": "operator", "outcome": "canonical", "session_id": "a" * 32}]
+    assert h.controller.phase is RoastPhase.DEVELOPMENT
+    levers = (h.controller._current_heat, h.controller._current_fan)
+    assert not await h.controller._execute_targets(evaluation())
+    assert (h.controller._current_heat, h.controller._current_fan) == levers
+    assert read.await_count == 2 and sends(double) == ["mark_first_crack"]
 
 
 async def test_unclaimed_non_heat_cannot_send_mark(monkeypatch: pytest.MonkeyPatch) -> None:
