@@ -1,4 +1,4 @@
-"""Pure strict readback grammar for a HUMAN manual/mock bootstrap (#1078 C2a).
+"""Pure strict HUMAN mock and explicitly composed Hottop simulation readback.
 
 This domain module owns the closed grammar of the three bootstrap reads a
 HUMAN (manual/mock) child must answer after attach (``get_server_info``,
@@ -13,7 +13,9 @@ envelope member here unchanged.
 
 Evidence is bootstrap readback only: the child *reported* manual authority,
 the mock driver, audio mode, Celsius units, override permission and its
-configured capture predicate.  It is not executable identity, measured
+configured capture predicate. A separately selected Hottop simulation grammar
+reports its closed synthetic identity and grants the same read-only evidence.
+It is not executable identity, measured
 audio, physical sensor units, recording readiness or Start admission, and it
 grants no control permission.  The JSON text bound applies to the
 independent text decoder here, not to transport frames, and this grammar
@@ -42,7 +44,7 @@ MAX_BOOTSTRAP_TEXT_CODE_POINTS = 16_384
 #: The capture-evidence request protocol and intent (also echoed in the reply).
 CAPTURE_EVIDENCE_PROTOCOL = "capture_evidence/v1"
 CAPTURE_EVIDENCE_INTENT = "bootstrap"
-#: The only admitted capture-evidence capability.
+#: The legacy mock grammar's capture-evidence capability.
 MANUAL_MOCK_CAPTURE = "manual_mock_capture"
 
 #: The bound producer's exact ordered bootstrap tool inventory.  Neither this
@@ -71,6 +73,12 @@ class BootstrapInventory(Enum):
 
     LEGACY = "legacy"
     T3A_MANUAL_MOCK = "t3a_manual_mock"
+
+
+class HottopSimulationInventory(Enum):
+    """Separately selected simulation grammar, ineligible for the mock issuer."""
+
+    BOOTSTRAP = "hottop_simulation"
 
 
 _T3A_MANUAL_MOCK_TOOL_INVENTORY = (
@@ -335,7 +343,9 @@ _CAPTURE_EVIDENCE = {
 _CAPTURE_KEYS = frozenset(_CAPTURE_EVIDENCE)
 
 
-def _server_info_shape(value: object, *, inventory: BootstrapInventory) -> bool:
+def _server_info_shape(
+    value: object, *, inventory: BootstrapInventory | HottopSimulationInventory
+) -> bool:
     data = _object(value, _SERVER_KEYS)
     if data is None:
         return False
@@ -345,8 +355,11 @@ def _server_info_shape(value: object, *, inventory: BootstrapInventory) -> bool:
         if inventory is BootstrapInventory.LEGACY
         else _T3A_MANUAL_MOCK_TOOL_INVENTORY
     )
+    constants = dict(_SERVER_CONSTANTS)
+    if inventory is HottopSimulationInventory.BOOTSTRAP:
+        constants["roaster_driver"] = "hottop_kn8828b_2k_plus"
     return (
-        all(_is_text(data[key], expected) for key, expected in _SERVER_CONSTANTS.items())
+        all(_is_text(data[key], expected) for key, expected in constants.items())
         and data["bootstrap_safe"] is False
         and _nonempty_text(data["version"])
         and _nonempty_text(data["started_at_utc"])
@@ -359,13 +372,23 @@ def _server_info_shape(value: object, *, inventory: BootstrapInventory) -> bool:
     )
 
 
-def _runtime_config_shape(value: object) -> bool:
+def _runtime_config_shape(
+    value: object,
+    *,
+    inventory: BootstrapInventory | HottopSimulationInventory = BootstrapInventory.LEGACY,
+) -> bool:
     data = _object(value, _RUNTIME_KEYS)
     if data is None:
         return False
     baudrate = data["roaster_baudrate"]
+    constants = dict(_RUNTIME_CONSTANTS)
+    port_valid = True
+    if inventory is HottopSimulationInventory.BOOTSTRAP:
+        constants["roaster_driver"] = "hottop_kn8828b_2k_plus"
+        port_valid = data["roaster_port"] == "in-memory://hottop-kn8828b-2k-plus"
     return (
-        all(_is_text(data[key], expected) for key, expected in _RUNTIME_CONSTANTS.items())
+        port_valid
+        and all(_is_text(data[key], expected) for key, expected in constants.items())
         and data["allow_manual_override"] is True
         and all(_optional_text(data[key]) for key in _RUNTIME_OPTIONAL_TEXT)
         and all(_finite_number(data[key]) for key in _RUNTIME_NUMBERS)
@@ -376,17 +399,18 @@ def _runtime_config_shape(value: object) -> bool:
     )
 
 
-def _capture_evidence_shape(value: object) -> bool:
+def _capture_evidence_shape(
+    value: object,
+    *,
+    inventory: BootstrapInventory | HottopSimulationInventory = BootstrapInventory.LEGACY,
+) -> bool:
     data = _object(value, _CAPTURE_KEYS)
+    constants = dict(_CAPTURE_EVIDENCE)
+    if inventory is HottopSimulationInventory.BOOTSTRAP:
+        constants["capability"] = "manual_hottop_simulation_capture"
     return data is not None and all(
-        _is_text(data[key], expected) for key, expected in _CAPTURE_EVIDENCE.items()
+        _is_text(data[key], expected) for key, expected in constants.items()
     )
-
-
-_SHAPES = {
-    BootstrapRead.RUNTIME_CONFIG: _runtime_config_shape,
-    BootstrapRead.CAPTURE_EVIDENCE: _capture_evidence_shape,
-}
 
 
 def _same(left: object, right: object) -> bool:
@@ -415,7 +439,7 @@ def decode_bootstrap_reply(
     content: object,
     structured: object,
     config_present: bool,
-    inventory: BootstrapInventory = BootstrapInventory.LEGACY,
+    inventory: BootstrapInventory | HottopSimulationInventory = BootstrapInventory.LEGACY,
 ) -> dict[str, object] | None:
     """Validate one bootstrap reply against its closed grammar.
 
@@ -433,7 +457,10 @@ def decode_bootstrap_reply(
     Returns:
         The validated result object, or ``None`` on any refusal.
     """
-    if type(inventory) is not BootstrapInventory or is_error is not False:
+    if (
+        type(inventory) not in (BootstrapInventory, HottopSimulationInventory)
+        or is_error is not False
+    ):
         return None
     if read is BootstrapRead.CAPTURE_EVIDENCE:
         wrapper = _object(structured, frozenset({"result"}))
@@ -445,9 +472,14 @@ def decode_bootstrap_reply(
         valid_shapes = _server_info_shape(structured, inventory=inventory) and _server_info_shape(
             text_value, inventory=inventory
         )
+    elif read is BootstrapRead.RUNTIME_CONFIG:
+        valid_shapes = _runtime_config_shape(
+            structured, inventory=inventory
+        ) and _runtime_config_shape(text_value, inventory=inventory)
     else:
-        shape = _SHAPES[read]
-        valid_shapes = shape(structured) and shape(text_value)
+        valid_shapes = _capture_evidence_shape(
+            structured, inventory=inventory
+        ) and _capture_evidence_shape(text_value, inventory=inventory)
     if not valid_shapes or not _same(structured, text_value):
         return None
     result = cast("dict[str, object]", structured)

@@ -33,6 +33,7 @@ passed through from MCP, never recomputed.
 
 import asyncio
 import contextlib
+import importlib
 import inspect
 import json
 import logging
@@ -48,6 +49,7 @@ import time
 from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, Protocol, TypeVar, cast, runtime_checkable
 
@@ -87,6 +89,7 @@ from roastpilot_agent.human_bootstrap import (
     BootstrapRead,
     BootstrapRefusal,
     EnvelopeMember,
+    HottopSimulationInventory,
     HumanBootstrapEvidence,
     HumanBootstrapReadback,
     HumanBootstrapRefused,
@@ -129,6 +132,7 @@ from roastpilot_agent.launch_composition import (
     ChildConfigRead,
     ChildConfigSelection,
     ConfigReadStatus,
+    HottopSimulationLaunchRecord,
     LaunchEvidence,
     LaunchProofStatus,
     LaunchRecord,
@@ -2836,6 +2840,168 @@ async def _call_strict_sdk(
         EnvelopeMember.ABSENT if raw.structuredContent is None else raw.structuredContent
     )
     return raw.isError, blocks, structured
+
+
+_SIMULATION_FACTORY_SEAL = object()
+
+
+class HottopSimulationBootstrap:
+    """Read-only bootstrap of one locally composed Hottop simulation.
+
+    The repository-owned factory is the sole supported constructor. This owner
+    deliberately exposes no general SDK caller, Start claim or actuator method.
+    """
+
+    __slots__ = (
+        "_session",
+        "_record",
+        "_composition_identity",
+        "_call_timeout_seconds",
+        "_read_generation",
+    )
+
+    def __init__(
+        self,
+        *,
+        seal: object,
+        session: ClientSession,
+        record: HottopSimulationLaunchRecord,
+        call_timeout_seconds: float,
+    ) -> None:
+        """Bind a factory-created session and immutable launch identity.
+
+        Args:
+            seal: Private composition-root issuer identity.
+            session: Exact SDK object owned by the factory context.
+            record: Immutable local composition record.
+            call_timeout_seconds: Bound for each read.
+
+        Raises:
+            TypeError: If the constructor did not receive the factory's seal.
+        """
+        if (
+            seal is not _SIMULATION_FACTORY_SEAL
+            or type(record) is not HottopSimulationLaunchRecord
+            or type(session) is not ClientSession
+        ):
+            raise TypeError("Simulation bootstrap requires its composition root")
+        self._session: ClientSession | None = session
+        self._record = record
+        self._composition_identity: object | None = record.composition_identity
+        self._call_timeout_seconds = call_timeout_seconds
+        self._read_generation = 0
+
+    def _current(
+        self, session: ClientSession, record: HottopSimulationLaunchRecord, generation: int
+    ) -> bool:
+        return (
+            type(self) is HottopSimulationBootstrap
+            and self._session is session
+            and self._record is record
+            and self._composition_identity is record.composition_identity
+            and record.child_epoch == 1
+            and self._read_generation == generation
+        )
+
+    def _invalidate(self) -> None:
+        self._session = None
+        self._composition_identity = None
+        self._read_generation += 1
+
+    async def read(self) -> HumanBootstrapReadback:
+        """Read three strict replies while retaining exact local ownership.
+
+        Returns:
+            Configuration evidence without command authority, or a typed refusal.
+        """
+        self._read_generation += 1
+        generation = self._read_generation
+        session, record = self._session, self._record
+        if session is None or not self._current(session, record, generation):
+            return HumanBootstrapRefused(BootstrapRefusal.MISSING_LAUNCH_FRAMING)
+        results: list[dict[str, object]] = []
+        for read in BOOTSTRAP_READ_ORDER:
+            if not self._current(session, record, generation):
+                return HumanBootstrapRefused(BootstrapRefusal.DISPLACED_FRAMING, read)
+            try:
+                async with asyncio.timeout(self._call_timeout_seconds):
+                    is_error, content, structured = await _call_bootstrap_sdk(session, read)
+            except ValidationError:
+                return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)
+            except Exception:
+                return HumanBootstrapRefused(BootstrapRefusal.READ_FAILED, read)
+            if not self._current(session, record, generation):
+                return HumanBootstrapRefused(BootstrapRefusal.DISPLACED_FRAMING, read)
+            result = decode_bootstrap_reply(
+                read,
+                is_error=is_error,
+                content=content,
+                structured=structured,
+                config_present=True,
+                inventory=HottopSimulationInventory.BOOTSTRAP,
+            )
+            if result is None:
+                return HumanBootstrapRefused(BootstrapRefusal.INVALID_PAYLOAD, read)
+            results.append(result)
+        return build_bootstrap_evidence(record.child_epoch, *results)
+
+
+@asynccontextmanager
+async def hottop_simulation_bootstrap(
+    *,
+    config_path: Path,
+    clock: Callable[[], float],
+    receipt_age_bound_seconds: float,
+    call_timeout_seconds: float = 10.0,
+) -> AsyncGenerator[HottopSimulationBootstrap, None]:
+    """Compose the repository's in-memory producer for read-only bootstrap.
+
+    This explicit in-process entry point has no configuration, CLI or API
+    selector. Its optional producer dependency is imported only here, and its
+    concrete composition is constructed here rather than accepted from callers.
+    The context and its SDK lifetime must be entered and exited in one task.
+
+    Args:
+        config_path: Synthetic-only producer configuration path.
+        clock: Clock injected into the closed simulation composition.
+        receipt_age_bound_seconds: Positive producer receipt age bound.
+        call_timeout_seconds: Positive per-read and SDK startup timeout.
+
+    Yields:
+        A read-only owner which is invalidated before the SDK context exits.
+
+    Raises:
+        ValueError: If either time bound is non-finite or non-positive.
+        ImportError: If the optional source-bound producer is unavailable.
+    """
+    for value in (receipt_age_bound_seconds, call_timeout_seconds):
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError("Simulation time bounds must be finite and positive")
+    simulation = importlib.import_module("coffee_roaster_mcp.hottop_simulation")
+    producer = importlib.import_module("coffee_roaster_mcp.mcp_server")
+    memory = importlib.import_module("mcp.shared.memory")
+    composition = simulation.HottopSimulationComposition(
+        clock=clock, receipt_age_bound_seconds=receipt_age_bound_seconds
+    )
+    if type(composition) is not simulation.HottopSimulationComposition:
+        raise TypeError("Simulation composition identity is invalid")
+    server = producer.create_hottop_simulation_mcp_server(
+        config_path=config_path, composition=composition
+    )
+    record = HottopSimulationLaunchRecord(composition_identity=composition, child_epoch=1)
+    async with memory.create_connected_server_and_client_session(
+        server, read_timeout_seconds=timedelta(seconds=call_timeout_seconds)
+    ) as session:
+        owner = HottopSimulationBootstrap(
+            seal=_SIMULATION_FACTORY_SEAL,
+            session=session,
+            record=record,
+            call_timeout_seconds=call_timeout_seconds,
+        )
+        try:
+            yield owner
+        finally:
+            owner._invalidate()  # pyright: ignore[reportPrivateUsage] -- composition owner closes it
 
 
 @dataclass(frozen=True, slots=True)
