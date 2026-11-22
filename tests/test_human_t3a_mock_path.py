@@ -3,6 +3,7 @@
 
 import asyncio
 import json
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -11,7 +12,12 @@ from unittest.mock import AsyncMock
 import pytest
 from mcp.types import CallToolResult, ListToolsResult, Tool
 
-from roastpilot_agent.api import QueuedOperatorAction, RoastRunConflictError, RoastService
+from roastpilot_agent.api import (
+    QueuedOperatorAction,
+    RoastRunConflictError,
+    RoastService,
+    _BufferedEvent,
+)
 from roastpilot_agent.human_bootstrap import BOOTSTRAP_TOOL_INVENTORY, BootstrapRead
 from roastpilot_agent.human_pre_fc_permission import (
     LeverReceipt,
@@ -33,10 +39,19 @@ from roastpilot_agent.mcp_client import MCPConnectionError, RoasterControlAdapte
 from roastpilot_agent.models import (
     OperatorAction,
     RestartClearanceRequest,
+    RoastCommand,
     RoastEventKind,
     RoastEventSource,
     RoastPhase,
     StartHoldSettlementOutcome,
+)
+from roastpilot_agent.roast_termination import (
+    EvidencePosition,
+    TerminationClassification,
+    TerminationEventRow,
+    TerminationEvidenceKind,
+    classify_termination,
+    select_first_executed_drop_event,
 )
 from roastpilot_agent.safety import SafetyEvaluation, SafetyVerdict
 from roastpilot_agent.timing_evidence import TimingEvidenceRead, TimingEvidenceReadOutcome
@@ -470,7 +485,8 @@ async def test_queued_mark_is_withheld_before_operation_entry(
     assert h.emitter.events[-1] == (
         RoastEventKind.COMMAND_FAILED,
         {
-            "action": "mark_first_crack",
+            "command": RoastCommand.MARK_FIRST_CRACK.value,
+            "diagnostic_only": True,
             "source": "operator",
             "outcome": "withheld",
             "session_id": "a" * 32,
@@ -544,7 +560,8 @@ async def test_wrong_typed_adapter_acknowledgement_is_scoped_uncertainty(
         assert h.emitter.events[-1] == (
             RoastEventKind.COMMAND_FAILED,
             {
-                "action": "mark_first_crack",
+                "command": RoastCommand.MARK_FIRST_CRACK.value,
+                "diagnostic_only": True,
                 "source": "operator",
                 "outcome": "unresolved",
                 "session_id": "a" * 32,
@@ -589,7 +606,8 @@ async def test_entered_mark_completion_cannot_advance_replacement_owner(
     assert h.emitter.events[-1] == (
         RoastEventKind.COMMAND_FAILED,
         {
-            "action": "mark_first_crack",
+            "command": RoastCommand.MARK_FIRST_CRACK.value,
+            "diagnostic_only": True,
             "source": "operator",
             "outcome": "unresolved",
             "session_id": "a" * 32,
@@ -1030,7 +1048,8 @@ async def test_inclusive_protection_after_mark_disposition(
         assert (
             RoastEventKind.COMMAND_FAILED,
             {
-                "action": "mark_first_crack",
+                "command": RoastCommand.MARK_FIRST_CRACK.value,
+                "diagnostic_only": True,
                 "source": "operator",
                 "outcome": mark,
                 "session_id": "a" * 32,
@@ -1073,11 +1092,13 @@ async def test_inclusive_protection_after_mark_disposition(
     assert await h.controller.operator_emergency_stop()
 
 
+@pytest.mark.parametrize("deferred", [False, True])
 @pytest.mark.parametrize("outcome", ["withheld", "unresolved", "canonical"])
 async def test_private_mark_persisted_landmark_and_dispatch_projection(
     fixture: tuple[RoastService, _BootstrapDouble],
     monkeypatch: pytest.MonkeyPatch,
     outcome: str,
+    deferred: bool,
 ) -> None:
     """Persist actual controller events through the runner and SQLite history."""
     service, double = fixture
@@ -1114,8 +1135,13 @@ async def test_private_mark_persisted_landmark_and_dispatch_projection(
     double.calls.clear()
     item = QueuedOperatorAction(run_id=detail.id, action=OperatorAction.MARK_FIRST_CRACK)
     levers = (controller._current_heat, controller._current_fan)
-    await runner._dispatch(item)
-    await runner._dispatch(item)  # A duplicate is diagnostic only.
+    deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] | None = (
+        deque() if deferred else None
+    )
+    await runner._dispatch(item, deferred_commands=deferred_commands)
+    await runner._dispatch(item, deferred_commands=deferred_commands)  # Duplicate: diagnostic only.
+    if deferred_commands is not None:
+        assert not deferred_commands
     assert await runner._flush_events()
     timeline = await service._store.read_timeline(detail.id)
     (summary,) = await service._store.list_runs()
@@ -1132,12 +1158,19 @@ async def test_private_mark_persisted_landmark_and_dispatch_projection(
             "outcome": "canonical",
             "session_id": "a" * 32,
         }
-    for event in diagnostics:
+    expected_outcomes = (
+        ["recorded_as_note"] if outcome == "canonical" else [outcome, "recorded_as_note"]
+    )
+    assert len(diagnostics) == len(expected_outcomes)
+    for event, expected_outcome in zip(diagnostics, expected_outcomes, strict=True):
         assert event.source is RoastEventSource.OPERATOR
-        assert event.payload is not None
-        assert event.payload["action"] == "mark_first_crack"
-        assert "command" not in event.payload
-    assert len(diagnostics) == (1 if outcome == "canonical" else 2)
+        assert event.payload == {
+            "command": RoastCommand.MARK_FIRST_CRACK.value,
+            "diagnostic_only": True,
+            "source": "operator",
+            "outcome": expected_outcome,
+            "session_id": "a" * 32,
+        }
     assert timeline.commands == []
     assert sends(double) == ([] if outcome == "withheld" else ["mark_first_crack"])
     assert read.await_count == (2 if outcome == "canonical" else 1)
@@ -1147,6 +1180,94 @@ async def test_private_mark_persisted_landmark_and_dispatch_projection(
     assert not await controller._execute_targets(evaluation())
     assert (controller._current_heat, controller._current_fan) == levers
     assert sends(double) == ([] if outcome == "withheld" else ["mark_first_crack"])
+
+    # Synthetic normal completion has a persisted Drop anchor, without a hardware call.
+    await service._store.record_event(
+        run_id=detail.id,
+        kind=RoastEventKind.COMMAND_EXECUTED,
+        source=RoastEventSource.OPERATOR,
+        payload={"command": RoastCommand.DROP_BEANS.value},
+    )
+    await service._store.complete_run(
+        run_id=detail.id, outcome="completed", agent_phase=RoastPhase.COMPLETE
+    )
+    assert await service._store.read_first_executed_drop_event(detail.id) is not None
+    termination = await service._store.read_termination(detail.id)
+    assert termination.classification is TerminationClassification.NORMAL
+    assert termination.evidence == ()
+
+    # Compare the same history with only the e5497931 diagnostic projection restored.
+    completed_timeline = await service._store.read_timeline(detail.id)
+    prior_rows: list[TerminationEventRow] = []
+    for event_id, event in enumerate(completed_timeline.events, start=1):
+        if event.kind not in (RoastEventKind.COMMAND_EXECUTED, RoastEventKind.COMMAND_FAILED):
+            continue
+        prior = dict(event.payload or {})
+        if event.kind is RoastEventKind.COMMAND_FAILED and prior.get("diagnostic_only") is True:
+            prior["action"] = prior.pop("command")
+            del prior["diagnostic_only"]
+        prior_rows.append(
+            TerminationEventRow(
+                event_id=event_id, kind=event.kind.value, payload_json=json.dumps(prior)
+            )
+        )
+    prior_drop = select_first_executed_drop_event(prior_rows)
+    assert prior_drop is not None
+    prior_termination = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=prior_drop,
+        event_rows=prior_rows,
+        emergency_stop_recorded_at_utc=(),
+    )
+    assert prior_termination.classification is TerminationClassification.ABNORMAL_BEFORE_OR_AT_DROP
+    assert len(prior_termination.evidence) == len(diagnostics)
+    assert all(
+        evidence.kind is TerminationEvidenceKind.UNKNOWN_DROP_REASON
+        and evidence.position is EvidencePosition.BEFORE_OR_AT_DROP
+        for evidence in prior_termination.evidence
+    )
+    assert await service._store.read_termination(detail.id) == termination
+
+
+@pytest.mark.parametrize("deferred", [False, True])
+@pytest.mark.parametrize("marker", [None, False, 1, "true"])
+async def test_unmarked_mark_failure_remains_audit_eligible(
+    fixture: tuple[RoastService, _BootstrapDouble],
+    monkeypatch: pytest.MonkeyPatch,
+    deferred: bool,
+    marker: object,
+) -> None:
+    """Only the exact diagnostic marker excludes a private mark failure audit."""
+    service, double = fixture
+    await enable_discovery(monkeypatch, double)
+    detail = await service._start_mock_human_roast(PROFILE, pre_fc_mock=True)
+    runner = service.runner
+    assert runner is not None
+    controller = runner.controller_for_human_fault_drop()
+    assert controller is not None
+    payload: dict[str, object] = {"command": RoastCommand.MARK_FIRST_CRACK.value}
+    if marker is not None:
+        payload["diagnostic_only"] = marker
+
+    async def fail_mark() -> None:
+        runner._emitter.emit(RoastEventKind.COMMAND_FAILED, payload)
+
+    monkeypatch.setattr(controller, "operator_mark_first_crack", fail_mark)
+    item = QueuedOperatorAction(run_id=detail.id, action=OperatorAction.MARK_FIRST_CRACK)
+    deferred_commands: deque[tuple[RoastCommand, QueuedOperatorAction, _BufferedEvent]] | None = (
+        deque() if deferred else None
+    )
+    await runner._dispatch(item, deferred_commands=deferred_commands)
+    if deferred_commands is not None:
+        assert len(deferred_commands) == 1
+        tool, queued, event = deferred_commands.popleft()
+        await runner._persist_dispatch_audit(tool, queued, event)
+    assert await runner._flush_events()
+    timeline = await service._store.read_timeline(detail.id)
+    assert len(timeline.commands) == 1
+    assert timeline.commands[0].tool is RoastCommand.MARK_FIRST_CRACK
+    assert timeline.commands[0].status == "failed"
 
 
 async def enable_discovery(monkeypatch: pytest.MonkeyPatch, double: _BootstrapDouble) -> AsyncMock:
@@ -1534,7 +1655,8 @@ async def test_concurrent_mark_during_preread_has_one_claim(
     assert h.emitter.events[-1] == (
         RoastEventKind.COMMAND_FAILED,
         {
-            "action": "mark_first_crack",
+            "command": RoastCommand.MARK_FIRST_CRACK.value,
+            "diagnostic_only": True,
             "source": "operator",
             "outcome": "recorded_as_note",
             "session_id": "a" * 32,

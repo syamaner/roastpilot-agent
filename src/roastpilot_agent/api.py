@@ -1948,6 +1948,12 @@ class RoastRunner:
                     if command_payload.get("command") != tool.value:
                         continue
                     if (
+                        tool is RoastCommand.MARK_FIRST_CRACK
+                        and event.kind is RoastEventKind.COMMAND_FAILED
+                        and command_payload.get("diagnostic_only") is True
+                    ):
+                        continue
+                    if (
                         tool is RoastCommand.DROP_BEANS
                         and event.kind is RoastEventKind.COMMAND_FAILED
                         and event.audit_command is None

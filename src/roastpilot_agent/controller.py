@@ -7485,7 +7485,8 @@ class RoastController:
             self._events.emit(
                 RoastEventKind.COMMAND_FAILED,
                 {
-                    "action": "mark_first_crack",
+                    "command": RoastCommand.MARK_FIRST_CRACK.value,
+                    "diagnostic_only": True,
                     "source": RoastEventSource.OPERATOR.value,
                     "outcome": "recorded_as_note",
                     "session_id": permission.binding.session_id,
@@ -7577,7 +7578,8 @@ class RoastController:
                     "session_id": permission.binding.session_id,
                 }
                 if outcome != "canonical":
-                    payload["action"] = "mark_first_crack"
+                    payload["command"] = RoastCommand.MARK_FIRST_CRACK.value
+                    payload["diagnostic_only"] = True
                 self._events.emit(
                     RoastEventKind.FIRST_CRACK
                     if outcome == "canonical"
