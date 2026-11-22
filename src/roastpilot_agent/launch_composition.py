@@ -802,3 +802,16 @@ def bind_launch_record(evidence: LaunchEvidence, child_epoch: int) -> LaunchReco
     if child_epoch <= 0:
         raise ValueError("child_epoch must be positive")
     return LaunchRecord(child_epoch=child_epoch, evidence=evidence)
+
+
+@dataclass(frozen=True, slots=True)
+class HottopSimulationLaunchRecord:
+    """Immutable local simulation identity, carrying no command permission.
+
+    Only the infrastructure composition root creates and retains the concrete
+    in-memory composition. This opaque identity must match by object identity,
+    independently of producer metadata or a numeric child epoch.
+    """
+
+    composition_identity: object
+    child_epoch: int
