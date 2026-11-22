@@ -61,6 +61,7 @@ from mcp.types import (
     ClientRequest,
     ListToolsResult,
     Result,
+    Tool,
 )
 from pydantic import (
     BaseModel,
@@ -74,6 +75,12 @@ from pydantic import (
 )
 
 from roastpilot_agent.config import DEFAULT_MCP_COMMAND, MCPConfig, MCPDeviceConfig
+from roastpilot_agent.exact_drop_reply import (
+    ExactDropDisposition,
+    ExactDropIdentity,
+    ExactDropReceipt,
+    decode_exact_drop_reply,
+)
 from roastpilot_agent.human_bootstrap import (
     BOOTSTRAP_READ_ORDER,
     BootstrapInventory,
@@ -1935,6 +1942,53 @@ class RoasterControlAdapter:
             self._timing_evidence_pin = pin
         return result
 
+    async def _drop_beans_exact_session(self, identity: ExactDropIdentity) -> ExactDropReceipt:
+        """Send once for an evaluated pin on the private started mock transport."""
+        not_sent = ExactDropReceipt(ExactDropDisposition.NOT_SENT)
+        transport = self._fixed_zero_transport
+        pin = self._timing_evidence_pin
+        if (
+            type(identity) is not ExactDropIdentity
+            or not identity.is_valid()
+            or transport is None
+            or transport.exact_drop_discovery is not ToolDiscovery.DISCOVERED
+            or self._started_child_epoch != transport.child_epoch
+            or self._started_session_id != identity.session_id
+            or type(pin) is not TimingEvidencePin
+        ):
+            return not_sent
+        record = pin.record
+        if admit_record(record, None)[0] is not TimingEvidenceReadOutcome.EVIDENCE:
+            return not_sent
+        if (
+            record.child_epoch != transport.child_epoch
+            or record.session_id != identity.session_id
+            or record.epoch_id != identity.clock_epoch_id
+            or record.session_ownership_sequence != identity.ownership_sequence
+            or record.evidence_sequence != identity.timing_evidence_sequence
+        ):
+            return not_sent
+        session = transport._session  # pyright: ignore[reportPrivateUsage]
+        if session is None:
+            return not_sent
+        snapshot = self._identity_snapshot()
+        try:
+            async with asyncio.timeout(transport._config.call_timeout_seconds):  # pyright: ignore[reportPrivateUsage]
+                error, content, structured = await _call_strict_sdk(
+                    session, "drop_beans_exact_session", identity.arguments()
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return ExactDropReceipt(ExactDropDisposition.UNKNOWN)
+        if (
+            transport is not self._fixed_zero_transport
+            or session is not transport._session  # pyright: ignore[reportPrivateUsage]
+            or snapshot != self._identity_snapshot()
+        ):
+            return ExactDropReceipt(ExactDropDisposition.UNKNOWN)
+        return decode_exact_drop_reply(error, content, structured, identity)
+
     async def contain_heat_fixed_zero(self) -> ContainmentResult:
         """Send one safety-approved fixed-zero request for the exact started session."""
         transport = self._fixed_zero_transport
@@ -2394,6 +2448,68 @@ def _semantic_schema_matches(schema: dict[str, object], fields: set[str]) -> boo
         and fields <= schema.keys()
         and all(key in fields or key in {"title", "description"} for key in schema)
     )
+
+
+def _advertises_exact_drop(inventory: object) -> bool:
+    """Validate the independent closed Drop schema on the shared inventory."""
+    if not isinstance(inventory, ListToolsResult) or inventory.nextCursor is not None:
+        return False
+    tools: object = inventory.tools
+    if type(tools) is not list:
+        return False
+    entries = cast("list[object]", tools)
+    if any(not isinstance(tool, Tool) for tool in entries):
+        return False
+    matches = [
+        tool
+        for tool in entries
+        if isinstance(tool, Tool) and getattr(tool, "name", None) == "drop_beans_exact_session"
+    ]
+    if len(matches) != 1:
+        return False
+    schema = _json_object(getattr(matches[0], "inputSchema", None))
+    fields = {"session_id", "clock_epoch_id", "ownership_sequence", "timing_evidence_sequence"}
+    if (
+        schema is None
+        or not _semantic_schema_matches(
+            schema, {"type", "additionalProperties", "required", "properties"}
+        )
+        or type(schema.get("type")) is not str
+        or schema.get("type") != "object"
+        or schema.get("additionalProperties") is not False
+    ):
+        return False
+    required = schema.get("required")
+    if type(required) is not list:
+        return False
+    names = cast("list[object]", required)
+    if len(names) != 4 or any(type(name) is not str for name in names):
+        return False
+    if set(cast("list[str]", names)) != fields:
+        return False
+    properties = _json_object(schema.get("properties"))
+    if properties is None or properties.keys() != fields:
+        return False
+    expected: dict[str, dict[str, object]] = {
+        "session_id": {"type": "string", "minLength": 1, "maxLength": 128},
+        "clock_epoch_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "ownership_sequence": {"type": "integer", "minimum": 1, "maximum": 9_007_199_254_740_991},
+        "timing_evidence_sequence": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9_007_199_254_740_991,
+        },
+    }
+    for name, semantics in expected.items():
+        prop = _json_object(properties[name])
+        if prop is None or not _semantic_schema_matches(prop, set(semantics)):
+            return False
+        if any(
+            type(prop[key]) is not type(value) or prop[key] != value
+            for key, value in semantics.items()
+        ):
+            return False
+    return True
 
 
 def _advertises_timing_evidence(inventory: object) -> bool:
@@ -2935,6 +3051,7 @@ class MCPServerProcess:
         self._child_epoch = 1 if session is not None else 0
         self._fixed_zero_discovery: ToolDiscovery | None = None
         self._timing_evidence_discovery: ToolDiscovery | None = None
+        self._exact_drop_discovery: ToolDiscovery | None = None
         self._session_factory: SessionFactory = (
             session_factory if session_factory is not None else self._default_session_factory
         )
@@ -3221,6 +3338,7 @@ class MCPServerProcess:
         self._child_epoch += 1
         self._fixed_zero_discovery = None
         self._timing_evidence_discovery = None
+        self._exact_drop_discovery = None
 
     def launch_record_for_epoch(self, epoch: object) -> LaunchRecord | None:
         """Return the launch record only for the exact current attach epoch.
@@ -3290,6 +3408,11 @@ class MCPServerProcess:
         """Return the cached timing advertisement for this child."""
         return self._timing_evidence_discovery or ToolDiscovery.ABSENT
 
+    @property
+    def exact_drop_discovery(self) -> ToolDiscovery:
+        """Return the terminal Drop advertisement for the attached child."""
+        return self._exact_drop_discovery or ToolDiscovery.ABSENT
+
     async def discover_timing_evidence(self) -> ToolDiscovery:
         """Reserve one explicit terminal discovery attempt per child."""
         session = self._session
@@ -3297,6 +3420,7 @@ class MCPServerProcess:
             return self.timing_evidence_discovery
         epoch = self._child_epoch
         self._timing_evidence_discovery = ToolDiscovery.ABSENT
+        self._exact_drop_discovery = ToolDiscovery.ABSENT
         if not isinstance(session, ToolDiscoverySession):
             return ToolDiscovery.ABSENT
         try:
@@ -3304,6 +3428,8 @@ class MCPServerProcess:
                 inventory = await session.list_tools()
             if epoch != self._child_epoch or session is not self._session:
                 return ToolDiscovery.ABSENT
+            if _advertises_exact_drop(inventory):
+                self._exact_drop_discovery = ToolDiscovery.DISCOVERED
             if _advertises_timing_evidence(inventory):
                 self._timing_evidence_discovery = ToolDiscovery.DISCOVERED
         except Exception:
