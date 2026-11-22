@@ -7087,9 +7087,10 @@ class RoastController:
                 if (
                     self._human_run is run
                     and self._human_ownership.is_current(run)
-                    and self._generation_is_current(generation)
-                    and not self._emergency_stop_transition_pending
+                    and not run.durably_closed
                 ):
+                    # Emergency admission revokes dispatch authority, but cannot
+                    # resolve an entered command whose acknowledgement was lost.
                     run.command = CommandDisposition.UNKNOWN
                 permission.end()
                 self._events.emit(

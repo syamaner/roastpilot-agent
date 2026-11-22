@@ -128,8 +128,8 @@ async def test_grant_is_one_shot_and_default_stays_inert(monkeypatch: pytest.Mon
     assert h.controller._private_pre_fc is not None
     assert h.controller._private_pre_fc.pair_outcome is PairOutcome.BOTH_CONFIRMED
     h.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
-    if h.controller.phase is RoastPhase.PREHEATING:
-        h.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    h.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert h.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
     assert not await h.controller._execute_targets(evaluation())
     assert h.controller._private_pre_fc.state is PermitState.ENDED
 
@@ -930,8 +930,15 @@ async def test_actual_sdk_receipts_without_implicit_discovery(name: Any, fault: 
         if fault == "none":
             result = await adapter._private_pre_fc_call(name, value)
             assert result.session_id == "a" * 32
+        elif fault == "is_error":
+            with pytest.raises(ValidationError) as rejected:
+                await adapter._private_pre_fc_call(name, value)
+            assert rejected.value.errors()[0]["loc"] == ("isError",)
+            assert rejected.value.errors()[0]["type"] == "bool_type"
         else:
-            with pytest.raises((MCPConnectionError, ValidationError)):
+            with pytest.raises(
+                MCPConnectionError, match="^private command acknowledgement invalid$"
+            ):
                 await adapter._private_pre_fc_call(name, value)
     assert len(peer.requests) == 1 and peer.requests[0][0] == "tools/call"
 
@@ -1000,6 +1007,11 @@ async def test_inclusive_protection_after_mark_disposition(
             double.replies[name] = _hs_raw({**control_receipt(), "heat_level_percent": 100})
     else:
         await h.controller.operator_mark_first_crack()
+    if mark in ("withheld", "unresolved"):
+        assert (
+            RoastEventKind.FIRST_CRACK,
+            {"source": "operator", "outcome": mark, "session_id": "a" * 32},
+        ) in h.emitter.events
     await h.turn(bean=180, t0=True)
     lever_sends = sends(double)
     await h.turn(bean=bean, t0=True)
@@ -1007,6 +1019,30 @@ async def test_inclusive_protection_after_mark_disposition(
     if mark == "actuator_unknown":
         assert "drop_beans" not in h.commands and h.actuator.containments == 0
         assert run_of(h).command is CommandDisposition.UNKNOWN
+        assert not h.controller.human_recovery_drop_allowed()
+        contained = await h.controller._contain_human_heat(generation=h.arbiter.generation)
+        from roastpilot_agent.human_protection import ContainmentOutcome
+
+        assert contained.outcome is ContainmentOutcome.NOT_ATTEMPTED
+        assert h.actuator.containments == 0
+
+        async def forbidden_fault_drop() -> None:
+            pytest.fail("UNKNOWN admitted fault Drop")
+
+        assert not await h.controller.execute_human_fault_drop(
+            "a" * 32,
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=forbidden_fault_drop,
+        )
+        assert (
+            RoastEventKind.COMMAND_FAILED,
+            {
+                "command": "drop_beans",
+                "outcome": "refused_unknown_prior_drop",
+                "physical_intervention_required": True,
+            },
+        ) in h.emitter.events
     else:
         assert h.commands == ["drop_beans"]
         assert h.controller.phase is RoastPhase.COOLING
@@ -1255,3 +1291,210 @@ async def test_failed_start_settlement_never_grants(
     before = sends(double)
     assert not await controller._execute_targets(evaluation())
     assert sends(double) == before
+
+
+@pytest.mark.parametrize("name", ["set_heat", "set_fan"])
+@pytest.mark.parametrize("owner", ["same", "replacement", "closed"])
+@pytest.mark.parametrize("lost", [True, False], ids=["lost-reply", "acknowledged"])
+async def test_entered_lever_with_actual_emergency_admission(
+    monkeypatch: pytest.MonkeyPatch, name: str, owner: str, lost: bool
+) -> None:
+    """An admitted stop revokes writes, not same-run uncertainty attribution."""
+    h, adapter, double = await granted(monkeypatch)
+    await prepare_mark(h, adapter, monkeypatch)
+    origin = run_of(h)
+    permission = h.controller._private_pre_fc
+    assert permission is not None
+    entered, release, admitted = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    original_call = double.call_tool
+    original_admit = h.arbiter.admit_emergency_stop
+    original_emit = h.emitter.emit
+    displaced_mirrors: list[tuple[int, int]] = []
+
+    def observe(kind: RoastEventKind, payload: dict[str, object]) -> None:
+        if kind is RoastEventKind.COMMAND_FAILED and payload.get("command") == name:
+            displaced_mirrors.append((h.controller._current_heat, h.controller._current_fan))
+        original_emit(kind, payload)
+
+    monkeypatch.setattr(h.emitter, "emit", observe)
+
+    async def held(tool: str, arguments: dict[str, object] | None = None) -> object:
+        reply = await original_call(tool, arguments)
+        if tool == name:
+            entered.set()
+            await release.wait()
+            if lost:
+                raise TimeoutError("synthetic reply loss; no physical effect asserted")
+        return reply
+
+    def admit() -> int:
+        result = original_admit()
+        admitted.set()
+        return result
+
+    monkeypatch.setattr(double, "call_tool", held)
+    monkeypatch.setattr(h.arbiter, "admit_emergency_stop", admit)
+    routine = asyncio.create_task(h.controller._execute_targets(evaluation()))
+    await entered.wait()
+    stop = asyncio.create_task(h.controller.operator_emergency_stop())
+    await admitted.wait()
+    assert h.arbiter.generation != permission.binding.command_generation
+    assert not stop.done() and h.commands == []
+    assert not h.controller._private_pre_fc_current()
+    assert permission.state is PermitState.ENDED
+    if owner == "replacement":
+        change(h, adapter, "run")
+    elif owner == "closed":
+        h.controller.note_human_run_durably_closed()
+    current = run_of(h)
+    endpoint = current.endpoint
+    h.controller._current_heat, h.controller._current_fan = 9, 8
+    release.set()
+    assert not await routine
+    assert await stop
+    assert h.commands == ["emergency_stop"]
+    assert h.controller.phase is RoastPhase.FAULTED
+    assert current.endpoint is endpoint
+    assert current.command is (
+        CommandDisposition.UNKNOWN if lost and owner == "same" else CommandDisposition.SETTLED
+    )
+    assert origin.command is (
+        CommandDisposition.UNKNOWN if lost and owner == "same" else CommandDisposition.SETTLED
+    )
+    assert displaced_mirrors == [(9, 8)]
+    # Only the independently dispatched stop adopts its acknowledged mirrors.
+    assert (h.controller._current_heat, h.controller._current_fan) == (0, 100)
+    assert sends(double) == (["set_heat"] if name == "set_heat" else ["set_heat", "set_fan"])
+    assert permission.pair_outcome is (PairOutcome.UNKNOWN if lost else PairOutcome.DISPLACED)
+    assert (permission.heat_receipt is not None) is (not lost or name == "set_fan")
+    assert (permission.fan_receipt is not None) is (not lost and name == "set_fan")
+    assert (
+        RoastEventKind.COMMAND_FAILED,
+        {
+            "command": name,
+            "outcome": "unknown" if lost else "displaced",
+            "run_id": origin.run_id,
+            "session_id": permission.binding.session_id,
+            **(
+                {
+                    "command_generation": permission.binding.command_generation,
+                    "child_epoch": permission.binding.child_epoch,
+                }
+                if lost
+                else {"acknowledged_value_percent": 65 if name == "set_heat" else 30}
+            ),
+        },
+    ) in h.emitter.events
+    before = sends(double)
+    assert not await h.controller._execute_targets(evaluation())
+    assert sends(double) == before
+    if lost and owner == "same":
+
+        async def forbidden_drop() -> None:
+            pytest.fail("UNKNOWN admitted fault Drop")
+
+        assert not await h.controller.execute_human_fault_drop(
+            permission.binding.session_id,
+            generation=h.arbiter.generation,
+            lease_current=lambda: True,
+            operation=forbidden_drop,
+        )
+        await h.turn(bean=196.0, t0=True)
+        assert h.commands == ["emergency_stop"] and h.actuator.containments == 0
+
+
+async def test_concurrent_mark_during_preread_has_one_claim(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second request observes the reservation before any mark RPC."""
+    h, adapter, double = await granted(monkeypatch)
+    read = await prepare_mark(h, adapter, monkeypatch)
+    entered, release = asyncio.Event(), asyncio.Event()
+    reads = 0
+
+    async def held() -> TimingEvidenceRead:
+        nonlocal reads
+        reads += 1
+        if reads == 1:
+            entered.set()
+            await release.wait()
+        return TimingEvidenceRead(
+            TimingEvidenceReadOutcome.EVIDENCE, record=timing(post=reads == 2)
+        )
+
+    read.side_effect = held
+    first = asyncio.create_task(h.controller.operator_mark_first_crack())
+    await entered.wait()
+    permission = h.controller._private_pre_fc
+    assert permission is not None and permission.claim is not None
+    claim = permission.claim
+    await h.controller.operator_mark_first_crack()
+    assert permission.claim is claim and read.await_count == 1 and sends(double) == []
+    assert h.emitter.events[-1] == (
+        RoastEventKind.FIRST_CRACK,
+        {"source": "operator", "outcome": "recorded_as_note"},
+    )
+    release.set()
+    await first
+    assert read.await_count == 2 and sends(double) == ["mark_first_crack"]
+    assert h.controller._canonical_human_fc_confirmed
+
+
+async def test_unclaimed_non_heat_cannot_send_mark(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An active lever grant alone never admits a NON_HEAT mark write."""
+    h, adapter, double = await granted(monkeypatch)
+    await prepare_mark(h, adapter, monkeypatch)
+
+    async def forbidden() -> None:
+        await adapter._private_pre_fc_call("mark_first_crack")
+
+    dispatched, _ = await h.controller._run_routine_write(
+        h.arbiter.generation, forbidden, write_class=WriteClass.NON_HEAT
+    )
+    assert not dispatched and sends(double) == []
+
+
+async def test_independent_start_generation_change_blocks_opted_grant(
+    fixture: tuple[RoastService, _BootstrapDouble], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Change Start admission alone while timing discovery is actually awaited."""
+    service, double = fixture
+    discovery = await enable_discovery(monkeypatch, double)
+    assert service._mcp is not None
+    child_epoch = service._mcp.child_epoch
+    arbiter_generation = service._command_arbiter.generation
+
+    def displace() -> ListToolsResult:
+        service._start_admission_generation += 1
+        return ListToolsResult(tools=[Tool(name="get_timing_evidence", inputSchema=schema())])
+
+    discovery.side_effect = displace
+    with pytest.raises(RoastRunConflictError, match="^private no-run admission changed$"):
+        await service._start_mock_human_roast(PROFILE, pre_fc_mock=True)
+    assert service._mcp.child_epoch == child_epoch
+    assert service._command_arbiter.generation == arbiter_generation
+    assert double.calls == [] and not service._mock_start_used and service.runner is None
+
+
+@pytest.mark.parametrize("bean", [196.0, 196.1])
+async def test_protection_precedes_a_real_lever_opportunity(
+    monkeypatch: pytest.MonkeyPatch, bean: float
+) -> None:
+    """The matched sub-threshold control actually writes through the lever path."""
+    control, adapter, double = await granted(monkeypatch)
+    await prepare_mark(control, adapter, monkeypatch)
+    for name in ("set_heat", "set_fan"):
+        double.replies[name] = _hs_raw({**control_receipt(), "heat_level_percent": 100})
+    await control.turn(bean=195.9, t0=True)
+    assert sends(double) == ["set_heat", "set_fan"]
+    assert control.commands == []
+    assert (control.controller._current_heat, control.controller._current_fan) == (100, 30)
+
+    protected, adapter, double = await granted(monkeypatch)
+    await prepare_mark(protected, adapter, monkeypatch)
+    for name in ("set_heat", "set_fan"):
+        double.replies[name] = _hs_raw({**control_receipt(), "heat_level_percent": 100})
+    await protected.turn(bean=bean, t0=True)
+    assert sends(double) == []
+    assert protected.commands == ["drop_beans"]
+    assert protected.controller.phase is RoastPhase.COOLING

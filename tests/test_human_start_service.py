@@ -71,13 +71,21 @@ async def test_bound_start(
     monkeypatch.setattr(service._store, "install_start_attempt_hold", install)
     evaluate = Mock(side_effect=AssertionError("initial heat/fan evaluation"))
     monkeypatch.setattr(service._safety, "evaluate_command", evaluate)
+    assert service._mcp is not None
+    discovery = AsyncMock(side_effect=AssertionError("default Start timing discovery"))
+    timing_read = AsyncMock(side_effect=AssertionError("default Start timing read"))
+    monkeypatch.setattr(service._mcp, "discover_timing_evidence", discovery)
+    monkeypatch.setattr(service._roaster, "read_timing_evidence", timing_read)
     detail = await service._start_mock_human_roast(PROFILE)
+    discovery.assert_not_awaited()
+    timing_read.assert_not_awaited()
     assert detail.agent_phase is RoastPhase.PREHEATING
     assert detail.instance_id == service.instance_id
     assert service.runner is not None
     controller = service.runner.controller_for_human_fault_drop()
     assert controller is not None and controller._human_run is not None
     run = controller._human_run
+    assert controller._private_pre_fc is None
     assert run.admission is HumanRunAdmission.SESSION_BOUND
     assert service._mcp is not None
     assert controller._known_human_identity() == (

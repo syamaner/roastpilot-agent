@@ -1,5 +1,22 @@
 # E11 — Packaging
 
+**22 Nov 2026 — #1111 T3a review repair (private mock-only caller):**
+The private service opt-in remains bound to exact mock producer
+`39de5634bc454e546234998a4f6c2e0f7ad4dd21`. An entered heat or fan call
+with a lost reply records UNKNOWN on its exact current, non-closed run even
+after independent emergency admission; replacement and closed ownership are
+untouched. No routine lever is sent after a mark disposition or actuator
+UNKNOWN. The mock can hold its last acknowledged pre-FC heat until an
+independently eligible action; UNKNOWN withholds protective/fault Drop and
+containment while independent emergency eligibility remains.
+T3b recipe Drop, #248 emergency preemption during a held mark, and #256 staged
+Hottop Start are separate work. Any later runner/observer change needs its own
+combined evidence against the exact producer. Completion remains conditional
+on protected delivery, lead-owned full native and protected stdio proof, and
+independent review. This synthetic software repair makes no live-readiness
+claim; #954 and E11-S3 remain open.
+
+
 **5 Nov 2026 — #1069 software-only diagnostic retention:** the normal MCP
 mirror, existing raw-state persistence, existing detail/SSE projection and SPA
 type contract retain four first-crack inference diagnostics as values or

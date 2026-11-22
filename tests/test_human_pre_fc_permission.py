@@ -268,7 +268,12 @@ def test_canonical_mark_identity(fault: str) -> None:
     changes: dict[str, Any] = {
         "session": {"session_id": "wrong"},
         "child": {"child_epoch": 2},
-        "epoch": {"epoch_id": "f" * 32},
+        "epoch": {
+            "epoch_id": "f" * 32,
+            "first_crack": replace(after.first_crack, clock_epoch_id="f" * 32)
+            if after.first_crack is not None
+            else None,
+        },
         "ownership": {"session_ownership_sequence": 2},
         "sequence": {"evidence_sequence": 1},
         "phase": {"phase": "roasting"},
@@ -301,3 +306,26 @@ def test_canonical_mark_identity(fault: str) -> None:
     assert not canonical_mark_matches(before, after, receipt, binding())
     if fault.startswith("pre_"):
         assert not pre_mark_evidence(before, binding())
+
+
+@pytest.mark.parametrize(
+    "fault", ["session", "child", "phase", "charge", "charge_clock", "charge_basis", "fc", "drop"]
+)
+def test_pre_mark_each_typed_boundary(fault: str) -> None:
+    """Reject each pre-read condition without a competing failed condition."""
+    record = timing()
+    assert pre_mark_evidence(record, binding())
+    assert record.charge is not None
+    changes: dict[str, Any] = {
+        "session": {"session_id": "wrong"},
+        "child": {"child_epoch": 2},
+        "phase": {"phase": "development"},
+        "charge": {"charge": None},
+        "charge_clock": {"charge": replace(record.charge, clock_epoch_id="f" * 32)},
+        "charge_basis": {
+            "charge": replace(record.charge, time_basis=TimeBasis.DETECTOR_CLOCK_REBASED)
+        },
+        "fc": {"first_crack": timing(post=True).first_crack},
+        "drop": {"drop": record.charge},
+    }
+    assert not pre_mark_evidence(replace(record, **changes[fault]), binding())
