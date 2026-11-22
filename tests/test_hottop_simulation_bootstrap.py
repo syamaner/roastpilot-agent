@@ -185,6 +185,48 @@ def test_simulation_checks_independent_text_and_structure(read: BootstrapRead) -
     )
 
 
+@pytest.mark.parametrize("text_value", [2.0, 1])
+def test_valid_simulation_members_must_agree_in_value_and_numeric_type(
+    text_value: float,
+) -> None:
+    """Individually valid numeric members still need type-sensitive equality."""
+    read = BootstrapRead.RUNTIME_CONFIG
+    structured = _payload(read)
+    textual = copy.deepcopy(structured)
+    textual["command_interval_seconds"] = text_value
+    assert _decode(read, structured) == structured
+    assert _decode(read, textual) == textual
+    assert (
+        decode_bootstrap_reply(
+            read,
+            is_error=False,
+            content=[{"type": "text", "text": json.dumps(textual)}],
+            structured=structured,
+            config_present=True,
+            inventory=HottopSimulationInventory.BOOTSTRAP,
+        )
+        is None
+    )
+
+
+def test_capture_requires_its_single_structured_wrapper() -> None:
+    """Plain valid capture text needs exactly the specified structured wrapper."""
+    read = BootstrapRead.CAPTURE_EVIDENCE
+    payload = _payload(read)
+    assert _decode(read, payload) == payload
+    assert (
+        decode_bootstrap_reply(
+            read,
+            is_error=False,
+            content=[{"type": "text", "text": json.dumps(payload)}],
+            structured=payload,
+            config_present=True,
+            inventory=HottopSimulationInventory.BOOTSTRAP,
+        )
+        is None
+    )
+
+
 def _owner() -> HottopSimulationBootstrap:
     # Unit ownership tests deliberately use the private issuer. Only the SDK
     # integration below exercises production construction and provenance.
@@ -205,6 +247,72 @@ def test_arbitrary_constructor_cannot_mint_binding() -> None:
             record=HottopSimulationLaunchRecord(object(), 1),
             call_timeout_seconds=1.0,
         )
+
+
+@pytest.mark.parametrize("foreign_member", ["session", "record"])
+def test_real_seal_rejects_subclassed_session_or_record(foreign_member: str) -> None:
+    """The real issuer seal cannot admit subclassed infrastructure identities."""
+
+    class SessionSubclass(ClientSession):
+        """Subclass used without opening any SDK resources."""
+
+    class RecordSubclass(HottopSimulationLaunchRecord):
+        """Subclass carrying otherwise valid immutable fields."""
+
+    session = object.__new__(ClientSession)
+    record = HottopSimulationLaunchRecord(object(), 1)
+    HottopSimulationBootstrap(
+        seal=mcp_client._SIMULATION_FACTORY_SEAL,
+        session=session,
+        record=record,
+        call_timeout_seconds=1.0,
+    )
+    if foreign_member == "session":
+        session = object.__new__(SessionSubclass)
+    else:
+        record = RecordSubclass(record.composition_identity, 1)
+    with pytest.raises(TypeError, match="composition root"):
+        HottopSimulationBootstrap(
+            seal=mcp_client._SIMULATION_FACTORY_SEAL,
+            session=session,
+            record=record,
+            call_timeout_seconds=1.0,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", ["exact", "wrong_epoch", "owner_subclass"])
+async def test_owner_type_and_epoch_are_checked_before_first_sdk_read(
+    monkeypatch: pytest.MonkeyPatch,
+    identity: str,
+) -> None:
+    """Only the exact owner at its issued epoch can begin the read sequence."""
+
+    class OwnerSubclass(HottopSimulationBootstrap):
+        """Subclass whose inherited fields must supply no local authority."""
+
+    calls: list[BootstrapRead] = []
+
+    async def read(_session: object, kind: BootstrapRead) -> tuple[object, object, object]:
+        calls.append(kind)
+        return _members(kind, _payload(kind))
+
+    owner_type = OwnerSubclass if identity == "owner_subclass" else HottopSimulationBootstrap
+    owner = owner_type(
+        seal=mcp_client._SIMULATION_FACTORY_SEAL,
+        session=object.__new__(ClientSession),
+        record=HottopSimulationLaunchRecord(object(), 2 if identity == "wrong_epoch" else 1),
+        call_timeout_seconds=1.0,
+    )
+    monkeypatch.setattr(mcp_client, "_call_bootstrap_sdk", read)
+    result = await owner.read()
+    if identity == "exact":
+        assert isinstance(result, HumanBootstrapEvidence)
+        assert calls == list(BootstrapRead)
+    else:
+        assert isinstance(result, HumanBootstrapRefused)
+        assert result.reason is BootstrapRefusal.MISSING_LAUNCH_FRAMING
+        assert calls == []
 
 
 @pytest.mark.asyncio
@@ -337,7 +445,13 @@ async def test_foreign_composition_refuses_before_server_or_sdk_creation(
         def __new__(cls, **_kwargs: object) -> object:
             """Return a foreign value before any server can be constructed."""
             calls.append("composition")
-            return object()
+            return object.__new__(CompositionSubclass)
+
+        def __init__(self, **_kwargs: object) -> None:
+            """Accept the constructor arguments without issuing an exact identity."""
+
+    class CompositionSubclass(ForeignComposition):
+        """An isinstance match still fails the factory's exact-type requirement."""
 
     def forbidden_entry(**_kwargs: object) -> object:
         calls.append("server_or_sdk")
@@ -469,6 +583,7 @@ async def run():
             legacy = mcp_client.MCPServerProcess(session=owner._session)
             refused = await legacy._read_human_bootstrap()
             assert isinstance(refused, HumanBootstrapRefused)
+            assert refused.reason is BootstrapRefusal.MISSING_LAUNCH_FRAMING
             claim = await legacy._attempt_human_start(result, gate=lambda: True)
             assert isinstance(claim, HumanStartRefused) and claim.reason is StartRefusal.NO_PROOF
             assert legacy._start_proof is None
