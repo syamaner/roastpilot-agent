@@ -685,16 +685,19 @@ enforces. (Memory: `claude-review-not-a-required-check`.)
 use GitHub's merge queue (organisation-only), and strict protection makes every
 merge put the other open PRs behind. A head change that ONLY merges the base
 branch into the PR therefore keeps a bot-authored **clean** Codex verdict, with
-no re-trigger, when `scripts/codex_catchup_carryover.py --old <verdict sha> --new
-<head> --base origin/main` prints `CARRY` and exits 0. It proves that the new head
-is a two-parent merge whose first parent is the verified head, that the merged-in
-parent is base history, and that the new head's tree is exactly git's clean
-automatic merge of the two (`git merge-tree --write-tree`). A findings verdict
-never carries; any other head change, any edit made during the merge (including
-whitespace or a moved line), a conflict, or a catch-up chained onto an earlier
-catch-up re-triggers Codex as above.
-Hosted CI still reruns on the new head, and update a PR's branch only when it is
-next to merge. Record the `CARRY` line in the merge context.
+no re-trigger, when `scripts/codex_catchup_carryover.py --old <verified head> --new
+<head> --base origin/main` prints `CARRY` and exits 0. The verified head is the
+commit the clean verdict names, or a head that itself reached `CARRY` from it (a
+chain of recorded `CARRY` lines is sound, because each step is an exact automatic
+merge). The script proves that the new head is a two-parent merge whose first
+parent is the verified head, that the merged-in parent is base history, and that
+the new head's tree is exactly git's clean automatic merge of the two (`git
+merge-tree --write-tree`). A findings verdict never carries; any other head
+change, any edit made during the merge (including whitespace or a moved line), and
+any conflicted catch-up, even one resolved with `-X ours`/`-X theirs`,
+re-triggers Codex as above. Hosted CI still reruns on the new head, and update a
+PR's branch only when it is next to merge. Record each `CARRY` line in the merge
+context.
 
 **Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
 Jul 2026).** The once-on-final-commit rule above governs the **post-ready** phase: a

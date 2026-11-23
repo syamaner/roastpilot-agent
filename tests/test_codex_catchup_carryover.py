@@ -181,6 +181,8 @@ def test_agents_md_rule_names_this_check_and_its_limits() -> None:
     agents = " ".join((root / "AGENTS.md").read_text(encoding="utf-8").split())
     assert (root / "scripts/codex_catchup_carryover.py").is_file()
     assert "**Catch-up carry-over (D241" in agents
-    assert "scripts/codex_catchup_carryover.py --old <verdict sha> --new <head>" in agents
+    assert "scripts/codex_catchup_carryover.py --old <verified head> --new <head>" in agents
+    assert "a chain of recorded `CARRY` lines is sound" in agents
+    assert "even one resolved with `-X ours`/`-X theirs`" in agents
     assert "A findings verdict never carries" in agents
     assert "Hosted CI still reruns on the new head" in agents
