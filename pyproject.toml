@@ -191,7 +191,11 @@ dev = [
   # is already present transitively (via the MCP server's ML stack), but the
   # curve-feature analysis imports it directly, so declare it explicitly here:
   # it is a dev/analysis tool, never a runtime dependency of the lean agent.
-  "numpy>=1.26"
+  "numpy>=1.26",
+  # First-crack predictor study (docs/research/fc-predictor, #1118): the
+  # two-node fit uses scipy.optimize.least_squares. Present transitively today;
+  # declared so the study has a supported install path. Analysis only.
+  "scipy>=1.11",
 ]
 
 # D180 (#702, slice 3): the docs-only CI fast path installs this empirically
