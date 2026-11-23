@@ -58,6 +58,7 @@ from roastpilot_agent.models import (
     AppliedRoasterState,
     DropReason,
     FaultControlState,
+    FirstCrackSource,
     JointWindowStatus,
     OperatorAction,
     PostFcHeatAuthorityState,
@@ -5622,10 +5623,11 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
     await harness.controller.operator_mark_first_crack()
-    assert harness.controller.phase is RoastPhase.DEVELOPMENT
-    assert "mark_first_crack" in harness.executor.commands
-    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
-    assert first_crack == [{"source": "operator"}]  # no reading consumed: never invent
+    # #1116: with no reading consumed yet the plausibility floor fails closed —
+    # no relay, no transition, and never an invented landmark.
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert "mark_first_crack" not in harness.executor.commands
+    assert [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK] == []
 
     # Once a server telemetry tick has been consumed, the supported operator
     # override persists that exact last validated bean reading for the fixed
@@ -5650,6 +5652,429 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     await harness2.controller.operator_mark_first_crack()
     assert harness2.controller.phase is RoastPhase.PREHEATING  # rejected, no transition
     assert harness2.executor.commands == []
+
+
+def _fc_source_harness(
+    readings: list[RoastTelemetry | Exception | None], config: ControllerConfig | None = None
+) -> Harness:
+    harness = make_harness(readings=readings, config=config)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    return harness
+
+
+OPERATOR_ONLY = ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY)
+
+
+@pytest.mark.asyncio
+async def test_operator_only_mcp_detection_is_shadow_evidence_once_per_run() -> None:
+    """#1116: under operator_only a latched MCP detection never starts
+    development; it persists exactly one REJECTed source evaluation, even
+    though the detected flag stays set on every later tick."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc, fc, fc], OPERATOR_ONLY)
+    for _ in range(3):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert harness.controller._first_crack_monotonic is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    source_evals = [e for e in harness.sink.evaluations if e.rule == "event_source_validity"]
+    assert len(source_evals) == 1
+    assert source_evals[0].verdict is SafetyVerdict.REJECT
+    assert "operator_only" in source_evals[0].reason
+
+
+@pytest.mark.asyncio
+async def test_operator_only_operator_mark_starts_development_after_shadow() -> None:
+    """#1116: after MCP shadow evidence, the operator's mark is still the start."""
+    fc = reading(bean=184.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.executor.commands.count("mark_first_crack") == 1
+    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
+    assert first_crack == [{"source": "operator", "bean_temp_c": 184.0}]
+    plausibility = [
+        e for e in harness.sink.evaluations if e.rule == "operator_first_crack_plausibility"
+    ]
+    assert [e.verdict for e in plausibility] == [SafetyVerdict.ALLOW]
+
+
+@pytest.mark.asyncio
+async def test_operator_only_shadow_latch_rearms_on_new_run() -> None:
+    """#1116: the once-per-run latch is cleared by the next run's preheat."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    await harness.controller.tick()
+    assert harness.controller._mcp_first_crack_shadow_recorded is True  # pyright: ignore[reportPrivateUsage]
+    for step in [
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+    ]:
+        harness.controller.transition_to(step)
+    assert harness.controller._mcp_first_crack_shadow_recorded is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_operator_only_advisor_context_hides_pre_fc_detection() -> None:
+    """#1116: the advisor never sees a pre-FC shadow detection as first crack;
+    the default source still passes the raw MCP flag through."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    for config, expected in ((OPERATOR_ONLY, False), (None, True)):
+        harness = _fc_source_harness([fc], config)
+        limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+        ctx = harness.controller._build_advisor_context(fc, limits)  # pyright: ignore[reportPrivateUsage]
+        assert ctx.first_crack_detected is expected
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(fc, limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.first_crack_detected is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", list(FirstCrackSource))
+async def test_operator_mark_below_floor_rejected_without_relay(source: FirstCrackSource) -> None:
+    """#1116: a mark below the plausibility floor (the 41 °C mock mis-click) is
+    a persisted REJECT with zero MCP relays, under either source setting."""
+    harness = _fc_source_harness([reading(bean=41.0)], ControllerConfig(first_crack_source=source))
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert "mark_first_crack" not in harness.executor.commands
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    plausibility = [
+        e for e in harness.sink.evaluations if e.rule == "operator_first_crack_plausibility"
+    ]
+    assert [e.verdict for e in plausibility] == [SafetyVerdict.REJECT]
+    assert "41.0" in plausibility[0].reason
+    # Operator-visible refusal, not just a trace row (#1116 safety review).
+    refused = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert refused == [
+        {"command": "mark_first_crack", "outcome": "refused", "reason": plausibility[0].reason}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_survives_one_failed_read() -> None:
+    """#1116: a failed read on the tick before the mark must not refuse a
+    genuine mark; the floor and the landmark use the last valid reading."""
+    harness = _fc_source_harness([reading(bean=180.0), RuntimeError("read failed")], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.tick()  # failed read: _last_telemetry is None
+    assert harness.controller._last_telemetry is None  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
+    assert first_crack == [{"source": "operator", "bean_temp_c": 180.0}]
+
+
+class _AllowAllSourcesPolicy(SafetyPolicy):
+    """A drifted policy that ALLOWs every FC/T0 source, operator_only or not."""
+
+    def evaluate_event_source(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, *, transition: str, source: object, operator_only_first_crack: bool = False
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="event_source_validity", verdict=SafetyVerdict.ALLOW, reason="drifted allow"
+        )
+
+
+@pytest.mark.asyncio
+async def test_operator_only_controller_gate_holds_even_if_policy_allows_mcp() -> None:
+    """#1116: the controller's own operator_only gate, not just the policy
+    verdict, keeps MCP detection from starting development."""
+    harness = _fc_source_harness([reading(bean=182.0, first_crack_detected=True)], OPERATOR_ONLY)
+    harness.controller._safety = _AllowAllSourcesPolicy(SafetyLimits())  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_only_ceiling_guard_drops_before_the_mark() -> None:
+    """#1116 (operator decision, 23 Nov): under operator_only the 196 °C guard
+    is a temperature limit from charge, so an unmarked run still drops, via
+    the command×phase matrix and the typed CEILING_GUARD reason."""
+    config = ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY)
+    assert config.post_first_crack_control.ceiling_guard_drop_enabled is True
+    harness = _fc_source_harness([reading(bean=196.0, first_crack_detected=True)], config)
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    matrix = [
+        e
+        for e in harness.sink.evaluations
+        if e.rule == "command_phase_validity" and "drop_beans" in e.reason
+    ]
+    assert matrix and matrix[-1].verdict is SafetyVerdict.ALLOW
+    assert not [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "bean"),
+    [
+        # Summer default source: the guard stays DEVELOPMENT-only (unchanged).
+        (ControllerConfig(), 199.0),
+        # Operator-only but the guard's own flag off: no pre-FC drop either.
+        (
+            ControllerConfig(
+                first_crack_source=FirstCrackSource.OPERATOR_ONLY,
+                post_first_crack_control=PostFirstCrackControl(ceiling_guard_drop_enabled=False),
+            ),
+            199.0,
+        ),
+        # Operator-only, strictly below the ceiling.
+        (ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY), 195.9),
+    ],
+)
+async def test_ceiling_guard_pre_fc_does_not_fire_outside_its_arm(
+    config: ControllerConfig, bean: float
+) -> None:
+    """#1116: the pre-FC arm exists only for operator_only with the guard on."""
+    harness = _fc_source_harness([reading(bean=bean)], config)
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_operator_only_failed_pre_fc_guard_drop_retries_next_tick() -> None:
+    """#1116: a failed pre-FC guard drop surfaces COMMAND_FAILED, holds the
+    phase, and the guard fires again on the next tick (no cadence gate)."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=197.0), reading(bean=197.5)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "policy", "reason": "ceiling_guard"} in failed
+    executor._failing.clear()  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heat_before_guard_tick", [None, 0])
+async def test_operator_only_failed_pre_fc_guard_drop_fails_closed_to_heat_off(
+    heat_before_guard_tick: int | None,
+) -> None:
+    """#1116 safety re-review: on a guard-eligible pre-FC tick the lever step
+    writes nothing, and a failed guard drop cuts heat to 0 through safety.
+
+    ``None`` keeps the lever's heat (the cut must fire); ``0`` models a resume
+    at 0 % heat, where the lever would otherwise raise heat before the drop."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()  # ordinary pre-FC lever write
+    assert harness.controller._current_heat > 0  # pyright: ignore[reportPrivateUsage]
+    if heat_before_guard_tick is not None:
+        harness.controller._current_heat = heat_before_guard_tick  # pyright: ignore[reportPrivateUsage]
+        # Clear the ordinary rate limit so a lever write is genuinely possible.
+        harness.clock.advance(10.0)
+    # ``None``: no clock advance — the cut lands inside the 2 s rate limit of
+    # the lever write one tick earlier, so its exemption is exercised.
+    writes_before = list(harness.executor.targets)
+    await harness.controller.tick()  # 197 °C: guard due, drop fails
+    new_writes = harness.executor.targets[len(writes_before) :]
+    expected = [0] if heat_before_guard_tick is None else []
+    assert [heat for heat, _ in new_writes] == expected
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_failed_pre_fc_guard_drop_latches_heat_off_until_operator_resume() -> None:
+    """#1116: after a failed pre-FC guard drop, a dip below the guard does not
+    let the lever re-raise heat (no 0 ↔ floor cycling); an operator resume
+    releases the latch."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0), reading(bean=195.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    await harness.controller.tick()  # 197 °C: drop fails, heat cut to 0, latched
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(10.0)
+    writes_before = len(harness.executor.targets)
+    await harness.controller.tick()  # 195 °C: below the guard, lever would raise
+    assert harness.executor.targets[writes_before:] == []
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller._pre_fc_guard_heat_off_latched is False  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_estop_during_mark_floor_evaluation_relays_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1116: an e-stop admitted while the floor verdict persists makes the
+    mark stale; nothing is relayed and development never starts."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    await harness.controller.tick()
+    original = harness.sink.persist_evaluation
+
+    async def persist(evaluation: SafetyEvaluation) -> int | None:
+        result = await original(evaluation)
+        if evaluation.rule == "operator_first_crack_plausibility":
+            harness.controller.admit_emergency_stop()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", persist)
+    await harness.controller.operator_mark_first_crack()
+    assert "mark_first_crack" not in harness.executor.commands
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_estop_during_failed_guard_drop_heat_cut_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1116: if an e-stop is admitted while the heat-off cut's verdict
+    persists, the stale cut never writes (the e-stop owns the actuators)."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    original = harness.sink.persist_evaluation
+    seen_phase_check_after_failure = False
+
+    async def persist(evaluation: SafetyEvaluation) -> int | None:
+        nonlocal seen_phase_check_after_failure
+        result = await original(evaluation)
+        failed = RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+        if failed and evaluation.rule == "command_phase_validity":
+            seen_phase_check_after_failure = True
+        elif seen_phase_check_after_failure:
+            harness.controller.admit_emergency_stop()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", persist)
+    writes_before = len(harness.executor.targets)
+    await harness.controller.tick()  # drop fails; e-stop lands mid-cut
+    assert seen_phase_check_after_failure
+    assert harness.executor.targets[writes_before:] == []
+
+
+@pytest.mark.asyncio
+async def test_latched_heat_off_is_retried_until_confirmed_below_the_guard() -> None:
+    """Codex P1 on #1117: the drop fails, the heat-off write ALSO fails, then
+    the bean dips below 196 °C. The latched tick must retry heat 0 (not skip
+    both the lever and the guard) until it is confirmed."""
+
+    class FlakyHeatOffExecutor(FailingCommandExecutor):
+        def __init__(self) -> None:
+            super().__init__({"drop_beans"})
+            self.heat_off_failures = 1
+
+        async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+            if heat_percent == 0 and self.heat_off_failures > 0:
+                self.heat_off_failures -= 1
+                raise RuntimeError("heat-off write failed")
+            await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+    executor = FlakyHeatOffExecutor()
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0), reading(bean=195.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    heat_before = harness.controller._current_heat  # pyright: ignore[reportPrivateUsage]
+    assert heat_before > 0
+    await harness.controller.tick()  # 197 °C: drop fails, heat-off write fails
+    assert harness.controller._current_heat == heat_before  # pyright: ignore[reportPrivateUsage]
+    assert executor.heat_off_failures == 0
+    harness.clock.advance(10.0)
+    await harness.controller.tick()  # 195 °C: below the guard, latched retry
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    assert harness.executor.targets[-1][0] == 0
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
+    """#1116: the mark-floor reading never crosses runs or stores non-finite."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    note = harness.controller._note_valid_bean_reading  # pyright: ignore[reportPrivateUsage]
+    note(reading(bean=182.0))
+    assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    note(None)
+    assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    for bad in (math.nan, math.inf):
+        note(RoastTelemetry.model_construct(bean_temp_c=bad, env_temp_c=200.0))
+        assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._prepare_run_bookkeeping(PROFILE)  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._last_valid_bean_temp_c is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_operator_resume_clears_the_mark_floor_reading() -> None:
+    """#1116: a reading from before a recovery wait never satisfies the floor;
+    a mark sent with the resume is refused until a fresh tick."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller._last_valid_bean_temp_c is None  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_exactly_at_floor_is_accepted() -> None:
+    """#1116: the floor is inclusive, and the configured value is honoured."""
+    config = ControllerConfig(operator_first_crack_min_bean_temp_c=160.0)
+    harness = _fc_source_harness([reading(bean=160.0)], config)
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    below = _fc_source_harness([reading(bean=159.9)], config)
+    await below.controller.tick()
+    await below.controller.operator_mark_first_crack()
+    assert below.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
 
 
 def test_development_elapsed_none_before_first_crack() -> None:
@@ -8078,6 +8503,7 @@ async def test_acknowledge_also_resets_completed_run() -> None:
 async def test_failed_operator_writes_surface_and_hold_phase() -> None:
     """A failed MCP write emits COMMAND_FAILED and never moves the phase."""
     fc = harness_in(3, FailingCommandExecutor({"mark_first_crack"}))
+    await fc.controller.tick()  # #1116: a consumed reading clears the mark floor
     await fc.controller.operator_mark_first_crack()
     assert fc.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
     assert RoastEventKind.COMMAND_FAILED in fc.events.kinds()
@@ -8150,7 +8576,9 @@ class RejectingSourcePolicy(SafetyPolicy):
     """Simulates a future rule change where event sources get rejected —
     the controller must honor the verdict and hold the phase."""
 
-    def evaluate_event_source(self, *, transition: str, source: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def evaluate_event_source(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, *, transition: str, source: object, operator_only_first_crack: bool = False
+    ) -> SafetyEvaluation:
         return SafetyEvaluation(
             rule="event_source_validity",
             verdict=SafetyVerdict.REJECT,

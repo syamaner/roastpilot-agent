@@ -176,7 +176,13 @@ async def _drive_slice(real_mcp: MCPServerProcess, store: RoastStore) -> None:
 
     adapter = RoasterControlAdapter(RoasterMCPClient(real_mcp.call_tool))
     clock = FakeClock()
-    config = AppConfig(controller=ControllerConfig(telemetry_log_interval_seconds=1.0))
+    # The mock charge ramp tops out at ~55 °C; this is a protocol slice, not a
+    # thermal one, so drop the operator-mark plausibility floor (#1116) below it.
+    config = AppConfig(
+        controller=ControllerConfig(
+            telemetry_log_interval_seconds=1.0, operator_first_crack_min_bean_temp_c=20.0
+        )
+    )
     service = RoastService(
         store,
         config=config,
