@@ -154,7 +154,8 @@ branch coverage of every changed line over those tests, and mutation checks
 that each changed safety guard is killed by a test. The mandatory
 `safety-reviewer`, the hosted full lanes and every preserved control are
 unchanged, and uncertain safety still falls back to full plus safety review.
-GATE_MACHINERY keeps the full gate and passed witness.
+GATE_MACHINERY keeps the full gate and passed witness, and a change to this
+route policy is itself GATE_MACHINERY.
 
 DOCS_ONLY requires the existing base-trusted classifier's `docs-only` result.
 ROUTINE requires focused behavioural tests, related cross-boundary contracts
@@ -206,8 +207,8 @@ Every route retains these controls:
 
 **Preserved controls:** `exact-commit-evidence; independent-risk-routed-review; feedback-triage; existing-coverage-gates; protected-checks; automatic-ready-head-Codex-boundary-and-wait; conversation-resolution; normal-protected-merge`
 
-A ROUTINE change no longer guarantees a single-process all-marker run on each
-change. Hosted and nightly ordinary tests remain under xdist, so D217's
+A ROUTINE or SAFETY_CRITICAL change no longer guarantees a single-process
+all-marker run on each change. Hosted and nightly ordinary tests remain under xdist, so D217's
 sequential-execution residual widens. Focused evidence is not equivalent to a
 full gate. Independent current-head review and existing hosted regression
 coverage remain required. Existing nightly lanes retain the exhaustive suite

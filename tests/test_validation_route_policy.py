@@ -331,6 +331,18 @@ def test_instruction_consumers_are_consistent() -> None:
     assert "current-head route assessment" in section
     assert "and `.venv/bin/python -m pytest`." not in section
     assert "Python coverage for full routes:" in section
+    # D240: the safety route's targeted evidence and its full-route exceptions
+    # are part of the procedure people follow, not only the table tokens.
+    flat = " ".join(section.split())
+    for phrase in (
+        "SAFETY_CRITICAL (D240): no local full run, UNLESS safety is uncertain",
+        "combined with GATE_MACHINERY",
+        "an assessment fallback applies",
+        "check every changed line and branch is covered",
+        "git diff --check origin/main...HEAD",
+        "mutation-check each changed safety guard",
+    ):
+        assert phrase in flat, phrase
     for source in ("roastpilot_agent", "scripts", ".agents/skills/capture-agent-usage/scripts"):
         assert f"--cov={source}" in section
     assert "route-applicable gates before\n   handback (AGENTS.md Validation routes)" in planner
