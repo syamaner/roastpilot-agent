@@ -242,3 +242,81 @@ def test_planned_finish(fc: float, percent: float, expected: float | None) -> No
         assert got is None
     else:
         assert got == pytest.approx(expected)
+
+
+def _study_heater_state(times: list[float], heats: list[float], k: int, tau: float) -> float:
+    """Transcription of the study's heater_state (zero-order-hold heat)."""
+
+    def heat_at(x: float) -> float:
+        i = max(j for j in range(len(times)) if times[j] <= x)
+        return heats[i] / 100.0
+
+    q = heats[0] / 100.0
+    t = times[0]
+    while t < times[k]:
+        q += (heat_at(t) - q) / tau
+        t += 1.0
+    return q
+
+
+@pytest.mark.parametrize(
+    ("times", "heats"),
+    [
+        ([0.0, 1.0, 1.86, 3.62], [100.0, 0.0, 100.0, 0.0]),  # review case
+        (
+            [392.974, 393.975, 397.554, 397.679, 397.801, 397.974, 398.974, 404.522],
+            [100.0, 100.0, 65.0, 65.0, 80.0, 65.0, 65.0, 40.0],
+        ),  # SSE-style bursts inside one grid second
+    ],
+)
+def test_heater_lag_filter_reproduces_the_study_on_irregular_samples(
+    times: list[float], heats: list[float]
+) -> None:
+    lag = HeaterLagFilter(TwoNodeParameters(tau_seconds=10.0))
+    for k, (t, h) in enumerate(zip(times, heats, strict=True)):
+        got = lag.update(elapsed_seconds=t, heat_percent=h)
+        assert got == pytest.approx(_study_heater_state(times, heats, k, 10.0))
+
+
+def test_heater_lag_filter_clamps_negative_heat_to_zero() -> None:
+    lag = HeaterLagFilter(TwoNodeParameters())
+    assert lag.update(elapsed_seconds=0.0, heat_percent=-20.0) == 0.0
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"tau_seconds": 0.0}, {"tau_seconds": -1.0}, {"kb": math.nan}, {"g": math.inf}],
+)
+def test_two_node_parameters_reject_unusable_constants(override: dict[str, float]) -> None:
+    with pytest.raises(ValueError, match="finite"):
+        TwoNodeParameters(**override)
+
+
+def test_slope_eta_nan_timestamp_voids_the_estimate() -> None:
+    points = [(0.0, 150.0), (math.nan, 151.0), (2.0, 152.0), (3.0, 153.0)]
+    assert slope_fc_eta_seconds(_curve(points), fc_target_bean_temp_c=176.0) is None
+
+
+def test_slope_window_includes_the_sample_exactly_at_its_edge() -> None:
+    """The window is inclusive: a sample exactly 30 s old still counts."""
+    points = [(0.0, 140.0), (30.0, 160.0), (30.0, 160.0)]
+    eta = slope_fc_eta_seconds(_curve(points), fc_target_bean_temp_c=176.0)
+    assert eta is not None  # without the edge sample the times would not vary
+
+
+def test_anchor_freezes_on_temperature_without_an_eta() -> None:
+    """A cold-room stall at/above 171 °C (no usable ETA) still freezes."""
+    tracker = FcAnchorTracker()
+    tracker.update(charge_elapsed_seconds=420.0, bean_temp_c=157.0, eta_seconds=110.0)
+    stalled = tracker.update(charge_elapsed_seconds=600.0, bean_temp_c=172.0, eta_seconds=None)
+    assert (stalled.state, stalled.fc_charge_seconds) == (AnchorState.FROZEN, 530.0)
+
+
+def test_anchor_ignores_a_negative_eta_and_opens_at_its_exact_bounds() -> None:
+    tracker = FcAnchorTracker()
+    assert (
+        tracker.update(charge_elapsed_seconds=420.0, bean_temp_c=160.0, eta_seconds=-5.0).state
+        is AnchorState.NONE
+    )
+    opened = tracker.update(charge_elapsed_seconds=420.0, bean_temp_c=155.0, eta_seconds=120.0)
+    assert (opened.state, opened.fc_charge_seconds) == (AnchorState.PROVISIONAL, 540.0)

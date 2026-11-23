@@ -91,6 +91,8 @@ def slope_fc_eta_seconds(
     """
     if not curve:
         return None
+    if not all(math.isfinite(s.elapsed_since_charge_seconds) for s in curve):
+        return None
     t_last = curve[-1].elapsed_since_charge_seconds
     points = [
         (s.elapsed_since_charge_seconds, s.bean_temp_c)
@@ -140,40 +142,55 @@ class TwoNodeParameters:
     ke: float = 0.005567468791396583
     tau_seconds: float = 269.8706228643829
 
+    def __post_init__(self) -> None:
+        """Reject constants the integration cannot use.
+
+        Raises:
+            ValueError: If any constant is non-finite or tau_seconds is not
+                positive.
+        """
+        values = (self.kb, self.cb, self.g, self.ka, self.ke, self.tau_seconds)
+        if not all(math.isfinite(v) for v in values) or self.tau_seconds <= 0.0:
+            raise ValueError("two-node parameters must be finite with tau_seconds > 0")
+
 
 class HeaterLagFilter:
     """The model's heater state Q, replayed from the heat actually applied.
 
-    Starts at the first applied heat fraction and follows
-    ``Q += dt (h - Q) / tau`` once per second of elapsed time, as the study's
-    ``heater_state`` does. Feed it only applied (acknowledged) heat, never a
-    requested value.
+    Reproduces the study's heater_state: Q starts at the first applied
+    heat fraction and, on a 1 s grid from the first sample, follows
+    Q += (h(g) - Q) / tau where h(g) is the heat in force at grid time
+    g (zero-order hold on the samples). Feed it only applied
+    (acknowledged) heat, never a requested value.
     """
 
     def __init__(self, parameters: TwoNodeParameters) -> None:
         """Create an unprimed filter.
 
         Args:
-            parameters: The model constants (only ``tau_seconds`` is used).
+            parameters: The model constants (only tau_seconds is used).
         """
         self._tau = parameters.tau_seconds
         self._q: float | None = None
-        self._t: float | None = None
+        self._grid: float = 0.0
+        self._last_sample: float = 0.0
         self._heat: float = 0.0
 
     @property
     def value(self) -> float | None:
-        """The current heater state as a 0-1 fraction, or ``None`` if unprimed."""
+        """The current heater state as a 0-1 fraction, or None if unprimed."""
         return self._q
 
     def update(self, *, elapsed_seconds: float, heat_percent: float) -> float | None:
-        """Advance to ``elapsed_seconds``; ``heat_percent`` applies from now on.
+        """Advance to elapsed_seconds; heat_percent applies from it on.
 
-        Non-finite inputs and a backwards clock leave the state unchanged.
+        Grid steps before elapsed_seconds use the heat of the previous
+        sample. Non-finite inputs and a sample earlier than the last one leave
+        the state unchanged.
 
         Args:
             elapsed_seconds: The charge-referenced time of this sample.
-            heat_percent: The heat applied at this sample, 0-100.
+            heat_percent: The heat applied from this sample on, 0-100.
 
         Returns:
             The heater state after the update.
@@ -181,16 +198,21 @@ class HeaterLagFilter:
         if not (math.isfinite(elapsed_seconds) and math.isfinite(heat_percent)):
             return self._q
         heat = min(max(heat_percent, 0.0), 100.0) / 100.0
-        if self._q is None or self._t is None:
-            self._q, self._t, self._heat = heat, elapsed_seconds, heat
+        if self._q is None:
+            self._q, self._grid, self._last_sample, self._heat = (
+                heat,
+                elapsed_seconds,
+                elapsed_seconds,
+                heat,
+            )
             return self._q
-        if elapsed_seconds < self._t:
+        if elapsed_seconds < self._last_sample:
             return self._q
-        q, t = self._q, self._t
-        while t + 1.0 <= elapsed_seconds:
+        q, grid = self._q, self._grid
+        while grid < elapsed_seconds:
             q += (self._heat - q) / self._tau
-            t += 1.0
-        self._q, self._t, self._heat = q, t, heat
+            grid += 1.0
+        self._q, self._grid, self._last_sample, self._heat = q, grid, elapsed_seconds, heat
         return self._q
 
 
@@ -331,7 +353,9 @@ class FcAnchorTracker:
     ) -> FcAnchor:
         """Fold one tick's ETA into the anchor.
 
-        A frozen or re-anchored anchor never moves here. A missing or
+        A frozen or re-anchored anchor never moves here. A provisional anchor
+        freezes in place once the bean reaches the freeze temperature, even
+        with no usable ETA that tick. A negative ETA is ignored. A missing or
         non-finite ETA keeps the current anchor.
 
         Args:
@@ -344,11 +368,22 @@ class FcAnchorTracker:
         """
         if self._anchor.state in (AnchorState.FROZEN, AnchorState.REANCHORED):
             return self._anchor
+        s = self._settings
+        if (
+            self._anchor.state is AnchorState.PROVISIONAL
+            and math.isfinite(bean_temp_c)
+            and bean_temp_c >= s.freeze_bean_temp_c
+        ):
+            # Freeze on temperature even when this tick has no usable ETA (a
+            # cold-room stall at or above the freeze temperature).
+            self._anchor = FcAnchor(AnchorState.FROZEN, self._anchor.fc_charge_seconds)
+            return self._anchor
         if eta_seconds is None or not all(
             math.isfinite(x) for x in (charge_elapsed_seconds, bean_temp_c, eta_seconds)
         ):
             return self._anchor
-        s = self._settings
+        if eta_seconds < 0.0:
+            return self._anchor
         if bean_temp_c < s.open_min_bean_temp_c or eta_seconds > s.open_max_eta_seconds:
             return self._anchor
         fc = charge_elapsed_seconds + eta_seconds
