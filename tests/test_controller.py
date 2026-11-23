@@ -5937,6 +5937,65 @@ async def test_failed_pre_fc_guard_drop_latches_heat_off_until_operator_resume()
     assert harness.controller._pre_fc_guard_heat_off_latched is False  # pyright: ignore[reportPrivateUsage]
 
 
+@pytest.mark.asyncio
+async def test_estop_during_mark_floor_evaluation_relays_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1116: an e-stop admitted while the floor verdict persists makes the
+    mark stale; nothing is relayed and development never starts."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    await harness.controller.tick()
+    original = harness.sink.persist_evaluation
+
+    async def persist(evaluation: SafetyEvaluation) -> int | None:
+        result = await original(evaluation)
+        if evaluation.rule == "operator_first_crack_plausibility":
+            harness.controller.admit_emergency_stop()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", persist)
+    await harness.controller.operator_mark_first_crack()
+    assert "mark_first_crack" not in harness.executor.commands
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_estop_during_failed_guard_drop_heat_cut_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#1116: if an e-stop is admitted while the heat-off cut's verdict
+    persists, the stale cut never writes (the e-stop owns the actuators)."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    original = harness.sink.persist_evaluation
+    seen_phase_check_after_failure = False
+
+    async def persist(evaluation: SafetyEvaluation) -> int | None:
+        nonlocal seen_phase_check_after_failure
+        result = await original(evaluation)
+        failed = RoastEventKind.COMMAND_FAILED in harness.events.kinds()
+        if failed and evaluation.rule == "command_phase_validity":
+            seen_phase_check_after_failure = True
+        elif seen_phase_check_after_failure:
+            harness.controller.admit_emergency_stop()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", persist)
+    writes_before = len(harness.executor.targets)
+    await harness.controller.tick()  # drop fails; e-stop lands mid-cut
+    assert seen_phase_check_after_failure
+    assert harness.executor.targets[writes_before:] == []
+
+
 def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
     """#1116: the mark-floor reading never crosses runs or stores non-finite."""
     harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
