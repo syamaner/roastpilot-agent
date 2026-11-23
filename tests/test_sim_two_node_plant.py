@@ -215,9 +215,10 @@ async def test_perturbed_plants_end_truthfully() -> None:
 
 
 @pytest.mark.asyncio
-async def test_detection_lag_delays_the_controller_first_crack() -> None:
-    """QA: with a 15 s detector lag the controller enters development 15 s
-    after the crack, as on the real roaster."""
+async def test_detection_lag_is_backdated_to_the_crack_onset() -> None:
+    """Codex P2 on #1132: like the real MCP adapter, a lagged detection carries
+    the onset backdate, so development enters late but its clock (and the
+    scoring origin) starts at the crack onset."""
     prompt = await run_closed_loop(
         config=ControllerConfig(),
         profile=PROFILE,
@@ -231,5 +232,10 @@ async def test_detection_lag_delays_the_controller_first_crack() -> None:
         ambient_c=19.5,
         fc_detection_lag_s=15,
     )
-    assert prompt.first_crack_charge_s is not None and lagged.first_crack_charge_s is not None
-    assert lagged.first_crack_charge_s - prompt.first_crack_charge_s == pytest.approx(15.0, abs=1.0)
+    assert lagged.development_entered_charge_s is not None
+    assert prompt.development_entered_charge_s is not None
+    assert lagged.development_entered_charge_s - prompt.development_entered_charge_s == (
+        pytest.approx(15.0, abs=1.0)
+    )
+    assert lagged.crack_onset_charge_s == prompt.crack_onset_charge_s
+    assert lagged.first_crack_charge_s == pytest.approx(lagged.crack_onset_charge_s, abs=1.0)

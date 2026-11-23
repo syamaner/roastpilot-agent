@@ -156,6 +156,8 @@ class PlantRoaster(RecordingExecutor):
         """Report the plant's current state as MCP telemetry."""
         window = self._bean_history[-31:]
         ror = (window[-1] - window[0]) * 60.0 / max(len(window) - 1, 1)
+        since = self._seconds_since_crack
+        backdate = float(since) if since is not None and self.first_crack_reported else None
         return RoastTelemetry.model_validate(
             {
                 "bean_temp_c": self.plant.bean_c,
@@ -164,6 +166,9 @@ class PlantRoaster(RecordingExecutor):
                 "ambient_temp_c": self.plant.ambient_c,
                 "ambient_age_seconds": 1.0,
                 "first_crack_detected": self.first_crack_reported,
+                # As the real MCP adapter does: how long ago the crack began, so
+                # the controller backdates its development clock to the onset.
+                "first_crack_backdate_seconds": backdate,
                 "cooling_on": self.plant.dropped,
             }
         )
@@ -212,7 +217,13 @@ class ClosedLoopResult:
 
     Attributes:
         ticks: ``(charge_s, bean_c, env_c, heat, fan, phase)`` per tick.
-        first_crack_charge_s: Charge time the controller entered DEVELOPMENT.
+        first_crack_charge_s: The controller's development-clock origin on the
+            charge clock (backdated to the reported crack onset), used for
+            scoring.
+        development_entered_charge_s: Charge time of the tick that entered
+            DEVELOPMENT (later than the origin by the detection lag).
+        crack_onset_charge_s: When the plant's bean actually crossed the
+            first-crack temperature.
         drop_charge_s: Charge time of the drop, or ``None``.
         drop_bean_c: Bean temperature at the drop, or ``None``.
         end_phase: The controller phase when the run ended.
@@ -225,6 +236,8 @@ class ClosedLoopResult:
 
     ticks: list[Tick] = field(default_factory=lambda: list[Tick]())
     first_crack_charge_s: float | None = None
+    development_entered_charge_s: float | None = None
+    crack_onset_charge_s: float | None = None
     drop_charge_s: float | None = None
     drop_bean_c: float | None = None
     end_phase: RoastPhase | None = None
@@ -304,8 +317,12 @@ async def run_closed_loop(
         await controller.tick()
         snap = controller.snapshot()
         now_s = clock.now + charge_s
-        if result.first_crack_charge_s is None and snap.phase is RoastPhase.DEVELOPMENT:
-            result.first_crack_charge_s = now_s
+        if result.crack_onset_charge_s is None and plant.bean_c >= first_crack_bean_c:
+            result.crack_onset_charge_s = now_s
+        if result.development_entered_charge_s is None and snap.phase is RoastPhase.DEVELOPMENT:
+            result.development_entered_charge_s = now_s
+            elapsed = snap.development_elapsed_seconds
+            result.first_crack_charge_s = now_s if elapsed is None else now_s - elapsed
         result.ticks.append(
             (now_s, plant.bean_c, plant.env_c, snap.current_heat, snap.current_fan, snap.phase)
         )
