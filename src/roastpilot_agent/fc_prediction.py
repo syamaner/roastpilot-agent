@@ -315,6 +315,51 @@ def two_node_fc_eta_seconds(
     return None
 
 
+def two_node_bean_after_seconds(
+    *,
+    bean_temp_c: float,
+    env_temp_c: float,
+    heater_state: float,
+    hold_heat_percent: float,
+    ambient_temp_c: float,
+    seconds: float,
+    parameters: TwoNodeParameters,
+) -> float | None:
+    """Bean temperature after ``seconds`` at a held heat (D239 finish law).
+
+    The same 1 s integration as :func:`two_node_fc_eta_seconds`, run for a
+    fixed time instead of to a target, interpolating within the last step.
+
+    Args:
+        bean_temp_c: The smoothed current bean temperature.
+        env_temp_c: The smoothed current environment temperature.
+        heater_state: The current heater state Q (0-1 fraction).
+        hold_heat_percent: The heat held for the projection, 0-100.
+        ambient_temp_c: The room temperature.
+        seconds: How far ahead to project; at most 1,800 s.
+        parameters: The model constants.
+
+    Returns:
+        The projected bean temperature, or ``None`` for non-finite input or a
+        horizon outside ``0 <= seconds <= 1800``.
+    """
+    inputs = (bean_temp_c, env_temp_c, heater_state, hold_heat_percent, ambient_temp_c, seconds)
+    if not all(math.isfinite(x) for x in inputs) or not 0.0 <= seconds <= 1800.0:
+        return None
+    p = parameters
+    heat = min(max(hold_heat_percent, 0.0), 100.0) / 100.0
+    b, e, q, t = bean_temp_c, env_temp_c, heater_state, 0.0
+    while t + 1.0 <= seconds:
+        db = p.kb * (e - b) - p.cb
+        de = p.g * q - p.ka * (e - ambient_temp_c) - p.ke * (e - b)
+        q += (heat - q) / p.tau_seconds
+        b += db
+        e += de
+        t += 1.0
+    remainder = seconds - t
+    return b + remainder * (p.kb * (e - b) - p.cb)
+
+
 class AnchorState(Enum):
     """Where the first-crack anchor is in its lifecycle (D239)."""
 
