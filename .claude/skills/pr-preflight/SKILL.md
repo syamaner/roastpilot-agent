@@ -38,6 +38,12 @@ Run the gates for every surface the diff touches:
   --cov-report=term-missing`; cover every changed line and branch. Never label a
   focused pass a full gate. Use
   `# pragma: no cover` only for a demonstrably unreachable path and record why.
+- SAFETY_CRITICAL (D240): no local full run. Run the changed modules' test files
+  and their direct dependants with `--cov=roastpilot_agent --cov-branch`, check
+  every changed line and branch is covered, run `git diff --check
+  origin/main...HEAD`, and mutation-check each changed safety guard (remove or
+  invert it in a scratch copy, confirm a test fails, restore by `cp`). The hosted
+  lanes are the full suite.
 - Web: from `web/`, run `npm run lint`, `npm run typecheck`, `npm test`, and
   `npm run build`.
 - Cross-boundary contract changes: run both Python and web gates and regenerate
