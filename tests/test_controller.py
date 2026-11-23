@@ -5996,6 +5996,45 @@ async def test_estop_during_failed_guard_drop_heat_cut_writes_nothing(
     assert harness.executor.targets[writes_before:] == []
 
 
+@pytest.mark.asyncio
+async def test_latched_heat_off_is_retried_until_confirmed_below_the_guard() -> None:
+    """Codex P1 on #1117: the drop fails, the heat-off write ALSO fails, then
+    the bean dips below 196 °C. The latched tick must retry heat 0 (not skip
+    both the lever and the guard) until it is confirmed."""
+
+    class FlakyHeatOffExecutor(FailingCommandExecutor):
+        def __init__(self) -> None:
+            super().__init__({"drop_beans"})
+            self.heat_off_failures = 1
+
+        async def set_targets(self, *, heat_percent: int, fan_percent: int) -> None:
+            if heat_percent == 0 and self.heat_off_failures > 0:
+                self.heat_off_failures -= 1
+                raise RuntimeError("heat-off write failed")
+            await super().set_targets(heat_percent=heat_percent, fan_percent=fan_percent)
+
+    executor = FlakyHeatOffExecutor()
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0), reading(bean=195.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    heat_before = harness.controller._current_heat  # pyright: ignore[reportPrivateUsage]
+    assert heat_before > 0
+    await harness.controller.tick()  # 197 °C: drop fails, heat-off write fails
+    assert harness.controller._current_heat == heat_before  # pyright: ignore[reportPrivateUsage]
+    assert executor.heat_off_failures == 0
+    harness.clock.advance(10.0)
+    await harness.controller.tick()  # 195 °C: below the guard, latched retry
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    assert harness.executor.targets[-1][0] == 0
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
 def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
     """#1116: the mark-floor reading never crosses runs or stores non-finite."""
     harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)

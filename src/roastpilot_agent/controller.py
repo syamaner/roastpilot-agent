@@ -3756,8 +3756,18 @@ class RoastController:
         # 100↔trim↔100 (the #218 lever-thrash). ``trim_window_open`` ignores the
         # carried latch, so a garbage ETA never arms it; the latch resets per
         # run/preheat in ``transition_to``.
-        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and (
-            self._pre_fc_guard_heat_off_latched or self._ceiling_guard_eligible(telemetry)
+        if (
+            self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            and self._pre_fc_guard_heat_off_latched
+        ):
+            # #1116 (Codex P1 on #1117): after a failed guard drop the lever is
+            # held off, and an unconfirmed heat-off (its own write failed) is
+            # retried EVERY latched tick until heat reads 0 — independent of
+            # whether this reading still qualifies for a drop.
+            await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
+            return
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and self._ceiling_guard_eligible(
+            telemetry
         ):
             # #1116: the guard drops this tick; never raise or hold heat first
             # (a failed drop would otherwise leave the lever target applied).
