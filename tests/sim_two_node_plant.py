@@ -17,12 +17,15 @@ throughout. Test-only: it never reaches a real roaster.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from typing import cast
 
 from roastpilot_agent.config import ControllerConfig, SafetyLimits
 from roastpilot_agent.controller import RoastController
 from roastpilot_agent.fc_prediction import TwoNodeParameters
+from roastpilot_agent.human_protection import ContainmentResult
 from roastpilot_agent.models import (
     AppliedRoasterState,
+    RoastEventKind,
     RoastPhase,
     RoastProfile,
     RoastTelemetry,
@@ -105,22 +108,49 @@ class PlantRoaster(RecordingExecutor):
     the bean reaches ``first_crack_bean_c``.
     """
 
-    def __init__(self, plant: TwoNodePlant, *, first_crack_bean_c: float = 182.0) -> None:
+    def __init__(
+        self,
+        plant: TwoNodePlant,
+        *,
+        first_crack_bean_c: float = 182.0,
+        fc_detection_lag_s: int = 0,
+    ) -> None:
         """Wrap a plant.
 
         Args:
             plant: The plant to drive.
-            first_crack_bean_c: Bean temperature at which MCP reports FC.
+            first_crack_bean_c: Bean temperature at which the crack happens.
+            fc_detection_lag_s: Seconds after the crack before MCP reports it
+                (the audio detector lags about 12-21 s on this roaster).
         """
         super().__init__()
         self.plant = plant
         self.first_crack_bean_c = first_crack_bean_c
-        self._bean_history: list[float] = [plant.bean_c]
+        self.fc_detection_lag_s = fc_detection_lag_s
+        self._seconds_since_crack: int | None = None
+        # Seed 30 s of history back along the model's current slope so the
+        # first reported RoR is the plant's, not an artefact of an empty window.
+        p = plant.parameters
+        slope = p.kb * (plant.env_c - plant.bean_c) - p.cb
+        self._bean_history: list[float] = [plant.bean_c - slope * k for k in range(30, 0, -1)]
+        self._bean_history.append(plant.bean_c)
 
     def advance(self) -> None:
         """One plant second; record the bean for the RoR window."""
         self.plant.step()
         self._bean_history.append(self.plant.bean_c)
+        if self._seconds_since_crack is not None:
+            self._seconds_since_crack += 1
+        elif self.plant.bean_c >= self.first_crack_bean_c:
+            self._seconds_since_crack = 0
+
+    @property
+    def first_crack_reported(self) -> bool:
+        """Whether MCP reports the crack yet (after the detection lag)."""
+        return (
+            self._seconds_since_crack is not None
+            and self._seconds_since_crack >= self.fc_detection_lag_s
+        )
 
     async def read_telemetry(self) -> RoastTelemetry | None:
         """Report the plant's current state as MCP telemetry."""
@@ -133,7 +163,7 @@ class PlantRoaster(RecordingExecutor):
                 "bean_ror_c_per_min": ror,
                 "ambient_temp_c": self.plant.ambient_c,
                 "ambient_age_seconds": 1.0,
-                "first_crack_detected": self.plant.bean_c >= self.first_crack_bean_c,
+                "first_crack_detected": self.first_crack_reported,
                 "cooling_on": self.plant.dropped,
             }
         )
@@ -148,11 +178,28 @@ class PlantRoaster(RecordingExecutor):
         self.plant.heat_fraction = heat_percent / 100.0
         await super().set_heat(heat_percent)
 
+    async def set_fan(self, fan_percent: int) -> None:
+        """A fan-only write leaves the plant's heat where it is."""
+        self.fan_writes.append(fan_percent)
+        await super().set_targets(
+            heat_percent=round(self.plant.heat_fraction * 100), fan_percent=fan_percent
+        )
+
     async def drop_beans(self) -> AppliedRoasterState | None:
         """Drop: the plant stops evolving; heat off."""
         self.plant.dropped = True
         self.plant.heat_fraction = 0.0
         return await super().drop_beans()
+
+    async def emergency_stop(self, *, reason: str) -> AppliedRoasterState | None:
+        """Emergency stop: heat off on the plant."""
+        self.plant.heat_fraction = 0.0
+        return await super().emergency_stop(reason=reason)
+
+    async def contain_heat_fixed_zero(self) -> ContainmentResult:
+        """Containment: heat off on the plant (classification as the legacy fake)."""
+        self.plant.heat_fraction = 0.0
+        return await super().contain_heat_fixed_zero()
 
 
 #: One tick of a closed-loop trace: (charge_s, bean_c, env_c, heat, fan, phase).
@@ -168,8 +215,12 @@ class ClosedLoopResult:
         first_crack_charge_s: Charge time the controller entered DEVELOPMENT.
         drop_charge_s: Charge time of the drop, or ``None``.
         drop_bean_c: Bean temperature at the drop, or ``None``.
-        end_phase: The controller phase when the run ended (a drop, a fault,
-            or the time limit).
+        end_phase: The controller phase when the run ended.
+        end_reason: ``"drop"``, ``"fault"`` (including the emergency stop a
+            fault itself issues), ``"timeout"`` or ``"other"``.
+        emergency_stop_reasons: Every emergency-stop reason the roaster saw.
+        drop_reason: The executed drop's typed reason value (for example
+            ``"ceiling_guard"``), or ``None``.
     """
 
     ticks: list[Tick] = field(default_factory=lambda: list[Tick]())
@@ -177,6 +228,9 @@ class ClosedLoopResult:
     drop_charge_s: float | None = None
     drop_bean_c: float | None = None
     end_phase: RoastPhase | None = None
+    end_reason: str | None = None
+    drop_reason: str | None = None
+    emergency_stop_reasons: list[str] = field(default_factory=lambda: list[str]())
 
     def bean_at(self, charge_s: float) -> float | None:
         """Bean temperature at the last tick at or before ``charge_s``."""
@@ -202,6 +256,7 @@ async def run_closed_loop(
     start: tuple[float, float, float, float] = WINTER_START,
     max_seconds: int = 900,
     first_crack_bean_c: float = 182.0,
+    fc_detection_lag_s: int = 0,
 ) -> ClosedLoopResult:
     """Run the real controller tick loop against the plant from ``start``.
 
@@ -215,7 +270,8 @@ async def run_closed_loop(
         ambient_c: Room temperature.
         start: ``(charge_s, bean_c, env_c, heater_state)``.
         max_seconds: Stop after this many ticks.
-        first_crack_bean_c: Bean temperature at which MCP reports FC.
+        first_crack_bean_c: Bean temperature at which the crack happens.
+        fc_detection_lag_s: Seconds after the crack before MCP reports it.
 
     Returns:
         The closed-loop trace and endpoints.
@@ -225,14 +281,17 @@ async def run_closed_loop(
     plant = TwoNodePlant(
         plant_parameters, ambient_c=ambient_c, bean_c=bean_c, env_c=env_c, heater_state=heater
     )
-    roaster = PlantRoaster(plant, first_crack_bean_c=first_crack_bean_c)
+    roaster = PlantRoaster(
+        plant, first_crack_bean_c=first_crack_bean_c, fc_detection_lag_s=fc_detection_lag_s
+    )
+    events = EventSink()
     controller = RoastController(
         config=config,
         safety=SafetyPolicy(SafetyLimits()),
         state_reader=roaster,
         command_executor=roaster,
         snapshot_sink=RecordingSnapshotSink(),
-        event_emitter=EventSink(),
+        event_emitter=events,
         clock=clock,
     )
     controller.load_profile(profile)
@@ -254,9 +313,21 @@ async def run_closed_loop(
         if plant.dropped:
             result.drop_charge_s = now_s
             result.drop_bean_c = plant.bean_c
+            result.end_reason = "drop"
             break
         if snap.phase not in (RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT):
+            if snap.phase is RoastPhase.FAULTED:
+                result.end_reason = "fault"
+            else:  # pragma: no cover - the plant never fails a read or leaves recovery
+                result.end_reason = "other"
             break
         roaster.advance()
         clock.advance(1.0)
+    else:
+        result.end_reason = "timeout"
+    result.emergency_stop_reasons = list(roaster.estop_reasons)
+    for kind, payload in events.events:
+        data = cast("dict[str, object]", payload) if isinstance(payload, dict) else {}
+        if kind is RoastEventKind.COMMAND_EXECUTED and data.get("command") == "drop_beans":
+            result.drop_reason = str(data.get("reason"))
     return result
