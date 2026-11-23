@@ -1,5 +1,18 @@
 # RoastPilot Agent Project State Registry
 
+**23 Nov 2026 — D239 S1 (#1116, PR #1117): winter-roast AUTOMATIC route.**
+The winter roast returns to the ordinary AUTOMATIC `serve` route under D239
+(roastpilot-plan#104): the anticipated first crack anchors control, the
+observed first crack is evidence, and the automatic drop is temperature-led.
+S1 adds `first_crack_source=operator_only` (MCP detection recorded as shadow
+evidence), a 150 °C operator-mark plausibility floor, and the 196 °C ceiling
+guard armed from charge under `operator_only`, failing closed to latched heat
+off if its drop fails. A refused mark is not yet shown on the dashboard
+(#1121). The HUMAN/v3 owned-transport branches stay unmerged and parked.
+Next: S2 estimator and anchor (#1118: research #1119, module #1120, then
+observe-only wiring). No live-readiness claim; physical validation remains
+open.
+
 **22 Nov 2026 — #1111 T3a review repair (private mock-only caller):**
 The private service opt-in remains bound to exact mock producer
 `39de5634bc454e546234998a4f6c2e0f7ad4dd21`. An entered heat or fan call
