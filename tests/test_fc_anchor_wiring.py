@@ -344,3 +344,46 @@ async def test_v23_upgrade_keeps_existing_rows_null_and_checks_the_state(
             )
     finally:
         await upgraded.close()
+
+
+@pytest.mark.asyncio
+async def test_stale_generation_mcp_detection_does_not_observe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An e-stop admitted while the source verdict persists makes the
+    detection stale: the anchor does not take it."""
+    harness = _charged(OPERATOR_ONLY)
+    await _ramp(harness, 150.0, 0.2, 40)
+    original = harness.sink.persist_evaluation
+
+    async def persist(evaluation: object) -> int | None:
+        result = await original(evaluation)  # type: ignore[arg-type]
+        if getattr(evaluation, "rule", None) == "event_source_validity":
+            harness.controller.admit_emergency_stop()
+        return result
+
+    monkeypatch.setattr(harness.sink, "persist_evaluation", persist)
+    harness.reader.readings = [_reading(165.0, fc=True)]
+    await harness.controller.tick()
+    tracker = harness.controller._fc_anchor_tracker  # pyright: ignore[reportPrivateUsage]
+    assert tracker.anchor.state is AnchorState.PROVISIONAL
+
+
+@pytest.mark.asyncio
+async def test_negative_backdate_is_ignored() -> None:
+    harness = _charged(OPERATOR_ONLY)
+    await _ramp(harness, 150.0, 0.2, 40)  # provisional anchor at 130 s
+    harness.reader.readings = [
+        RoastTelemetry.model_validate(
+            {
+                "bean_temp_c": 165.0,
+                "env_temp_c": 215.0,
+                "first_crack_detected": True,
+                "first_crack_backdate_seconds": -20.0,
+            }
+        )
+    ]
+    await harness.controller.tick()  # received at 40 s; a negative onset is ignored
+    snap = harness.controller.snapshot().fc_prediction
+    assert snap is not None
+    assert snap.anchor_fc_charge_seconds == pytest.approx(40.0)
