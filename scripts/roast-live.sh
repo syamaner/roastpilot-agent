@@ -124,6 +124,20 @@ elif [ "${CEILING_GUARD:-1}" = "1" ]; then
   export ROASTPILOT_CONTROLLER__POST_FIRST_CRACK_CONTROL__CEILING_GUARD_DROP_ENABLED=true
 fi
 
+# #1116: first-crack source. FC_SOURCE=operator_only makes the operator's
+# Mark First Crack the ONLY start of development; MCP audio detection is then
+# recorded as shadow evidence. FC_SOURCE=mcp_or_operator is the summer
+# behaviour. Unset leaves the configured value. Any other value is refused, so
+# a typo can never silently run the wrong arm.
+case "${FC_SOURCE:-}" in
+  "") ;;
+  operator_only|mcp_or_operator)
+    export ROASTPILOT_CONTROLLER__FIRST_CRACK_SOURCE="$FC_SOURCE" ;;
+  *)
+    echo "ERROR: FC_SOURCE must be operator_only or mcp_or_operator (got '$FC_SOURCE')" >&2
+    exit 1 ;;
+esac
+
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   echo "ERROR: MCP config not found: $COFFEE_ROASTER_MCP_CONFIG" >&2
   echo "       Set COFFEE_ROASTER_MCP_CONFIG to your coffee-roaster-mcp.yaml" >&2
@@ -219,7 +233,8 @@ ADV="advisor configured"
 # var, AND pydantic's full truthy set (1/true/yes/on/…) identically, because it
 # is the agent's own parser (Augment #402).
 #
-# Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text. A
+# Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text, line 3 =
+# the "First crack:" text (#1116). A
 # malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
 # exit) and both lines read "unresolved" — never a plausible-but-wrong version.
 #
@@ -236,8 +251,10 @@ BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
 # to refuse to roast; the port guard is, and keeps its hard failure).
 ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p' || true)"
 TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p' || true)"
+FIRST_CRACK="$(printf '%s\n' "$BANNER_LINES" | sed -n '3p' || true)"
 [ -n "$ADVISOR_CFG" ] || ADVISOR_CFG="$BANNER_UNRESOLVED"
 [ -n "$TRIM" ] || TRIM="$BANNER_UNRESOLVED"
+[ -n "$FIRST_CRACK" ] || FIRST_CRACK="$BANNER_UNRESOLVED"
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
@@ -264,6 +281,7 @@ for _ in $(seq 1 120); do
   Advisor    : ${ADV}
   Advisor cfg: ${ADVISOR_CFG}
   Pre-FC trim: ${TRIM}
+  First crack: ${FIRST_CRACK}
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
 

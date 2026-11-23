@@ -426,10 +426,15 @@ async def test_estop_during_operator_first_crack_cannot_publish_development() ->
             await super().mark_first_crack()
 
     executor = BlockingFirstCrackExecutor()
-    controller, _, _, events = _controller(executor=executor)
+    controller, _, _, events = _controller(
+        readings=[RoastTelemetry(bean_temp_c=182.0, env_temp_c=205.0)], executor=executor
+    )
     controller.transition_to(RoastPhase.STARTING)
     controller.transition_to(RoastPhase.PREHEATING)
     controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    # #1116: consume one reading at/above the mark floor so the mark reaches
+    # the parked MCP write this race needs.
+    await controller.tick()
     first_crack = asyncio.create_task(controller.operator_mark_first_crack())
     await asyncio.wait_for(executor.entered.wait(), timeout=1.0)
 
