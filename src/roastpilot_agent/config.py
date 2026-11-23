@@ -1488,6 +1488,49 @@ class FcAnchorConfig(BaseModel):
     model_ambient_max_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
 
 
+class FinishControlConfig(BaseModel):
+    """The D239 predictive finish-tracking law (slice 3, #1131).
+
+    Off by default; with ``enabled`` the controller (slice 3c) drives heat
+    toward the profile's drop target at the anchored planned finish and drops
+    at the target bean temperature. Every number is a D239 starting
+    hypothesis; temperatures are Celsius, heat is 0-100 percent duty.
+    """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
+    #: Hand heat to the finish law once the first-crack anchor exists.
+    enabled: bool = Field(default=False)
+    #: Seconds between finish-law decisions.
+    cadence_seconds: float = Field(default=5.0, gt=0.0, le=60.0)
+    heat_floor_percent: int = Field(default=25, ge=0, le=100)
+    heat_ceiling_percent: int = Field(default=100, ge=0, le=100)
+    #: Largest heat change per decision.
+    step_percent: int = Field(default=5, ge=1, le=50)
+    #: Subdivisions of one step either side of the applied heat that the
+    #: predictive search considers (D239: heat moves at most one step).
+    candidate_steps: int = Field(default=2, ge=1, le=5)
+    #: With the planned finish near or past, aim to reach the target this far
+    #: ahead (owner, 23 Nov: a late finish keeps raising heat).
+    late_horizon_seconds: float = Field(default=60.0, gt=0.0, le=600.0)
+    correction_window_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
+    correction_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
+    max_rate_bias_c_per_min: float = Field(default=3.0, gt=0.0, le=10.0)
+    max_prediction_error_c: float = Field(default=5.0, gt=0.0, le=20.0)
+    feedback_gain: float = Field(default=2.0, gt=0.0, le=10.0)
+    lag_horizon_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
+    #: A target drop with development this many percentage points under the
+    #: profile target raises a SAFETY_ALERT (owner, 23 Nov).
+    low_development_alert_points: float = Field(default=4.0, ge=0.0)
+
+    @model_validator(mode="after")
+    def _floor_below_ceiling(self) -> "FinishControlConfig":
+        """Reject an empty heat range."""
+        if self.heat_floor_percent > self.heat_ceiling_percent:
+            raise ValueError("finish_control heat_floor_percent must not exceed the ceiling")
+        return self
+
+
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
 
@@ -1611,6 +1654,8 @@ class ControllerConfig(BaseModel):
     first_crack_source: FirstCrackSource = Field(default=FirstCrackSource.MCP_OR_OPERATOR)
     # D239 slice 2 (#1118): the observe-only first-crack anchor and shadow model.
     fc_anchor: FcAnchorConfig = Field(default_factory=FcAnchorConfig)
+    # D239 slice 3 (#1131): the predictive finish law (default off).
+    finish_control: FinishControlConfig = Field(default_factory=FinishControlConfig)
     # Operator first-crack plausibility floor (#1116): an operator mark below
     # this indicated bean temperature, or before any telemetry, is REJECTed and
     # never relayed to MCP. Default 150.0 °C sits well under this roaster's
@@ -1704,6 +1749,34 @@ class ControllerConfig(BaseModel):
     # above — a selectable advisor teaching whose context inputs stay INERT
     # until explicitly enabled.
     joint_window_planner: JointWindowPlanner = Field(default_factory=JointWindowPlanner)
+
+    @model_validator(mode="after")
+    def _check_finish_control_prerequisites(self) -> "ControllerConfig":
+        """Forbid the finish law without its anchor and the 196 °C guard flag.
+
+        D239 slice 3 (#1131): the law starts from the first-crack anchor, so it
+        needs ``fc_anchor.enabled``; and it may keep raising heat when the
+        finish runs late (owner, 23 Nov), so the deterministic ceiling guard
+        flag must be on. The flag alone does not arm the guard before first
+        crack in the default ``first_crack_source``: slice 3c must also arm it
+        in ROASTING_PRE_FIRST_CRACK whenever the law owns heat (D239 item 5).
+
+        Returns:
+            The validated config.
+
+        Raises:
+            ValueError: If finish control is enabled without either.
+        """
+        if not self.finish_control.enabled:
+            return self
+        if not self.fc_anchor.enabled:
+            raise ValueError("finish_control.enabled requires fc_anchor.enabled")
+        if not self.post_first_crack_control.ceiling_guard_drop_enabled:
+            raise ValueError(
+                "finish_control.enabled requires post_first_crack_control."
+                "ceiling_guard_drop_enabled"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_joint_window_planner_requires_ceiling_guard(self) -> "ControllerConfig":
