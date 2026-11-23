@@ -2658,9 +2658,12 @@ class AppConfig(BaseSettings):
             The validated application config.
 
         Raises:
-            ValueError: If ``controller.finish_control.env_raise_cap_c`` is not
-                strictly below ``safety.max_env_temp_c``.
+            ValueError: If the law is enabled and
+                ``controller.finish_control.env_raise_cap_c`` is not strictly
+                below ``safety.max_env_temp_c``.
         """
+        if not self.controller.finish_control.enabled:
+            return self
         cap_c = self.controller.finish_control.env_raise_cap_c
         if cap_c >= self.safety.max_env_temp_c:
             raise ValueError(

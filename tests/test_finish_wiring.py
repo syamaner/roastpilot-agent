@@ -362,7 +362,7 @@ async def test_no_raise_on_a_tick_the_target_drop_is_due_and_alerts_are_once() -
 
 
 @pytest.mark.asyncio
-async def test_a_failed_target_drop_raises_no_alert_and_holds_the_phase() -> None:
+async def test_a_failed_target_drop_alerts_once_and_holds_the_phase() -> None:
     from tests.test_controller import FailingCommandExecutor
 
     harness = make_harness(
@@ -375,7 +375,8 @@ async def test_a_failed_target_drop_raises_no_alert_and_holds_the_phase() -> Non
     _anchor(harness)
     await harness.controller.tick()
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
-    assert not [p for k, p in harness.events.events if k is RoastEventKind.SAFETY_ALERT]
+    alerts = [p for k, p in harness.events.events if k is RoastEventKind.SAFETY_ALERT]
+    assert alerts == [{"alert": "finish_drop_failed"}]  # never low_development
 
 
 @pytest.mark.asyncio
@@ -575,5 +576,116 @@ async def test_an_estop_during_the_finish_drop_ends_the_tick(
 
     monkeypatch.setattr(harness.controller, "_maybe_finish_drop", stale)
     monkeypatch.setattr(harness.controller, "_maybe_deterministic_drop", d84)
+    await _tick(harness, _reading(185.0, ror=12.0))
+    assert called == []
+
+
+def test_a_flag_off_config_keeps_any_stricter_env_fault() -> None:
+    from roastpilot_agent.config import AppConfig, SafetyLimits
+
+    AppConfig(safety=SafetyLimits(max_env_temp_c=225.0))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_fails", [True, False])
+async def test_d84_never_follows_a_policy_drop_attempt_in_the_same_tick(
+    drop_fails: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _failing_drop([_reading(195.5)], heat=60)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.controller._first_crack_monotonic = harness.clock.now - 90.0  # pyright: ignore[reportPrivateUsage]
+    called: list[str] = []
+
+    async def d84(*_a: object, **_k: object) -> None:
+        called.append("d84")
+
+    monkeypatch.setattr(harness.controller, "_maybe_deterministic_drop", d84)
+    bean = 195.5 if drop_fails else 190.0
+    await _tick(harness, _reading(bean, ror=6.0))
+    assert called == ([] if drop_fails else ["d84"])
+
+
+@pytest.mark.asyncio
+async def test_a_failed_operator_drop_while_the_law_owns_heat_cuts_to_zero() -> None:
+    harness = _failing_drop([_reading(190.0)], heat=80)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    await harness.controller.operator_drop_beans()
+    assert harness.executor.targets[-1][0] == 0
+    assert harness.controller._finish_failed_drop_latched  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_failed_advisor_drop_while_the_law_owns_heat_cuts_to_zero() -> None:
+    from tests.test_controller import FailingCommandExecutor
+
+    first: list[RoastTelemetry | Exception | None] = [_reading(190.0, ror=6.0)]
+    harness = make_harness(
+        readings=first,
+        config=ON,
+        advisor=FakeAdvisor([decision(heat=80, fan=30, drop=True)]),
+        executor=FailingCommandExecutor({"drop_beans"}),
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    harness.controller._charge_monotonic = harness.clock.now - 700.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._current_heat = 80  # pyright: ignore[reportPrivateUsage]
+    harness.controller._current_fan = 30  # pyright: ignore[reportPrivateUsage]
+    _anchor(harness)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.controller._first_crack_monotonic = harness.clock.now - 120.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._finish_last_decision_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
+    harness.controller.request_advisory()
+    await _tick(harness, _reading(190.0, ror=6.0))
+    failed = [
+        p
+        for k, p in harness.events.events
+        if k is RoastEventKind.COMMAND_FAILED and p.get("source") == "advisor"  # type: ignore[union-attr]
+    ]
+    assert failed
+    assert harness.executor.targets[-1][0] == 0
+    assert harness.controller._finish_failed_drop_latched  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_a_resumed_run_with_the_law_off_trims_like_today(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resume is unsupported for the law, so a resumed run falls back to today's
+    controller, trim included, rather than flat heat with no law."""
+    late_anchor = ControllerConfig(
+        finish_control=FinishControlConfig(enabled=True),
+        fc_anchor=FcAnchorConfig(open_min_bean_temp_c=175.0),
+    )
+    harness = _charged(late_anchor)
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+
+    def eta() -> float:
+        return 30.0
+
+    monkeypatch.setattr(harness.controller, "_first_crack_eta_seconds", eta)
+    for bean in (160.0, 165.0, 170.0):
+        await _tick(harness, _reading(bean, ror=20.0))
+    assert harness.controller._trim_latched  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_an_estop_during_the_d84_step_ends_the_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _charged()
+    _anchor(harness)
+
+    async def stale(*_a: object, **_k: object) -> None:
+        harness.controller.admit_emergency_stop()
+
+    called: list[str] = []
+
+    async def advisory(*_a: object, **_k: object) -> None:
+        called.append("advisory")
+
+    monkeypatch.setattr(harness.controller, "_maybe_deterministic_drop", stale)
+    monkeypatch.setattr(harness.controller, "_maybe_run_advisory", advisory)
     await _tick(harness, _reading(185.0, ror=12.0))
     assert called == []
