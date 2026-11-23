@@ -177,8 +177,8 @@ def test_routine_route_retains_focused_behaviour_and_contracts() -> None:
     }
 
 
-def test_safety_route_requires_full_and_safety_review() -> None:
-    """Safety-relevant capabilities retain full validation and safety review."""
+def test_safety_route_requires_targeted_evidence_and_safety_review() -> None:
+    """Safety-relevant capabilities keep safety review and gain targeted evidence (D240)."""
     row = _parse_rows(_agents())[RouteId.SAFETY_CRITICAL]
     assert row.trigger == {
         "safety",
@@ -187,7 +187,14 @@ def test_safety_route_requires_full_and_safety_review() -> None:
         "hardware-command-path",
         "safety-relevant-runtime-capability",
     }
-    assert row.local == {"full"}
+    assert row.local == {
+        "focused-behaviour",
+        "cross-boundary-contracts",
+        "statics",
+        "changed-line-coverage",
+        "guard-mutation-checks",
+        "focused-not-full",
+    }
     assert row.reviewers == {"safety-reviewer", "risk-routed"}
     assert row.witness == {"not-required"}
 
@@ -268,10 +275,10 @@ def test_fallback_and_known_composition_preserve_union_obligations() -> None:
 
 
 def test_only_full_routes_declare_full_validation() -> None:
-    """A focused route cannot acquire the full-gate label."""
+    """A focused route cannot acquire the full-gate label; only gate machinery is full."""
     rows = _parse_rows(_agents())
     for route, row in rows.items():
-        if route in {RouteId.DOCS_ONLY, RouteId.ROUTINE}:
+        if route in {RouteId.DOCS_ONLY, RouteId.ROUTINE, RouteId.SAFETY_CRITICAL}:
             assert "full" not in row.local
             assert "focused-not-full" in row.local
             assert row.witness == {"not-required"}
@@ -324,6 +331,18 @@ def test_instruction_consumers_are_consistent() -> None:
     assert "current-head route assessment" in section
     assert "and `.venv/bin/python -m pytest`." not in section
     assert "Python coverage for full routes:" in section
+    # D240: the safety route's targeted evidence and its full-route exceptions
+    # are part of the procedure people follow, not only the table tokens.
+    flat = " ".join(section.split())
+    for phrase in (
+        "SAFETY_CRITICAL (D240): no local full run, UNLESS safety is uncertain",
+        "combined with GATE_MACHINERY",
+        "an assessment fallback applies",
+        "check every changed line and branch is covered",
+        "git diff --check origin/main...HEAD",
+        "mutation-check each changed safety guard",
+    ):
+        assert phrase in flat, phrase
     for source in ("roastpilot_agent", "scripts", ".agents/skills/capture-agent-usage/scripts"):
         assert f"--cov={source}" in section
     assert "route-applicable gates before\n   handback (AGENTS.md Validation routes)" in planner

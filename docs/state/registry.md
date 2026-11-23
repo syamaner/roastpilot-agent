@@ -1,5 +1,14 @@
 # RoastPilot Agent Project State Registry
 
+**23 Nov 2026 — D239 S2 (#1118, PRs #1120/#1123/#1125): first-crack anchor, observe-only.**
+The 30 s slope ETA anchors D239's predicted first crack; a fitted two-node
+model using the live room reading runs in shadow. The offline study
+(docs/research/fc-predictor) found the five-sample slope 40-60 s early and
+the room term worth about 0.5 s/°C. The anchor, both ETAs and the planned
+finish F/(1-p) are logged every tick (schema V23, 0.5 s telemetry interval in
+roast-live.sh) and steer nothing. Next: S3 finish-tracking heat/fan law and
+the temperature-led drop. No live-readiness claim.
+
 **23 Nov 2026 — D239 S1 (#1116, PR #1117): winter-roast AUTOMATIC route.**
 The winter roast returns to the ordinary AUTOMATIC `serve` route under D239
 (roastpilot-plan#104): the anticipated first crack anchors control, the

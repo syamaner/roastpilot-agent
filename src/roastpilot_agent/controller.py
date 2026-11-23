@@ -44,6 +44,17 @@ from roastpilot_agent.control_policy import (
     RoastControlPolicy,
     TrimSignal,
 )
+from roastpilot_agent.fc_prediction import (
+    AnchorSettings,
+    FcAnchorTracker,
+    FcPredictionSnapshot,
+    HeaterLagFilter,
+    TwoNodeParameters,
+    planned_finish_charge_seconds,
+    slope_fc_eta_seconds,
+    smoothed_bean_env_c,
+    two_node_fc_eta_seconds,
+)
 from roastpilot_agent.human_persistence import (
     CommandAuditOwner,
     CommandReference,
@@ -1756,6 +1767,10 @@ class ControllerSnapshot:
     human_command_disposition: CommandDisposition | None = None
     physical_intervention_required: bool = False
     emergency_fallback_disclosure: str | None = None
+    #: D239 slice 2 (#1118): this tick's observe-only first-crack evidence
+    #: (slope/model ETAs and the anchor), or ``None`` before charge or when
+    #: ``fc_anchor.enabled`` is off. Persisted with telemetry; never a lever.
+    fc_prediction: FcPredictionSnapshot | None = None
 
 
 @dataclass
@@ -1907,6 +1922,11 @@ class RoastController:
         # off (no lever re-raise) until a drop succeeds, the phase leaves
         # pre-FC, or a new run starts. Prevents 0 ↔ floor cycling at 196 °C.
         self._pre_fc_guard_heat_off_latched = False
+        # D239 slice 2 (#1118): observe-only first-crack anchor, re-armed per run.
+        self._fc_model_parameters = TwoNodeParameters()
+        self._fc_anchor_tracker = self._new_fc_anchor_tracker()
+        self._fc_heater_lag = HeaterLagFilter(self._fc_model_parameters)
+        self._fc_prediction: FcPredictionSnapshot | None = None
         # Monotonic instant of the debounced T0/charge transition into
         # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
@@ -2225,6 +2245,7 @@ class RoastController:
             )
         )
         return ControllerSnapshot(
+            fc_prediction=self._fc_prediction,
             phase=self._phase,
             current_heat=self._current_heat,
             current_fan=self._current_fan,
@@ -2631,6 +2652,10 @@ class RoastController:
             self._first_crack_monotonic = None
             # #1116: re-arm the once-per-run MCP first-crack shadow record.
             self._mcp_first_crack_shadow_recorded = False
+            # D239 (#1118): a fresh run gets a fresh anchor and heater state.
+            self._fc_anchor_tracker = self._new_fc_anchor_tracker()
+            self._fc_heater_lag = HeaterLagFilter(self._fc_model_parameters)
+            self._fc_prediction = None
             # A new run/preheat clears any staged FC backdating delta (#337):
             # belt-and-braces with the consume-on-stamp clear, so a delta from a
             # prior roast can never anchor a fresh roast's development clock.
@@ -3311,6 +3336,7 @@ class RoastController:
         telemetry = evidence.telemetry
         self._last_telemetry = telemetry
         self._note_valid_bean_reading(telemetry)
+        self._fc_prediction = None
         if not latched:
             self._consecutive_read_failures = 0
         if evidence.bound_child_epoch is None:
@@ -3535,6 +3561,10 @@ class RoastController:
         # snapshot publishes the same telemetry it acted on (E9).
         self._last_telemetry = telemetry
         self._note_valid_bean_reading(telemetry)
+        # D239 (Codex P2 on #1125): a prediction is published only for the
+        # reading it was computed from; a tick that returns early (fault,
+        # recovery) persists NULL rather than the previous tick's ETAs.
+        self._fc_prediction = None
         await self._snapshots.persist_snapshot(telemetry)
         if not self._generation_is_current(generation):
             return
@@ -5528,6 +5558,17 @@ class RoastController:
                     operator_only_first_crack=operator_only,
                 )
                 await self._snapshots.persist_evaluation(source)
+                if (
+                    self._generation_is_current(generation)
+                    and math.isfinite(telemetry.bean_temp_c)
+                    and telemetry.bean_temp_c >= self._config.operator_first_crack_min_bean_temp_c
+                ):
+                    # D239: an MCP detection is anchor evidence only at a
+                    # plausible bean temperature (#1116's floor) and on a
+                    # current generation; origin it at the reported onset.
+                    self._observe_fc_for_anchor(
+                        backdate_seconds=telemetry.first_crack_backdate_seconds
+                    )
                 if operator_only:
                     # #1116: MCP detection is shadow evidence only. Record the
                     # REJECTed source evaluation once per run (the detected flag
@@ -7644,6 +7685,7 @@ class RoastController:
             if self._human_run.endpoint is not EndpointDisposition.NONE:
                 return
             self._canonical_human_fc_confirmed = True
+        self._observe_fc_for_anchor()
         self._events.emit(RoastEventKind.FIRST_CRACK, event_payload)
         self.transition_to(RoastPhase.DEVELOPMENT)
 
@@ -8475,6 +8517,132 @@ class RoastController:
         )
         self._history.record_sample(sample)
         self._arm_pre_fc_milestones(telemetry, elapsed)
+        self._update_fc_prediction(telemetry, elapsed)
+
+    def _new_fc_anchor_tracker(self) -> FcAnchorTracker:
+        """A tracker with this config's D239 anchor window (#1118)."""
+        cfg = self._config.fc_anchor
+        return FcAnchorTracker(
+            AnchorSettings(
+                open_min_bean_temp_c=cfg.open_min_bean_temp_c,
+                open_max_eta_seconds=cfg.open_max_eta_seconds,
+                freeze_eta_seconds=cfg.freeze_eta_seconds,
+                freeze_bean_temp_c=cfg.freeze_bean_temp_c,
+                reanchor_threshold_seconds=cfg.reanchor_threshold_seconds,
+            )
+        )
+
+    def _fresh_model_ambient_c(self, telemetry: RoastTelemetry) -> float | None:
+        """The room reading for the shadow model, or ``None`` if missing/stale.
+
+        Independent of the fan doctrine's flag: the shadow model only logs.
+        Every invalid age (``nan``, negative, ``inf``, unknown) fails closed.
+
+        Args:
+            telemetry: This tick's telemetry.
+
+        Returns:
+            The room temperature in Celsius, or ``None``.
+        """
+        temp = telemetry.ambient_temp_c
+        age = telemetry.ambient_age_seconds
+        if temp is None or age is None or not math.isfinite(temp):
+            return None
+        if not (0.0 <= age <= self._config.fc_anchor.model_ambient_max_age_seconds):
+            return None
+        return temp
+
+    def _update_fc_prediction(self, telemetry: RoastTelemetry, elapsed: float) -> None:
+        """Compute this tick's observe-only FC evidence (D239 slice 2, #1118).
+
+        The 30 s slope ETA feeds the anchor while pre-FC; the two-node model
+        runs in shadow from the smoothed state, the replayed heater lag and a
+        fresh room reading. Nothing here writes to the roaster.
+
+        Args:
+            telemetry: The reading this tick consumed.
+            elapsed: Seconds since charge for this reading.
+        """
+        cfg = self._config.fc_anchor
+        if not cfg.enabled or self._profile is None:
+            return
+        curve = self._history.curve_window()
+        target = self._config.first_crack_target_bean_temp_c
+        slope_eta = slope_fc_eta_seconds(
+            curve, fc_target_bean_temp_c=target, window_seconds=cfg.slope_window_seconds
+        )
+        heater = self._fc_heater_lag.update(
+            elapsed_seconds=elapsed, heat_percent=float(self._current_heat)
+        )
+        model_eta: float | None = None
+        smoothed = smoothed_bean_env_c(curve, window_seconds=cfg.slope_window_seconds)
+        ambient = self._fresh_model_ambient_c(telemetry)
+        if smoothed is not None and heater is not None and ambient is not None:
+            model_eta = two_node_fc_eta_seconds(
+                bean_temp_c=smoothed[0],
+                env_temp_c=smoothed[1],
+                heater_state=heater,
+                hold_heat_percent=float(self._current_heat),
+                ambient_temp_c=ambient,
+                fc_target_bean_temp_c=target,
+                parameters=self._fc_model_parameters,
+            )
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            self._fc_anchor_tracker.update(
+                charge_elapsed_seconds=elapsed,
+                bean_temp_c=telemetry.bean_temp_c,
+                eta_seconds=slope_eta,
+            )
+        self._publish_fc_prediction(slope_eta, model_eta)
+
+    def _publish_fc_prediction(self, slope_eta: float | None, model_eta: float | None) -> None:
+        """Store the snapshot of the current anchor with the given ETAs (#1118)."""
+        anchor = self._fc_anchor_tracker.anchor
+        profile = self._profile
+        finish = (
+            None
+            if anchor.fc_charge_seconds is None or profile is None
+            else planned_finish_charge_seconds(
+                anchor.fc_charge_seconds,
+                target_development_percent=profile.target_development_percent,
+            )
+        )
+        self._fc_prediction = FcPredictionSnapshot(
+            slope_eta_seconds=slope_eta,
+            model_eta_seconds=model_eta,
+            anchor_state=anchor.state,
+            anchor_fc_charge_seconds=anchor.fc_charge_seconds,
+            planned_finish_charge_seconds=finish,
+        )
+
+    def _observe_fc_for_anchor(self, *, backdate_seconds: float | None = None) -> None:
+        """Feed the first observed first crack to the anchor (D239, #1118).
+
+        Called for a plausible MCP detection (including an operator_only
+        shadow detection) and for the operator's accepted mark; only the
+        first counts. The private HUMAN mark path does not call this: that
+        route is parked for the winter roast (D239) and its anchor stays
+        unobserved.
+
+        Args:
+            backdate_seconds: The MCP-reported crack-onset backdate, or
+                ``None`` (operator mark: receive time).
+        """
+        if not self._config.fc_anchor.enabled or self._charge_monotonic is None:
+            return
+        observed = self._charge_elapsed_seconds()
+        if (
+            backdate_seconds is not None
+            and math.isfinite(backdate_seconds)
+            and backdate_seconds > 0
+        ):
+            observed -= backdate_seconds
+        self._fc_anchor_tracker.observe_first_crack(charge_elapsed_seconds=observed)
+        last = self._fc_prediction
+        self._publish_fc_prediction(
+            None if last is None else last.slope_eta_seconds,
+            None if last is None else last.model_eta_seconds,
+        )
 
     def _arm_pre_fc_milestones(self, telemetry: RoastTelemetry, elapsed: float) -> None:
         """Arm the pre-FC curve milestones from the live reading (#275).

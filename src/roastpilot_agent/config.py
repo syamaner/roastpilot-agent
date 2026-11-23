@@ -1459,6 +1459,35 @@ class JointWindowPlanner(BaseModel):
     labelling most of DEVELOPMENT as closing."""
 
 
+class FcAnchorConfig(BaseModel):
+    """The D239 first-crack anchor, observe-only in slice 2 (#1118).
+
+    The controller computes the 30 s slope ETA, the shadow two-node model ETA
+    and the anchor every tick after charge and persists them with telemetry.
+    Nothing here moves heat, fan or drop. Every number is a D239 starting
+    hypothesis; temperatures are Celsius.
+    """
+
+    model_config = FINITE_NUMERIC_MODEL_CONFIG
+
+    #: Compute and persist the predictions and anchor (logging only).
+    enabled: bool = Field(default=True)
+    #: The anchor estimator's least-squares window.
+    slope_window_seconds: float = Field(default=30.0, gt=0.0, le=300.0)
+    #: Below this bean temperature no anchor is taken.
+    open_min_bean_temp_c: float = Field(default=155.0, gt=0.0)
+    #: An ETA longer than this is not yet trusted for the anchor.
+    open_max_eta_seconds: float = Field(default=120.0, gt=0.0)
+    #: The anchor freezes once the ETA is this short...
+    freeze_eta_seconds: float = Field(default=45.0, gt=0.0)
+    #: ...or once the bean reaches this temperature.
+    freeze_bean_temp_c: float = Field(default=171.0, gt=0.0)
+    #: An observed first crack further than this from the anchor moves it once.
+    reanchor_threshold_seconds: float = Field(default=30.0, gt=0.0)
+    #: The shadow model uses the room reading only while it is at most this old.
+    model_ambient_max_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
+
+
 class ControllerConfig(BaseModel):
     """Controller timing and advisory-call thresholds.
 
@@ -1580,6 +1609,8 @@ class ControllerConfig(BaseModel):
     # makes the operator's Mark First Crack the sole start and records MCP
     # audio detection as shadow evidence (one REJECTed source evaluation).
     first_crack_source: FirstCrackSource = Field(default=FirstCrackSource.MCP_OR_OPERATOR)
+    # D239 slice 2 (#1118): the observe-only first-crack anchor and shadow model.
+    fc_anchor: FcAnchorConfig = Field(default_factory=FcAnchorConfig)
     # Operator first-crack plausibility floor (#1116): an operator mark below
     # this indicated bean temperature, or before any telemetry, is REJECTed and
     # never relayed to MCP. Default 150.0 °C sits well under this roaster's
