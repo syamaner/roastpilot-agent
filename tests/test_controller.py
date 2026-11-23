@@ -58,6 +58,7 @@ from roastpilot_agent.models import (
     AppliedRoasterState,
     DropReason,
     FaultControlState,
+    FirstCrackSource,
     JointWindowStatus,
     OperatorAction,
     PostFcHeatAuthorityState,
@@ -5622,10 +5623,11 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     for step in NORMAL_PATH[:3]:
         harness.controller.transition_to(step)
     await harness.controller.operator_mark_first_crack()
-    assert harness.controller.phase is RoastPhase.DEVELOPMENT
-    assert "mark_first_crack" in harness.executor.commands
-    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
-    assert first_crack == [{"source": "operator"}]  # no reading consumed: never invent
+    # #1116: with no reading consumed yet the plausibility floor fails closed —
+    # no relay, no transition, and never an invented landmark.
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert "mark_first_crack" not in harness.executor.commands
+    assert [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK] == []
 
     # Once a server telemetry tick has been consumed, the supported operator
     # override persists that exact last validated bean reading for the fixed
@@ -5650,6 +5652,122 @@ async def test_operator_first_crack_override_stamped_and_gated() -> None:
     await harness2.controller.operator_mark_first_crack()
     assert harness2.controller.phase is RoastPhase.PREHEATING  # rejected, no transition
     assert harness2.executor.commands == []
+
+
+def _fc_source_harness(
+    readings: list[RoastTelemetry | Exception | None], config: ControllerConfig | None = None
+) -> Harness:
+    harness = make_harness(readings=readings, config=config)
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:  # …→ ROASTING_PRE_FIRST_CRACK
+        harness.controller.transition_to(step)
+    harness.events.events.clear()
+    return harness
+
+
+OPERATOR_ONLY = ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY)
+
+
+@pytest.mark.asyncio
+async def test_operator_only_mcp_detection_is_shadow_evidence_once_per_run() -> None:
+    """#1116: under operator_only a latched MCP detection never starts
+    development; it persists exactly one REJECTed source evaluation, even
+    though the detected flag stays set on every later tick."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc, fc, fc], OPERATOR_ONLY)
+    for _ in range(3):
+        await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert harness.controller._first_crack_monotonic is None  # pyright: ignore[reportPrivateUsage]
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    source_evals = [e for e in harness.sink.evaluations if e.rule == "event_source_validity"]
+    assert len(source_evals) == 1
+    assert source_evals[0].verdict is SafetyVerdict.REJECT
+    assert "operator_only" in source_evals[0].reason
+
+
+@pytest.mark.asyncio
+async def test_operator_only_operator_mark_starts_development_after_shadow() -> None:
+    """#1116: after MCP shadow evidence, the operator's mark is still the start."""
+    fc = reading(bean=184.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    assert harness.executor.commands.count("mark_first_crack") == 1
+    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
+    assert first_crack == [{"source": "operator", "bean_temp_c": 184.0}]
+    plausibility = [
+        e for e in harness.sink.evaluations if e.rule == "operator_first_crack_plausibility"
+    ]
+    assert [e.verdict for e in plausibility] == [SafetyVerdict.ALLOW]
+
+
+@pytest.mark.asyncio
+async def test_operator_only_shadow_latch_rearms_on_new_run() -> None:
+    """#1116: the once-per-run latch is cleared by the next run's preheat."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    await harness.controller.tick()
+    assert harness.controller._mcp_first_crack_shadow_recorded is True  # pyright: ignore[reportPrivateUsage]
+    for step in [
+        RoastPhase.DEVELOPMENT,
+        RoastPhase.COOLING,
+        RoastPhase.COMPLETE,
+        RoastPhase.IDLE,
+        RoastPhase.STARTING,
+        RoastPhase.PREHEATING,
+    ]:
+        harness.controller.transition_to(step)
+    assert harness.controller._mcp_first_crack_shadow_recorded is False  # pyright: ignore[reportPrivateUsage]
+
+
+def test_operator_only_advisor_context_hides_pre_fc_detection() -> None:
+    """#1116: the advisor never sees a pre-FC shadow detection as first crack;
+    the default source still passes the raw MCP flag through."""
+    fc = reading(bean=182.0, first_crack_detected=True)
+    for config, expected in ((OPERATOR_ONLY, False), (None, True)):
+        harness = _fc_source_harness([fc], config)
+        limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+        ctx = harness.controller._build_advisor_context(fc, limits)  # pyright: ignore[reportPrivateUsage]
+        assert ctx.first_crack_detected is expected
+    harness = _fc_source_harness([fc], OPERATOR_ONLY)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    limits = harness.controller._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = harness.controller._build_advisor_context(fc, limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.first_crack_detected is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", list(FirstCrackSource))
+async def test_operator_mark_below_floor_rejected_without_relay(source: FirstCrackSource) -> None:
+    """#1116: a mark below the plausibility floor (the 41 °C mock mis-click) is
+    a persisted REJECT with zero MCP relays, under either source setting."""
+    harness = _fc_source_harness([reading(bean=41.0)], ControllerConfig(first_crack_source=source))
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert "mark_first_crack" not in harness.executor.commands
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+    plausibility = [
+        e for e in harness.sink.evaluations if e.rule == "operator_first_crack_plausibility"
+    ]
+    assert [e.verdict for e in plausibility] == [SafetyVerdict.REJECT]
+    assert "41.0" in plausibility[0].reason
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_exactly_at_floor_is_accepted() -> None:
+    """#1116: the floor is inclusive, and the configured value is honoured."""
+    config = ControllerConfig(operator_first_crack_min_bean_temp_c=160.0)
+    harness = _fc_source_harness([reading(bean=160.0)], config)
+    await harness.controller.tick()
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    below = _fc_source_harness([reading(bean=159.9)], config)
+    await below.controller.tick()
+    await below.controller.operator_mark_first_crack()
+    assert below.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
 
 
 def test_development_elapsed_none_before_first_crack() -> None:
@@ -8078,6 +8196,7 @@ async def test_acknowledge_also_resets_completed_run() -> None:
 async def test_failed_operator_writes_surface_and_hold_phase() -> None:
     """A failed MCP write emits COMMAND_FAILED and never moves the phase."""
     fc = harness_in(3, FailingCommandExecutor({"mark_first_crack"}))
+    await fc.controller.tick()  # #1116: a consumed reading clears the mark floor
     await fc.controller.operator_mark_first_crack()
     assert fc.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
     assert RoastEventKind.COMMAND_FAILED in fc.events.kinds()
@@ -8150,7 +8269,9 @@ class RejectingSourcePolicy(SafetyPolicy):
     """Simulates a future rule change where event sources get rejected —
     the controller must honor the verdict and hold the phase."""
 
-    def evaluate_event_source(self, *, transition: str, source: object) -> SafetyEvaluation:  # pyright: ignore[reportIncompatibleMethodOverride]
+    def evaluate_event_source(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, *, transition: str, source: object, operator_only_first_crack: bool = False
+    ) -> SafetyEvaluation:
         return SafetyEvaluation(
             rule="event_source_validity",
             verdict=SafetyVerdict.REJECT,

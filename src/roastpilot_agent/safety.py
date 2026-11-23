@@ -958,8 +958,9 @@ class SafetyPolicy:
         *,
         transition: Literal["t0", "first_crack"],
         source: RoastEventSource,
+        operator_only_first_crack: bool = False,
     ) -> SafetyEvaluation:
-        """FC/T0 source validity (E3-S5, D16).
+        """FC/T0 source validity (E3-S5, D16; #1116).
 
         First-crack and T0 state transitions are accepted only from MCP
         detection status or explicit operator action (component plan §3
@@ -967,7 +968,31 @@ class SafetyPolicy:
         is REJECTed and the attempt is recorded in the trace: the advisor
         must never be able to start the roast clock or the development
         timer, directly or indirectly.
+
+        Args:
+            transition: The phase edge being requested.
+            source: Who requested it.
+            operator_only_first_crack: When True (``first_crack_source`` is
+                ``operator_only``), an MCP first-crack detection is REJECTed
+                too, so only the operator's mark can start development. T0
+                acceptance is unchanged.
+
+        Returns:
+            The typed source-validity evaluation.
         """
+        if (
+            operator_only_first_crack
+            and transition == "first_crack"
+            and source is RoastEventSource.MCP
+        ):
+            return SafetyEvaluation(
+                rule="event_source_validity",
+                verdict=SafetyVerdict.REJECT,
+                reason=(
+                    "first_crack transition from source 'mcp': rejected — first_crack_source "
+                    "is operator_only; MCP detection is recorded as shadow evidence only"
+                ),
+            )
         if source in (RoastEventSource.MCP, RoastEventSource.OPERATOR):
             return SafetyEvaluation(
                 rule="event_source_validity",
@@ -980,5 +1005,50 @@ class SafetyPolicy:
             reason=(
                 f"{transition} transition from source '{source.value}': rejected — only MCP "
                 f"detection or explicit operator action may drive T0/first-crack transitions"
+            ),
+        )
+
+    def evaluate_operator_first_crack_plausibility(
+        self,
+        *,
+        bean_temp_c: float | None,
+        min_bean_temp_c: float,
+    ) -> SafetyEvaluation:
+        """Operator first-crack mark plausibility floor (#1116).
+
+        An operator mark starts the development clock, so a mis-click during
+        drying would corrupt development percentage and every endpoint that
+        reads it. The mark is accepted only with a current indicated bean
+        reading at or above ``min_bean_temp_c``; no reading fails closed.
+
+        Args:
+            bean_temp_c: The last bean temperature the controller consumed for
+                this run, or ``None`` when it has consumed none yet.
+            min_bean_temp_c: The configured floor in Celsius.
+
+        Returns:
+            ``ALLOW`` at or above the floor, otherwise ``REJECT``.
+        """
+        if bean_temp_c is None:
+            return SafetyEvaluation(
+                rule="operator_first_crack_plausibility",
+                verdict=SafetyVerdict.REJECT,
+                reason="operator first-crack mark rejected — no bean temperature reading yet",
+            )
+        if bean_temp_c < min_bean_temp_c:
+            return SafetyEvaluation(
+                rule="operator_first_crack_plausibility",
+                verdict=SafetyVerdict.REJECT,
+                reason=(
+                    f"operator first-crack mark rejected — bean {bean_temp_c:.1f} °C is below "
+                    f"the {min_bean_temp_c:.1f} °C plausibility floor"
+                ),
+            )
+        return SafetyEvaluation(
+            rule="operator_first_crack_plausibility",
+            verdict=SafetyVerdict.ALLOW,
+            reason=(
+                f"operator first-crack mark at bean {bean_temp_c:.1f} °C: at or above the "
+                f"{min_bean_temp_c:.1f} °C floor"
             ),
         )

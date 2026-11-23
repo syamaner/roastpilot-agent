@@ -184,6 +184,19 @@ class RoastEventSource(Enum):
     SAFETY = "safety"
 
 
+class FirstCrackSource(Enum):
+    """Which first-crack evidence may start development (#1116).
+
+    ``MCP_OR_OPERATOR`` is the summer behaviour: MCP audio detection or the
+    operator's explicit mark starts development, whichever arrives first.
+    ``OPERATOR_ONLY`` makes the operator's mark the sole start; MCP detection
+    is then recorded as shadow evidence and never drives the transition.
+    """
+
+    MCP_OR_OPERATOR = "mcp_or_operator"
+    OPERATOR_ONLY = "operator_only"
+
+
 class DropReason(Enum):
     """Reason for a deterministic drop in command event payloads.
 

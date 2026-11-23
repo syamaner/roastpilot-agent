@@ -837,14 +837,15 @@ def test_main_reports_unreadable_config_and_exits_non_zero(
 def test_main_prints_advisor_then_trim(
     config_file: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Line 1 is the advisor line, line 2 the trim line — the launcher reads positionally."""
+    """Line 1 advisor, line 2 trim, line 3 first crack — the launcher reads positionally."""
     persist_config_edit(AppConfigEdit(advisor=AdvisorConfigEdit(prompt_version="c10")))
 
     assert main() == 0
 
     out = capsys.readouterr().out.splitlines()
-    assert len(out) == 2
+    assert len(out) == 3
     assert out[0] == "openai/gpt-4o  ·  prompt c10" + EXPERIMENT_TAG
+    assert out[2] == "MCP detection or operator mark, first wins; mark floor 150.0 °C"
     assert out[1] == (
         "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
         "base; recovery off; proven roast-6 default)"
@@ -866,7 +867,7 @@ def test_multiline_value_cannot_split_the_two_line_contract(
     assert main() == 0
 
     out = capsys.readouterr().out.splitlines()
-    assert len(out) == 2
+    assert len(out) == 3
     assert "bad slug" in out[0] and "\n" not in out[0]
     assert out[1] == (
         "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
@@ -927,3 +928,19 @@ def test_schema_defaults_match_the_untagged_wording() -> None:
     model = fields["model_slug"].default
     prompt = fields["prompt_version"].default
     assert lines.advisor_cfg == f"{model}  ·  prompt {prompt}"
+
+
+def test_first_crack_line_names_operator_only_and_floor() -> None:
+    """#1116: the banner says which evidence starts development and the floor."""
+    from roastpilot_agent.config import AppConfig, ControllerConfig
+    from roastpilot_agent.models import FirstCrackSource
+
+    config = AppConfig(
+        controller=ControllerConfig(
+            first_crack_source=FirstCrackSource.OPERATOR_ONLY,
+            operator_first_crack_min_bean_temp_c=160.0,
+        )
+    )
+    assert resolve_banner_lines(config).first_crack == (
+        "OPERATOR MARK ONLY (MCP detection = shadow evidence); mark floor 160.0 °C"
+    )

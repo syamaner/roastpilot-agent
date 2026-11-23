@@ -97,6 +97,7 @@ from roastpilot_agent.models import (
     AppliedRoasterState,
     DropReason,
     FaultControlState,
+    FirstCrackSource,
     OperatorAction,
     PostFcHeatAuthorityState,
     ReferenceRoast,
@@ -1894,6 +1895,9 @@ class RoastController:
         # ``development_elapsed_seconds`` in the advisor context — the DTR clock
         # the advisor reasons about near the drop.
         self._first_crack_monotonic: float | None = None
+        # #1116: one-shot latch so an operator_only run persists its MCP
+        # first-crack shadow evaluation once, not on every latched tick.
+        self._mcp_first_crack_shadow_recorded = False
         # Monotonic instant of the debounced T0/charge transition into
         # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
@@ -2616,6 +2620,8 @@ class RoastController:
             # A new run/preheat resets the development clock; it is (re)armed
             # only on the first-crack transition below.
             self._first_crack_monotonic = None
+            # #1116: re-arm the once-per-run MCP first-crack shadow record.
+            self._mcp_first_crack_shadow_recorded = False
             # A new run/preheat clears any staged FC backdating delta (#337):
             # belt-and-braces with the consume-on-stamp clear, so a delta from a
             # prior roast can never anchor a fresh roast's development clock.
@@ -5395,11 +5401,24 @@ class RoastController:
             # landmark, so it can only fire while still pre-FC — the FC transition
             # below moves the phase out of pre-FC and ends the window.
             self._maybe_emit_drying_end(telemetry)
-            if self._human_run is None and telemetry.first_crack_detected:
+            if (
+                self._human_run is None
+                and telemetry.first_crack_detected
+                and not self._mcp_first_crack_shadow_recorded
+            ):
+                operator_only = self._config.first_crack_source is FirstCrackSource.OPERATOR_ONLY
                 source = self._safety.evaluate_event_source(
-                    transition="first_crack", source=RoastEventSource.MCP
+                    transition="first_crack",
+                    source=RoastEventSource.MCP,
+                    operator_only_first_crack=operator_only,
                 )
                 await self._snapshots.persist_evaluation(source)
+                if operator_only:
+                    # #1116: MCP detection is shadow evidence only. Record the
+                    # REJECTed source evaluation once per run (the detected flag
+                    # stays latched every later tick) and never transition.
+                    self._mcp_first_crack_shadow_recorded = True
+                    return
                 if (
                     not self._generation_is_current(generation)
                     or self._phase is not RoastPhase.ROASTING_PRE_FIRST_CRACK
@@ -7449,6 +7468,18 @@ class RoastController:
             return
         if not self.can_transition(RoastPhase.DEVELOPMENT):
             raise InvalidTransitionError(self._phase, RoastPhase.DEVELOPMENT)
+        # #1116: a mark starts the development clock, so it must be plausible.
+        # Checked after the drift guard and before the MCP relay, so a refused
+        # mark reaches no roaster.
+        plausibility = self._safety.evaluate_operator_first_crack_plausibility(
+            bean_temp_c=None if self._last_telemetry is None else self._last_telemetry.bean_temp_c,
+            min_bean_temp_c=self._config.operator_first_crack_min_bean_temp_c,
+        )
+        await self._snapshots.persist_evaluation(plausibility)
+        if plausibility.verdict is not SafetyVerdict.ALLOW or not self._generation_is_current(
+            generation
+        ):
+            return
         try:
             dispatched, _ = await self._run_routine_write(
                 generation,
@@ -8637,7 +8668,13 @@ class RoastController:
             charge_guidance_min_c=self._profile.charge_guidance_min_c,
             charge_guidance_max_c=self._profile.charge_guidance_max_c,
             profile_name=self._profile.name,
-            first_crack_detected=telemetry.first_crack_detected,
+            # #1116: under operator_only a pre-FC MCP detection is shadow
+            # evidence; the advisor must not reason as if development began.
+            first_crack_detected=telemetry.first_crack_detected
+            and not (
+                self._config.first_crack_source is FirstCrackSource.OPERATOR_ONLY
+                and self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            ),
             seconds_since_charge=(
                 None if self._charge_monotonic is None else self._clock() - self._charge_monotonic
             ),

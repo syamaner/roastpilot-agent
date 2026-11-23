@@ -32,6 +32,7 @@ from pydantic import BaseModel, ValidationError
 from roastpilot_agent.advisor_screen import advice_models, screen_warning
 from roastpilot_agent.config import AppConfig
 from roastpilot_agent.controller import AUTO_ADVICE_PHASES
+from roastpilot_agent.models import FirstCrackSource
 
 #: Appended to a banner line whose RESOLVED value differs from the schema
 #: default, so a non-default arm can never be mistaken for the proven baseline.
@@ -56,10 +57,13 @@ class LaunchBannerLines:
         trim: The ``Pre-FC trim:`` line — the resolved late-Maillard trim depth
             and whether adaptive depth (#386) is active, including the depth's
             conditional coupling to post-FC D88/D96 bases at first crack.
+        first_crack: The ``First crack:`` line — which evidence may start
+            development and the operator-mark plausibility floor (#1116).
     """
 
     advisor_cfg: str
     trim: str
+    first_crack: str
 
 
 def _changed_fields(model: BaseModel) -> set[str]:
@@ -216,6 +220,22 @@ def _trim_line(config: AppConfig) -> str:
     return f"{prefix}{compact_authority}; non-default: {len(changed)} settings){EXPERIMENT_TAG}"
 
 
+def _first_crack_line(config: AppConfig) -> str:
+    """Format the ``First crack:`` line from a fully-resolved config (#1116).
+
+    Args:
+        config: The resolved application config.
+
+    Returns:
+        Which evidence starts development plus the operator-mark floor.
+    """
+    controller = config.controller
+    floor = f"mark floor {controller.operator_first_crack_min_bean_temp_c:.1f} °C"
+    if controller.first_crack_source is FirstCrackSource.OPERATOR_ONLY:
+        return f"OPERATOR MARK ONLY (MCP detection = shadow evidence); {floor}"
+    return f"MCP detection or operator mark, first wins; {floor}"
+
+
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:
     """Render both banner lines from an already-resolved config.
 
@@ -228,7 +248,11 @@ def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:
     Returns:
         The rendered :class:`LaunchBannerLines`.
     """
-    return LaunchBannerLines(advisor_cfg=_advisor_line(config), trim=_trim_line(config))
+    return LaunchBannerLines(
+        advisor_cfg=_advisor_line(config),
+        trim=_trim_line(config),
+        first_crack=_first_crack_line(config),
+    )
 
 
 def load_banner_lines() -> LaunchBannerLines:
@@ -267,10 +291,10 @@ def _one_line(text: str) -> str:
 def main() -> int:
     """Print the two banner lines on stdout for ``scripts/roast-live.sh``.
 
-    Line 1 is the ``Advisor cfg:`` text, line 2 the ``Pre-FC trim:`` text; the
-    launcher reads them positionally.  A config failure prints the reason on
-    stderr and returns non-zero so the launcher falls back to ``unresolved``
-    instead of showing a plausible but wrong prompt version.
+    Line 1 is the ``Advisor cfg:`` text, line 2 the ``Pre-FC trim:`` text and
+    line 3 the ``First crack:`` text; the launcher reads them positionally.  A
+    config failure prints the reason on stderr and returns non-zero so the
+    launcher falls back to ``unresolved`` instead of showing a plausible but wrong prompt version.
 
     Any newline inside a resolved value (a hand-edited saved config can hold a
     multi-line ``model_slug``) is folded to a space, so a value can never split
@@ -295,6 +319,7 @@ def main() -> int:
         return 1
     print(_one_line(lines.advisor_cfg))
     print(_one_line(lines.trim))
+    print(_one_line(lines.first_crack))
     return 0
 
 
