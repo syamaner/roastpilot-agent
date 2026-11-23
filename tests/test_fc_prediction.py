@@ -320,3 +320,36 @@ def test_anchor_ignores_a_negative_eta_and_opens_at_its_exact_bounds() -> None:
     )
     opened = tracker.update(charge_elapsed_seconds=420.0, bean_temp_c=155.0, eta_seconds=120.0)
     assert (opened.state, opened.fc_charge_seconds) == (AnchorState.PROVISIONAL, 540.0)
+
+
+def test_smoothed_bean_env_uses_the_line_value_at_the_newest_sample() -> None:
+    from roastpilot_agent.fc_prediction import smoothed_bean_env_c
+
+    curve = [
+        RoastCurveSample(
+            elapsed_since_charge_seconds=float(t),
+            bean_temp_c=150.0 + t,
+            env_temp_c=200.0 + 2 * t,
+            heat_percent=65,
+            fan_percent=30,
+        )
+        for t in range(5)
+    ]
+    smoothed = smoothed_bean_env_c(curve)
+    assert smoothed is not None
+    assert smoothed == (pytest.approx(154.0), pytest.approx(208.0))
+
+
+@pytest.mark.parametrize(
+    "points",
+    [
+        [],
+        [(0.0, 150.0), (1.0, 151.0)],  # too few samples
+        [(0.0, 150.0), (1.0, math.nan), (2.0, 152.0)],  # non-finite
+        [(5.0, 150.0), (5.0, 151.0), (5.0, 152.0)],  # times do not vary
+    ],
+)
+def test_smoothed_bean_env_none_cases(points: list[tuple[float, float]]) -> None:
+    from roastpilot_agent.fc_prediction import smoothed_bean_env_c
+
+    assert smoothed_bean_env_c(_curve(points)) is None

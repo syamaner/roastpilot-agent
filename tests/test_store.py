@@ -900,7 +900,7 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
     upgraded = RoastStore(db_path=db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 23 == len(MIGRATIONS)
         row = await fetch_one(upgraded, "SELECT excluded FROM roast_runs WHERE id = 'run-1'")
         assert row == (0,)
         detail = await upgraded.read_run("run-1")
@@ -916,11 +916,11 @@ async def test_v13_migration_adds_excluded_flag_back_compat(
 
 
 @pytest.mark.asyncio
-async def test_fresh_store_is_v22(tmp_store: RoastStore) -> None:
-    """A brand-new store lands on the current (v22) schema version."""
+async def test_fresh_store_is_v23(tmp_store: RoastStore) -> None:
+    """A brand-new store lands on the current (v23) schema version."""
     await tmp_store.initialize()
     try:
-        assert await tmp_store.schema_version() == 22 == len(MIGRATIONS)
+        assert await tmp_store.schema_version() == 23 == len(MIGRATIONS)
     finally:
         await tmp_store.close()
 
@@ -944,7 +944,7 @@ async def test_v14_migration_upgrades_real_v13_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 22
+        assert await upgraded.schema_version() == 23
         assert await upgraded.read_run("run-1") is not None
         assert "bean_sourcing_attempts" in await fetch_names(upgraded, "table")
         assert "idx_bean_sourcing_attempt_expiry" in await fetch_names(upgraded, "index")
@@ -973,7 +973,7 @@ async def test_v15_migration_adds_catalogue_counts_to_real_v14_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 23 == len(MIGRATIONS)
         row = await fetch_one(
             upgraded,
             "SELECT catalogue_discovered_count, catalogue_extracted_count"
@@ -1030,7 +1030,7 @@ async def test_v16_migration_adds_nullable_d96_trace_to_real_v15_database(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 23 == len(MIGRATIONS)
         [point] = await upgraded.read_telemetry_points("run-1")
         assert point.post_fc_recovery_enabled is None
         assert point.post_fc_heat_authority_state is None
@@ -1067,7 +1067,7 @@ async def test_v17_migration_preserves_historical_event_ids_and_index(
     upgraded = RoastStore(db_path)
     await upgraded.initialize()
     try:
-        assert await upgraded.schema_version() == 22 == len(MIGRATIONS)
+        assert await upgraded.schema_version() == 23 == len(MIGRATIONS)
         assert (
             await fetch_one(upgraded, "SELECT id FROM roast_events WHERE run_id = 'run-1'")
             == historical
@@ -11613,7 +11613,7 @@ async def test_v22_upgrade_preserves_all_v21_state(
     new = RoastStore(path)
     try:
         await new.initialize()
-        assert await new.schema_version() == 22
+        assert await new.schema_version() == 23
         assert [await fetch_one(new, "SELECT * FROM " + table) for table in tables] == before
         assert await fetch_one(new, "SELECT COUNT(*) FROM start_attempt_hold") == (0,)
     finally:
