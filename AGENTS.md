@@ -130,9 +130,9 @@ The full native gate uses the worktree's own venv:
 It runs all markers in one process, with no `-m`, `-k`, `--deselect` or `-n`.
 All three coverage roots and branch coverage are required. A passed witness
 means the exact exhaustive witness node passed, never skipped or deselected.
-The table's witness column specifies extra explicit witness evidence. A safety
-route still runs the unfiltered all-marker full gate; `not-required` never
-authorises filtering, skipping or deselecting that gate.
+The table's witness column specifies extra explicit witness evidence. A full
+route runs the unfiltered all-marker full gate; `not-required` never authorises
+filtering, skipping or deselecting that gate.
 Never label a focused pass a full gate.
 
 The closed tokens below declare obligations for assessment and review; they do
@@ -142,8 +142,20 @@ not classify arbitrary changes or prove that the process was followed.
 |---|---|---|---|---|---|
 | DOCS_ONLY | `trusted-classifier-docs-only` | `docs-consumers; governance; applicable-statics; focused-not-full` | `not-required` | `risk-routed` | `docs-only` |
 | ROUTINE | `application-behaviour; cross-boundary-contract; ordinary-behavioural-tests` | `focused-behaviour; cross-boundary-contracts; statics; focused-not-full` | `not-required` | `risk-routed` | `ordinary; serial; stress; packaging; web` |
-| SAFETY_CRITICAL | `safety; controller; recovery; hardware-command-path; safety-relevant-runtime-capability` | `full` | `not-required` | `safety-reviewer; risk-routed` | `ordinary; serial; stress; packaging; web` |
+| SAFETY_CRITICAL | `safety; controller; recovery; hardware-command-path; safety-relevant-runtime-capability` | `focused-behaviour; cross-boundary-contracts; statics; changed-line-coverage; guard-mutation-checks; focused-not-full` | `not-required` | `safety-reviewer; risk-routed` | `ordinary; serial; stress; packaging; web` |
 | GATE_MACHINERY | `test-selection; QA-wrapper; execution-environment; gate-machinery` | `full` | `passed` | `risk-routed` | `ordinary; serial; stress; packaging; web` |
+
+**D240 (operator ruling, 23 Nov 2026).** SAFETY_CRITICAL no longer runs the
+local single-process full gate, which took about an hour per head while the
+hosted lanes run every marker in 13-21 minutes. Its local evidence is focused
+behavioural tests for the changed modules and their direct dependants, the
+related cross-boundary contracts, statics (including `git diff --check`),
+branch coverage of every changed line over those tests, and mutation checks
+that each changed safety guard is killed by a test. The mandatory
+`safety-reviewer`, the hosted full lanes and every preserved control are
+unchanged, and uncertain safety still falls back to full plus safety review.
+GATE_MACHINERY keeps the full gate and passed witness, and a change to this
+route policy is itself GATE_MACHINERY.
 
 DOCS_ONLY requires the existing base-trusted classifier's `docs-only` result.
 ROUTINE requires focused behavioural tests, related cross-boundary contracts
@@ -195,8 +207,8 @@ Every route retains these controls:
 
 **Preserved controls:** `exact-commit-evidence; independent-risk-routed-review; feedback-triage; existing-coverage-gates; protected-checks; automatic-ready-head-Codex-boundary-and-wait; conversation-resolution; normal-protected-merge`
 
-A ROUTINE change no longer guarantees a single-process all-marker run on each
-change. Hosted and nightly ordinary tests remain under xdist, so D217's
+A ROUTINE or SAFETY_CRITICAL change no longer guarantees a single-process
+all-marker run on each change. Hosted and nightly ordinary tests remain under xdist, so D217's
 sequential-execution residual widens. Focused evidence is not equivalent to a
 full gate. Independent current-head review and existing hosted regression
 coverage remain required. Existing nightly lanes retain the exhaustive suite
