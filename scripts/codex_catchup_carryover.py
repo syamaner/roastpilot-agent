@@ -1,20 +1,22 @@
 """Decide whether a Codex clean verdict carries over a catch-up merge (D241).
 
 A head change that only merges the base branch into a PR branch leaves the
-PR's own change set unchanged. D241 lets a bot-authored CLEAN Codex verdict on
+PR's reviewed code untouched. D241 lets a bot-authored CLEAN Codex verdict on
 the previous head ``A`` carry to the new head ``B`` only when this script
 proves, from git alone, that:
 
-1. ``B`` is a merge commit whose first parent is ``A``;
-2. ``B``'s second parent is an ancestor of the base ref (it brings in base
-   history, nothing else); and
-3. the PR's own change set is identical: the stable patch-id of
-   ``diff(merge-base(base, A), A)`` equals that of
-   ``diff(merge-base(base, B), B)``, computed with zero context so unrelated
-   base changes that only shift line numbers do not count.
+1. ``B`` is a two-parent merge commit whose first parent is ``A``;
+2. ``B``'s second parent is an ancestor of the base ref (base history only);
+3. ``B``'s tree is EXACTLY the tree git produces for a clean automatic merge
+   of ``A`` and that second parent (``git merge-tree --write-tree``). Any edit
+   made during the merge (whitespace, a moved line, a conflict resolution, a
+   binary or mode change) changes the tree and fails the proof; a conflicting
+   merge has no automatic tree and fails too.
 
-Anything it cannot prove exits non-zero, and the caller re-triggers Codex.
-It never decides about findings verdicts, which do not carry over.
+Anything it cannot prove exits non-zero, and the caller re-triggers Codex. A
+catch-up chained onto an earlier catch-up (first parent is not ``A``) also
+re-triggers. It never decides about findings verdicts, which never carry.
+Requires git 2.38 or later.
 
 Usage::
 
@@ -32,18 +34,6 @@ from collections.abc import Sequence
 def _git(*args: str) -> str:
     """Run git and return stdout, raising on failure."""
     return subprocess.run(["git", *args], check=True, capture_output=True, text=True).stdout
-
-
-def _patch_id(base: str, head: str) -> str | None:
-    """The stable patch-id of the PR's own changes, or ``None`` if empty."""
-    merge_base = _git("merge-base", base, head).strip()
-    diff = _git("diff", "--no-color", "--no-ext-diff", "-U0", merge_base, head)
-    if not diff.strip():
-        return None
-    out = subprocess.run(
-        ["git", "patch-id", "--stable"], input=diff, check=True, capture_output=True, text=True
-    ).stdout.split()
-    return out[0] if out else None
 
 
 def carryover_reason(old: str, new: str, base: str) -> str | None:
@@ -68,11 +58,16 @@ def carryover_reason(old: str, new: str, base: str) -> str | None:
     )
     if probe.returncode != 0:
         return "merged-in parent is not base history"
-    old_id, new_id = _patch_id(base, old), _patch_id(base, new)
-    if old_id is None or new_id is None:
-        return "empty change set"
-    if old_id != new_id:
-        return "the PR's own change set differs"
+    merge = subprocess.run(
+        ["git", "merge-tree", "--write-tree", old_full, parents[1]],
+        capture_output=True,
+        text=True,
+    )
+    if merge.returncode != 0:
+        return "the automatic merge of the verified head and base conflicts"
+    automatic_tree = merge.stdout.split()[0]
+    if automatic_tree != _git("rev-parse", f"{new}^{{tree}}").strip():
+        return "new head is not the automatic merge of the verified head and base"
     return None
 
 

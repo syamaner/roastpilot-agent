@@ -688,9 +688,11 @@ branch into the PR therefore keeps a bot-authored **clean** Codex verdict, with
 no re-trigger, when `scripts/codex_catchup_carryover.py --old <verdict sha> --new
 <head> --base origin/main` prints `CARRY` and exits 0. It proves that the new head
 is a two-parent merge whose first parent is the verified head, that the merged-in
-parent is base history, and that the PR's own change set has an identical stable
-patch-id. A findings verdict never carries; any other head change, an evil merge
-or a conflict resolution touching the PR's files re-triggers Codex as above.
+parent is base history, and that the new head's tree is exactly git's clean
+automatic merge of the two (`git merge-tree --write-tree`). A findings verdict
+never carries; any other head change, any edit made during the merge (including
+whitespace or a moved line), a conflict, or a catch-up chained onto an earlier
+catch-up re-triggers Codex as above.
 Hosted CI still reruns on the new head, and update a PR's branch only when it is
 next to merge. Record the `CARRY` line in the merge context.
 
