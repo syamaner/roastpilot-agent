@@ -693,6 +693,24 @@ catches what a strong single lens misses; the constraint Codex must satisfy is *
 re-litigating resolved threads on every push*, which the once-on-final-commit discipline
 enforces. (Memory: `claude-review-not-a-required-check`.)
 
+**Catch-up carry-over (D241, operator ruling 23 Nov 2026).** This repository cannot
+use GitHub's merge queue (organisation-only), and strict protection makes every
+merge put the other open PRs behind. A head change that ONLY merges the base
+branch into the PR therefore keeps a bot-authored **clean** Codex verdict, with
+no re-trigger, when `scripts/codex_catchup_carryover.py --old <verified head> --new
+<head> --base origin/main` prints `CARRY` and exits 0. The verified head is the
+commit the clean verdict names, or a head that itself reached `CARRY` from it (a
+chain of recorded `CARRY` lines is sound, because each step is an exact automatic
+merge). The script proves that the new head is a two-parent merge whose first
+parent is the verified head, that the merged-in parent is base history, and that
+the new head's tree is exactly git's clean automatic merge of the two (`git
+merge-tree --write-tree`). A findings verdict never carries; any other head
+change, any edit made during the merge (including whitespace or a moved line), and
+any conflicted catch-up, even one resolved with `-X ours`/`-X theirs`,
+re-triggers Codex as above. Hosted CI still reruns on the new head, and update a
+PR's branch only when it is next to merge. Record each `CARRY` line in the merge
+context.
+
 **Draft phase vs ready phase (the shift-left reconciliation, D103-adjacent; corrected 27
 Jul 2026).** The once-on-final-commit rule above governs the **post-ready** phase: a
 marked-ready PR heading to merge, where re-triggering across pushes is re-litigation
@@ -733,7 +751,8 @@ repo is public, so anyone can add a 👍 OR post a look-alike comment copying th
 head sha — verify the reaction's / comment's `user.login` is the bot (the reactions API exposes it),
 because content or a bare reaction alone is spoofable; and **any verdict carrying a
 `Reviewed commit:` sha — clean comment AND findings-review alike — counts only when that sha
-EQUALS the current PR head** (a bot-authored verdict from an earlier in-flight review can post
+EQUALS the current PR head** (or, for a clean verdict only, when the current head is a
+D241 catch-up merge of it that `scripts/codex_catchup_carryover.py` reports as `CARRY`) (a bot-authored verdict from an earlier in-flight review can post
 *after* the final-commit trigger yet name a stale sha — identity + recency alone would accept a
 verdict about old code; a stale findings-review is still worth triaging, it just does not satisfy
 the wait for the current head). The same bot-identity requirement applies to the **findings**
