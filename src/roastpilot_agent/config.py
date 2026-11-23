@@ -1522,6 +1522,15 @@ class FinishControlConfig(BaseModel):
     #: A target drop with development this many percentage points under the
     #: profile target raises a SAFETY_ALERT (owner, 23 Nov).
     low_development_alert_points: float = Field(default=4.0, ge=0.0)
+    #: Past the planned finish by more than this, the law stops raising heat
+    #: and alerts once (a late finish keeps raising only within this window).
+    max_overrun_seconds: float = Field(default=120.0, gt=0.0, le=600.0)
+    #: Stall check: with the bean RoR at or below this, the law never raises
+    #: heat (a frozen or detached probe must not drive heat up).
+    stall_ror_c_per_min: float = Field(default=0.5, ge=0.0, le=5.0)
+    #: The law never raises heat with the environment at or above this
+    #: (below the 240 °C ``max_env_temp_c`` fault).
+    env_raise_cap_c: float = Field(default=230.0, gt=0.0, le=240.0)
 
     @model_validator(mode="after")
     def _floor_below_ceiling(self) -> "FinishControlConfig":

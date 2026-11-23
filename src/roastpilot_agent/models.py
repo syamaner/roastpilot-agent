@@ -214,6 +214,10 @@ class DropReason(Enum):
     #: regardless of the RoR-taper loop's flag or engagement (the safety
     #: anchor every roast needs, not a taper feature).
     CEILING_GUARD = "ceiling_guard"
+    #: D239 slice 3c (#1131): the finish law's temperature-led drop, firing
+    #: when the bean reaches the profile's ``target_drop_temp_c`` whatever the
+    #: development percentage (owner, 23 Nov).
+    FINISH_TARGET = "finish_target"
     #: D230's charged human-mode protective endpoint.
     HUMAN_PROTECTION = "human_protection"
 
