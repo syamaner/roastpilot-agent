@@ -202,6 +202,8 @@ class FinishTracker:
             if charge_seconds - pending.due_charge_seconds > _MAX_MATURITY_LATENESS_SECONDS:
                 continue
             error = bean_temp_c - pending.predicted_bean_c
+            if not math.isfinite(error):
+                continue
             self.last_error_c = error
             sample = error * 60.0 / s.correction_window_seconds
             blended = (1.0 - s.correction_alpha) * self.rate_bias_c_per_min + (
@@ -268,9 +270,13 @@ class FinishTracker:
         heater = inputs.heater_state
         if heater is None or not math.isfinite(heater) or not 0.0 <= heater <= 1.0:
             return "no_heater_state"
-        if abs(self.rate_bias_c_per_min) >= s.max_rate_bias_c_per_min:
+        bias = self.rate_bias_c_per_min
+        if not math.isfinite(bias) or abs(bias) >= s.max_rate_bias_c_per_min:
             return "bias_at_bound"
-        if self.last_error_c is not None and abs(self.last_error_c) > s.max_prediction_error_c:
+        error = self.last_error_c
+        if error is not None and (
+            not math.isfinite(error) or abs(error) > s.max_prediction_error_c
+        ):
             return "prediction_error"
         return None
 
@@ -341,7 +347,7 @@ class FinishTracker:
             seconds=window,
             parameters=self.parameters,
         )
-        if ahead is not None:  # pragma: no branch - inputs validated by the caller
+        if ahead is not None and math.isfinite(ahead):
             self._pending.append(_Pending(inputs.charge_seconds + window, ahead, heat))
             self._pending = self._pending[-_MAX_PENDING:]
 

@@ -364,3 +364,24 @@ def test_config_refuses_an_empty_heat_range_and_missing_prerequisites() -> None:
             finish_control=on,
             post_first_crack_control=PostFirstCrackControl(ceiling_guard_drop_enabled=False),
         )
+
+
+def test_overflow_sized_inputs_never_latch_a_nan_correction() -> None:
+    """Safety re-pass: finite but overflow-sized state yields a NaN projection;
+    it is never stored, and a NaN bias or error forces the feedback fallback."""
+    tracker = FinishTracker()
+    tracker.decide(_inputs(bean_temp_c=-1e308, env_temp_c=1e308))
+    assert tracker._pending == []  # pyright: ignore[reportPrivateUsage]
+    for bias, error, reason in (
+        (math.nan, None, "bias_at_bound"),
+        (0.0, math.nan, "prediction_error"),
+    ):
+        latched = FinishTracker()
+        latched.rate_bias_c_per_min, latched.last_error_c = bias, error
+        decision = latched.decide(_inputs())
+        assert (decision.mode, decision.reason) == (FinishMode.FEEDBACK, reason)
+    observer = FinishTracker()
+    observer.decide(_held_inputs(600.0))
+    observer._pending[0].predicted_bean_c = math.nan  # pyright: ignore[reportPrivateUsage]
+    observer.observe(charge_seconds=660.0, bean_temp_c=190.0)
+    assert observer.last_error_c is None and observer.rate_bias_c_per_min == 0.0
