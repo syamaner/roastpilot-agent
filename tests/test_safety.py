@@ -817,6 +817,48 @@ def test_event_source_validity(
         assert evaluation.verdict is SafetyVerdict.REJECT
 
 
+@pytest.mark.parametrize("transition", ["t0", "first_crack"])
+@pytest.mark.parametrize("source", list(RoastEventSource))
+def test_event_source_validity_operator_only(
+    policy: SafetyPolicy, transition: str, source: RoastEventSource
+) -> None:
+    """#1116: operator_only rejects MCP for first crack only; T0 and the
+    operator are unchanged, and non-MCP/operator sources stay rejected."""
+    evaluation = policy.evaluate_event_source(
+        transition=transition,  # pyright: ignore[reportArgumentType]
+        source=source,
+        operator_only_first_crack=True,
+    )
+    accepted = source is RoastEventSource.OPERATOR or (
+        source is RoastEventSource.MCP and transition == "t0"
+    )
+    assert evaluation.verdict is (SafetyVerdict.ALLOW if accepted else SafetyVerdict.REJECT)
+    if source is RoastEventSource.MCP and transition == "first_crack":
+        assert "shadow evidence" in evaluation.reason
+
+
+@pytest.mark.parametrize(
+    ("bean", "verdict"),
+    [
+        (None, SafetyVerdict.REJECT),
+        (41.0, SafetyVerdict.REJECT),
+        (149.9, SafetyVerdict.REJECT),
+        (150.0, SafetyVerdict.ALLOW),
+        (189.0, SafetyVerdict.ALLOW),
+    ],
+)
+def test_operator_first_crack_plausibility_floor(
+    policy: SafetyPolicy, bean: float | None, verdict: SafetyVerdict
+) -> None:
+    """#1116: inclusive floor; no reading fails closed."""
+    evaluation = policy.evaluate_operator_first_crack_plausibility(
+        bean_temp_c=bean, min_bean_temp_c=150.0
+    )
+    assert evaluation.rule == "operator_first_crack_plausibility"
+    assert evaluation.verdict is verdict
+    assert evaluation.reason
+
+
 def test_advisor_can_never_drive_t0_or_fc(policy: SafetyPolicy) -> None:
     """The talk's core invariant, stated directly."""
     for transition in ("t0", "first_crack"):

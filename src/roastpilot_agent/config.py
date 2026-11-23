@@ -14,7 +14,7 @@ from urllib.parse import urlsplit, urlunsplit
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from .models import RoastPhase
+from .models import FirstCrackSource, RoastPhase
 
 # Phase-keyed advisor consult floors — advisor cadence scales with first-crack
 # proximity (D32 / #191, refining #171). The advisor is consulted where it adds
@@ -1575,6 +1575,18 @@ class ControllerConfig(BaseModel):
     # ETA. Default 176.0 °C = the #229-validated FC band midpoint (171-180 °C) on
     # this roaster's indicated probe. Anticipation context only; never a lever.
     first_crack_target_bean_temp_c: float = Field(default=176.0, gt=0)
+    # First-crack source (#1116): which evidence may start development. The
+    # default keeps the summer MCP-or-operator behaviour; ``operator_only``
+    # makes the operator's Mark First Crack the sole start and records MCP
+    # audio detection as shadow evidence (one REJECTed source evaluation).
+    first_crack_source: FirstCrackSource = Field(default=FirstCrackSource.MCP_OR_OPERATOR)
+    # Operator first-crack plausibility floor (#1116): an operator mark below
+    # this indicated bean temperature, or before any telemetry, is REJECTed and
+    # never relayed to MCP. Default 150.0 °C sits well under this roaster's
+    # indicated FC band (171-189 °C observed, summer and winter) so a genuine
+    # mark is never refused, while a mis-click during drying (a mock run
+    # accepted a mark at 41 °C) cannot start the development clock.
+    operator_first_crack_min_bean_temp_c: float = Field(default=150.0, gt=0)
     # Drying-end landmark (#351): the bean temperature at the drying→browning
     # boundary, recorded once pre-FC as a DISPLAY/observability signal (the chart
     # dry-end marker + the persisted timeline). Default 150.0 °C is .alog-validated
