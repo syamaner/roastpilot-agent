@@ -45,6 +45,12 @@ from roastpilot_agent.store import RoastStore
 from tests.conftest import FakeClock
 from tests.test_controller import PROFILE
 
+#: Test-side budget for a real MCP stdio child to reach a held state (#1124).
+#: Each wait is on an event, so a generous bound only costs time when something
+#: is genuinely stuck; 3-4 s timed out on a loaded hosted runner (RS4, 23 Nov).
+#: Product timeouts are unchanged.
+_REAL_CHILD_WAIT_SECONDS = 15.0
+
 _MCP_COMMAND = Path(resolve_mcp_command(DEFAULT_MCP_COMMAND))
 pytestmark = [
     pytest.mark.asyncio,
@@ -353,7 +359,7 @@ async def _exercise_route(
         )
     )
     try:
-        await asyncio.wait_for(evaluation_held.wait(), 4)
+        await asyncio.wait_for(evaluation_held.wait(), _REAL_CHILD_WAIT_SECONDS)
         if interval == "barrier":
             # Through the real producer, establish the dropped-beans state
             # D212 requires to stop cooling. The service DROP is held before
@@ -372,7 +378,7 @@ async def _exercise_route(
         )
         assert acknowledgement.result == "accepted" and acknowledgement.queued
         completion = asyncio.create_task(runner.tick_once())
-        await asyncio.wait_for(reserved.wait(), 4)
+        await asyncio.wait_for(reserved.wait(), _REAL_CHILD_WAIT_SECONDS)
         if interval == "barrier":
             # D212 already obtained exact-session safe-zero readback before
             # reaching settlement. Do not spend the held wait on another RPC.
@@ -384,18 +390,18 @@ async def _exercise_route(
             assert ready.session_id == session and ready.phase == "fault"
             assert not ready.active and ready.cooling_on
         if route == "global":
-            stopped = await asyncio.wait_for(stop_global(), 4)
+            stopped = await asyncio.wait_for(stop_global(), _REAL_CHILD_WAIT_SECONDS)
         else:
             stopped = await asyncio.wait_for(
                 service.submit_operator_action(
                     run.id, OperatorActionRequest(action=OperatorAction.EMERGENCY_STOP)
                 ),
-                4,
+                _REAL_CHILD_WAIT_SECONDS,
             )
         if fail_audit:
             # Let the bounded completion waiter expire while its precise
             # evaluation owner remains held. The real e-stop has already run.
-            assert not await asyncio.wait_for(asyncio.shield(completion), 3)
+            assert not await asyncio.wait_for(asyncio.shield(completion), _REAL_CHILD_WAIT_SECONDS)
         completion_left_before_release = completion.done()
         if completion_left_before_release:
             assert completion.result() is False
@@ -409,7 +415,7 @@ async def _exercise_route(
         release_proof.set()
         try:
             pending: list[Awaitable[object]] = [drop] if completion is None else [drop, completion]
-            outcomes = await asyncio.wait_for(asyncio.gather(*pending), 4)
+            outcomes = await asyncio.wait_for(asyncio.gather(*pending), _REAL_CHILD_WAIT_SECONDS)
         finally:
             try:
                 assert await service.settle_fault_lease_persistence_for_teardown()
