@@ -3752,6 +3752,12 @@ class RoastController:
         # 100↔trim↔100 (the #218 lever-thrash). ``trim_window_open`` ignores the
         # carried latch, so a garbage ETA never arms it; the latch resets per
         # run/preheat in ``transition_to``.
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and self._ceiling_guard_eligible(
+            telemetry
+        ):
+            # #1116: the guard drops this tick; never raise or hold heat first
+            # (a failed drop would otherwise leave the lever target applied).
+            return
         trim_signal = self._arm_trim_latch(self._trim_signal(telemetry))
         box = self._control_limits(trim_signal=trim_signal)
         if not box.has_deterministic_target:
@@ -4810,7 +4816,8 @@ class RoastController:
         thresholds) but then run the IDENTICAL command sequence: the same
         safety path as every other drop in this codebase —
         ``evaluate_drop_recommendation`` (ALLOWs unconditionally in
-        DEVELOPMENT, the only phase either caller invokes this from) then
+        DEVELOPMENT) — or, for the operator_only pre-FC ceiling guard (#1116),
+        the DROP_BEANS command×phase matrix — then
         ``self._executor.drop_beans()`` in a try/except (``COMMAND_FAILED`` +
         return on a transient actuator failure, mirroring the advisor-drop and
         operator-drop paths exactly), then ``COMMAND_EXECUTED`` and
@@ -4851,10 +4858,11 @@ class RoastController:
         else:
             drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
         await self._snapshots.persist_evaluation(drop)
-        # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT (the
-        # sole phase either caller actuates in) — the REJECT/false branch here is
-        # unreachable today. Kept (not collapsed) as the safety boundary if a
-        # future phase becomes reachable by either caller; the un-taken branch is
+        # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT, and
+        # the pre-FC matrix row ALLOWs DROP_BEANS (the only other phase a caller
+        # reaches, #1116) — the REJECT/false branch here is unreachable today.
+        # Kept (not collapsed) as the safety boundary if a future phase
+        # becomes reachable by either caller; the un-taken branch is
         # pragma'd, not the guard logic (mirrors the identical advisor-drop
         # pattern in ``_run_advisory``).
         if drop.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — see above
@@ -4875,7 +4883,12 @@ class RoastController:
             # dev%/temp-anchor callers) fires on EVERY DEVELOPMENT tick with
             # no cadence gate, so a failed corrective write is retried again
             # next tick regardless (Codex round-2 finding #1's distinction).
-            await self._clamp_heat_after_failed_drop(self_healing=True, generation=generation)
+            if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+                # #1116: the pre-FC guard is the bean-temperature limit here;
+                # a failed drop at or above it must fail closed to heat off.
+                await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
+            else:
+                await self._clamp_heat_after_failed_drop(self_healing=True, generation=generation)
             return False
         if not dispatched or not self._generation_is_current(generation):
             return False
@@ -4886,6 +4899,42 @@ class RoastController:
         )
         self.transition_to(RoastPhase.COOLING)
         return True
+
+    async def _cut_heat_after_failed_pre_fc_guard_drop(self, *, generation: int) -> None:
+        """Fail closed to heat 0 after a failed pre-FC ceiling-guard drop (#1116).
+
+        Under ``first_crack_source=operator_only`` the guard is armed pre-FC,
+        where no post-FC D88/D96 state exists for
+        :meth:`_clamp_heat_after_failed_drop` to restore. Heat goes to 0 at the
+        current fan THROUGH the safety path (phase matrix, then
+        ``evaluate_command`` on a box whose only heat value is 0). The ordinary
+        rate limit is exempted (``seconds_since_last_command=None``) because a
+        same-tick collision with an earlier write is exactly when this matters;
+        the write can only remove heat. The guard retries the drop next tick.
+
+        Args:
+            generation: The tick's command generation.
+        """
+        if self._current_heat == 0:
+            return
+        resolved_box = self._control_limits()
+        box = resolved_box.model_copy(update={"heat_floor_percent": 0, "heat_target_percent": 0})
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — pre-FC allows
+            return
+        evaluation = self._safety.evaluate_command(
+            requested_heat=0,
+            requested_fan=self._current_fan,
+            seconds_since_last_command=None,
+            bounds=box,
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        await self._execute_targets(evaluation, generation=generation)
 
     async def _clamp_heat_after_failed_drop(self, *, self_healing: bool, generation: int) -> None:
         """D96 slice 1.5 (#561): fail-safe-DOWN heat clamp on a FAILED drop
@@ -5252,23 +5301,38 @@ class RoastController:
         reachable from every phase; a restart never auto-resumes into this
         path (``recover_from_restart`` always lands in
         ``operator_recovery_required``, and this method only ever actuates
-        from DEVELOPMENT, which a restart never re-enters directly).
+        from DEVELOPMENT, or pre-FC under operator_only (#1116), neither of
+        which a restart re-enters without an explicit operator resume).
 
         Args:
             telemetry: The reading this tick consumed, or ``None`` on a
                 failed/sessionless read (the guard does not fire either way —
                 bean temperature is unknown).
         """
-        config = self._config.post_first_crack_control
-        if (
-            not config.ceiling_guard_drop_enabled
-            or self._phase not in self._ceiling_guard_phases()
-            or telemetry is None
-        ):
-            return
-        if telemetry.bean_temp_c < config.ceiling_guard_temp_c:
+        if not self._ceiling_guard_eligible(telemetry):
             return
         await self._execute_deterministic_drop(DropReason.CEILING_GUARD, generation=generation)
+
+    def _ceiling_guard_eligible(self, telemetry: RoastTelemetry | None) -> bool:
+        """Whether the ceiling guard fires on this reading (single source, #1116).
+
+        Shared by :meth:`_maybe_ceiling_guard_drop` and the pre-FC lever step,
+        which must not write heat on a tick the guard is due to drop.
+
+        Args:
+            telemetry: The reading this tick consumed, or ``None``.
+
+        Returns:
+            ``True`` when the guard flag is on, the phase is armed, and the bean
+            reading is at or above ``ceiling_guard_temp_c``.
+        """
+        config = self._config.post_first_crack_control
+        return (
+            config.ceiling_guard_drop_enabled
+            and self._phase in self._ceiling_guard_phases()
+            and telemetry is not None
+            and telemetry.bean_temp_c >= config.ceiling_guard_temp_c
+        )
 
     def _ceiling_guard_phases(self) -> frozenset[RoastPhase]:
         """Phases the 196 °C ceiling guard actuates in (#1116).
@@ -7431,6 +7495,9 @@ class RoastController:
         # roast starts the counter fresh rather than re-tripping on the next
         # single failure.
         self._consecutive_advisor_failures = 0
+        # #1116: a pre-recovery reading may be minutes old; the mark floor must
+        # wait for a fresh tick after the resume.
+        self._last_valid_bean_temp_c = None
         self.transition_to(target)  # table gates targets; starting is never legal
         # No post-charge settle re-arm under D35 (#222): the advisor is not
         # consulted pre-FC, so a resume into ROASTING_PRE_FIRST_CRACK has no
@@ -7474,7 +7541,7 @@ class RoastController:
 
     def _note_valid_bean_reading(self, telemetry: RoastTelemetry | None) -> None:
         """Remember the last non-None bean reading for the mark floor (#1116)."""
-        if telemetry is not None:
+        if telemetry is not None and math.isfinite(telemetry.bean_temp_c):
             self._last_valid_bean_temp_c = telemetry.bean_temp_c
 
     async def operator_mark_first_crack(self) -> None:

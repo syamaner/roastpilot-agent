@@ -5875,6 +5875,64 @@ async def test_operator_only_failed_pre_fc_guard_drop_retries_next_tick() -> Non
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("heat_before_guard_tick", [None, 0])
+async def test_operator_only_failed_pre_fc_guard_drop_fails_closed_to_heat_off(
+    heat_before_guard_tick: int | None,
+) -> None:
+    """#1116 safety re-review: on a guard-eligible pre-FC tick the lever step
+    writes nothing, and a failed guard drop cuts heat to 0 through safety.
+
+    ``None`` keeps the lever's heat (the cut must fire); ``0`` models a resume
+    at 0 % heat, where the lever would otherwise raise heat before the drop."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()  # ordinary pre-FC lever write
+    assert harness.controller._current_heat > 0  # pyright: ignore[reportPrivateUsage]
+    if heat_before_guard_tick is not None:
+        harness.controller._current_heat = heat_before_guard_tick  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(10.0)  # clear the ordinary rate limit: a lever write is possible
+    writes_before = list(harness.executor.targets)
+    await harness.controller.tick()  # 197 °C: guard due, drop fails
+    new_writes = harness.executor.targets[len(writes_before) :]
+    expected = [0] if heat_before_guard_tick is None else []
+    assert [heat for heat, _ in new_writes] == expected
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
+    """#1116: the mark-floor reading never crosses runs or stores non-finite."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    note = harness.controller._note_valid_bean_reading  # pyright: ignore[reportPrivateUsage]
+    note(reading(bean=182.0))
+    assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    note(None)
+    assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._prepare_run_bookkeeping(PROFILE)  # pyright: ignore[reportPrivateUsage]
+    assert harness.controller._last_valid_bean_temp_c is None  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.asyncio
+async def test_operator_resume_clears_the_mark_floor_reading() -> None:
+    """#1116: a reading from before a recovery wait never satisfies the floor;
+    a mark sent with the resume is refused until a fresh tick."""
+    harness = _fc_source_harness([reading(bean=182.0)], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.recover_from_restart(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller._last_valid_bean_temp_c is None  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
 async def test_operator_mark_exactly_at_floor_is_accepted() -> None:
     """#1116: the floor is inclusive, and the configured value is honoured."""
     config = ControllerConfig(operator_first_crack_min_bean_temp_c=160.0)
