@@ -5754,6 +5754,124 @@ async def test_operator_mark_below_floor_rejected_without_relay(source: FirstCra
     ]
     assert [e.verdict for e in plausibility] == [SafetyVerdict.REJECT]
     assert "41.0" in plausibility[0].reason
+    # Operator-visible refusal, not just a trace row (#1116 safety review).
+    refused = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert refused == [
+        {"command": "mark_first_crack", "outcome": "refused", "reason": plausibility[0].reason}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_operator_mark_survives_one_failed_read() -> None:
+    """#1116: a failed read on the tick before the mark must not refuse a
+    genuine mark; the floor and the landmark use the last valid reading."""
+    harness = _fc_source_harness([reading(bean=180.0), RuntimeError("read failed")], OPERATOR_ONLY)
+    await harness.controller.tick()
+    await harness.controller.tick()  # failed read: _last_telemetry is None
+    assert harness.controller._last_telemetry is None  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.operator_mark_first_crack()
+    assert harness.controller.phase is RoastPhase.DEVELOPMENT
+    first_crack = [p for k, p in harness.events.events if k is RoastEventKind.FIRST_CRACK]
+    assert first_crack == [{"source": "operator", "bean_temp_c": 180.0}]
+
+
+class _AllowAllSourcesPolicy(SafetyPolicy):
+    """A drifted policy that ALLOWs every FC/T0 source, operator_only or not."""
+
+    def evaluate_event_source(  # pyright: ignore[reportIncompatibleMethodOverride]
+        self, *, transition: str, source: object, operator_only_first_crack: bool = False
+    ) -> SafetyEvaluation:
+        return SafetyEvaluation(
+            rule="event_source_validity", verdict=SafetyVerdict.ALLOW, reason="drifted allow"
+        )
+
+
+@pytest.mark.asyncio
+async def test_operator_only_controller_gate_holds_even_if_policy_allows_mcp() -> None:
+    """#1116: the controller's own operator_only gate, not just the policy
+    verdict, keeps MCP detection from starting development."""
+    harness = _fc_source_harness([reading(bean=182.0, first_crack_detected=True)], OPERATOR_ONLY)
+    harness.controller._safety = _AllowAllSourcesPolicy(SafetyLimits())  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    assert RoastEventKind.FIRST_CRACK not in harness.events.kinds()
+
+
+@pytest.mark.asyncio
+async def test_operator_only_ceiling_guard_drops_before_the_mark() -> None:
+    """#1116 (operator decision, 23 Nov): under operator_only the 196 °C guard
+    is a temperature limit from charge, so an unmarked run still drops, via
+    the command×phase matrix and the typed CEILING_GUARD reason."""
+    config = ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY)
+    assert config.post_first_crack_control.ceiling_guard_drop_enabled is True
+    harness = _fc_source_harness([reading(bean=196.0, first_crack_detected=True)], config)
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
+    executed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_EXECUTED]
+    assert {
+        "command": "drop_beans",
+        "source": "policy",
+        "reason": DropReason.CEILING_GUARD.value,
+    } in executed
+    matrix = [
+        e
+        for e in harness.sink.evaluations
+        if e.rule == "command_phase_validity" and "drop_beans" in e.reason
+    ]
+    assert matrix and matrix[-1].verdict is SafetyVerdict.ALLOW
+    assert not [e for e in harness.sink.evaluations if e.rule == "drop_eligibility"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "bean"),
+    [
+        # Summer default source: the guard stays DEVELOPMENT-only (unchanged).
+        (ControllerConfig(), 199.0),
+        # Operator-only but the guard's own flag off: no pre-FC drop either.
+        (
+            ControllerConfig(
+                first_crack_source=FirstCrackSource.OPERATOR_ONLY,
+                post_first_crack_control=PostFirstCrackControl(ceiling_guard_drop_enabled=False),
+            ),
+            199.0,
+        ),
+        # Operator-only, strictly below the ceiling.
+        (ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY), 195.9),
+    ],
+)
+async def test_ceiling_guard_pre_fc_does_not_fire_outside_its_arm(
+    config: ControllerConfig, bean: float
+) -> None:
+    """#1116: the pre-FC arm exists only for operator_only with the guard on."""
+    harness = _fc_source_harness([reading(bean=bean)], config)
+    await harness.controller.tick()
+    assert "drop_beans" not in harness.executor.commands
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_operator_only_failed_pre_fc_guard_drop_retries_next_tick() -> None:
+    """#1116: a failed pre-FC guard drop surfaces COMMAND_FAILED, holds the
+    phase, and the guard fires again on the next tick (no cadence gate)."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=197.0), reading(bean=197.5)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+    failed = [p for k, p in harness.events.events if k is RoastEventKind.COMMAND_FAILED]
+    assert {"command": "drop_beans", "source": "policy", "reason": "ceiling_guard"} in failed
+    executor._failing.clear()  # pyright: ignore[reportPrivateUsage]
+    await harness.controller.tick()
+    assert harness.executor.commands.count("drop_beans") == 1
+    assert harness.controller.phase is RoastPhase.COOLING
 
 
 @pytest.mark.asyncio

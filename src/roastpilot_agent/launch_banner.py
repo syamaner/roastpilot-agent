@@ -14,7 +14,7 @@ genuinely ran the saved value.
 
 This module is the launcher's read-only view of the SAME resolution the serving
 agent uses.  It has **no runtime authority**: it never constructs a controller,
-never touches MCP, and never mutates config — it formats two strings.
+never touches MCP, and never mutates config — it formats three strings.
 
 Fail-loud contract: a malformed / unreadable saved-config file makes the banner
 *unresolved*, never a plausible-looking schema default.  :func:`main` reports the
@@ -49,7 +49,7 @@ ADVISOR_PHASES = frozenset(AUTO_ADVICE_PHASES)
 
 @dataclass(frozen=True)
 class LaunchBannerLines:
-    """The resolved text for the launcher's two config-derived banner lines.
+    """The resolved text for the launcher's three config-derived banner lines.
 
     Attributes:
         advisor_cfg: The ``Advisor cfg:`` line — model slug, control-teaching
@@ -227,13 +227,20 @@ def _first_crack_line(config: AppConfig) -> str:
         config: The resolved application config.
 
     Returns:
-        Which evidence starts development plus the operator-mark floor.
+        Which evidence starts development plus the operator-mark floor,
+        tagged when either setting differs from its schema default.
     """
     controller = config.controller
     floor = f"mark floor {controller.operator_first_crack_min_bean_temp_c:.1f} °C"
     if controller.first_crack_source is FirstCrackSource.OPERATOR_ONLY:
-        return f"OPERATOR MARK ONLY (MCP detection = shadow evidence); {floor}"
-    return f"MCP detection or operator mark, first wins; {floor}"
+        line = f"OPERATOR MARK ONLY (MCP detection = shadow evidence); {floor}"
+    else:
+        line = f"MCP detection or operator mark, first wins; {floor}"
+    # Same rule as the other lines: a non-default arm is never mistaken for the
+    # proven baseline.
+    if _changed_fields(controller) & {"first_crack_source", "operator_first_crack_min_bean_temp_c"}:
+        line += EXPERIMENT_TAG
+    return line
 
 
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:

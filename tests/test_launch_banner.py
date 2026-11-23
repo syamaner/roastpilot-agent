@@ -942,5 +942,6 @@ def test_first_crack_line_names_operator_only_and_floor() -> None:
         )
     )
     assert resolve_banner_lines(config).first_crack == (
-        "OPERATOR MARK ONLY (MCP detection = shadow evidence); mark floor 160.0 °C"
+        "OPERATOR MARK ONLY (MCP detection = shadow evidence); mark floor 160.0 °C" + EXPERIMENT_TAG
     )
+    assert EXPERIMENT_TAG not in resolve_banner_lines(AppConfig()).first_crack

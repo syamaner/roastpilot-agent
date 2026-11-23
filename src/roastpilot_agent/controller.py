@@ -1898,6 +1898,11 @@ class RoastController:
         # #1116: one-shot latch so an operator_only run persists its MCP
         # first-crack shadow evaluation once, not on every latched tick.
         self._mcp_first_crack_shadow_recorded = False
+        # #1116: the last non-None bean reading this run consumed. Unlike
+        # ``_last_telemetry`` it survives one failed read (and a HUMAN turn's
+        # reset), so a genuine mark is not refused because the previous tick's
+        # read failed. Cleared only by the per-run bookkeeping reset.
+        self._last_valid_bean_temp_c: float | None = None
         # Monotonic instant of the debounced T0/charge transition into
         # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
@@ -3301,6 +3306,7 @@ class RoastController:
         turn.evidence = evidence
         telemetry = evidence.telemetry
         self._last_telemetry = telemetry
+        self._note_valid_bean_reading(telemetry)
         if not latched:
             self._consecutive_read_failures = 0
         if evidence.bound_child_epoch is None:
@@ -3524,6 +3530,7 @@ class RoastController:
         # Remember the reading this tick consumed so the runner's post-tick
         # snapshot publishes the same telemetry it acted on (E9).
         self._last_telemetry = telemetry
+        self._note_valid_bean_reading(telemetry)
         await self._snapshots.persist_snapshot(telemetry)
         if not self._generation_is_current(generation):
             return
@@ -4833,7 +4840,16 @@ class RoastController:
         if self._human_run is not None:
             self._join_human_drop()
             return False
-        drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
+            # #1116: only the operator_only ceiling guard reaches here pre-FC.
+            # The advisor drop-eligibility rule is development-only by design,
+            # so this policy drop is gated by the command×phase matrix — the
+            # same rule that governs the operator's own pre-FC Drop Beans.
+            drop = self._safety.evaluate_command_phase(
+                command=RoastCommand.DROP_BEANS, phase=self._phase
+            )
+        else:
+            drop = self._safety.evaluate_drop_recommendation(phase=self._phase)
         await self._snapshots.persist_evaluation(drop)
         # evaluate_drop_recommendation ALLOWs unconditionally in DEVELOPMENT (the
         # sole phase either caller actuates in) — the REJECT/false branch here is
@@ -5203,7 +5219,9 @@ class RoastController:
         incumbent-behaviour change; that flip is not part of this change).
 
         **Eligibility:** fires the instant ``telemetry.bean_temp_c >=
-        ceiling_guard_temp_c`` while in DEVELOPMENT — no development-percent
+        ceiling_guard_temp_c`` while in DEVELOPMENT (and, under
+        ``first_crack_source=operator_only``, also pre-FC from charge — see
+        :meth:`_ceiling_guard_phases`, #1116) — no development-percent
         condition, no engagement condition, no cadence gate (mirrors
         :meth:`_maybe_deterministic_drop`'s one-shot-per-tick reasoning: a drop
         is irreversible, so it must fire the instant it is eligible).
@@ -5244,13 +5262,30 @@ class RoastController:
         config = self._config.post_first_crack_control
         if (
             not config.ceiling_guard_drop_enabled
-            or self._phase is not RoastPhase.DEVELOPMENT
+            or self._phase not in self._ceiling_guard_phases()
             or telemetry is None
         ):
             return
         if telemetry.bean_temp_c < config.ceiling_guard_temp_c:
             return
         await self._execute_deterministic_drop(DropReason.CEILING_GUARD, generation=generation)
+
+    def _ceiling_guard_phases(self) -> frozenset[RoastPhase]:
+        """Phases the 196 °C ceiling guard actuates in (#1116).
+
+        DEVELOPMENT always. Under ``first_crack_source=operator_only`` also
+        ROASTING_PRE_FIRST_CRACK (charge confirmed, before the operator's
+        mark): MCP detection no longer moves the run into DEVELOPMENT, so a
+        missed or refused mark must not leave the bean-temperature limit
+        disarmed until the 230 °C hard bound. The guard is a temperature
+        limit; it never acts on a predicted first crack.
+
+        Returns:
+            The set of phases in which the guard may fire.
+        """
+        if self._config.first_crack_source is FirstCrackSource.OPERATOR_ONLY:
+            return frozenset({RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT})
+        return frozenset({RoastPhase.DEVELOPMENT})
 
     async def _maybe_deterministic_drop(
         self, telemetry: RoastTelemetry | None, *, generation: int
@@ -6692,6 +6727,7 @@ class RoastController:
         self._current_heat = 0
         self._current_fan = 0
         self._last_telemetry = None  # never carry a prior run's reading into this run
+        self._last_valid_bean_temp_c = None  # #1116: nor its mark-floor reading
         self._last_command_monotonic = None  # new run: rate-limit baseline resets
         # New run: advisory baselines reset too, so the first consult in the
         # new roast fires on its own merits, not on a previous run's timer.
@@ -7436,6 +7472,11 @@ class RoastController:
         run = self._human_run
         return run is not None and run.endpoint is EndpointDisposition.NONE
 
+    def _note_valid_bean_reading(self, telemetry: RoastTelemetry | None) -> None:
+        """Remember the last non-None bean reading for the mark floor (#1116)."""
+        if telemetry is not None:
+            self._last_valid_bean_temp_c = telemetry.bean_temp_c
+
     async def operator_mark_first_crack(self) -> None:
         """Operator FC override: matrix- and source-validated, then relayed
         to MCP with the true OPERATOR source (E3-S5/D16)."""
@@ -7471,14 +7512,25 @@ class RoastController:
         # #1116: a mark starts the development clock, so it must be plausible.
         # Checked after the drift guard and before the MCP relay, so a refused
         # mark reaches no roaster.
+        mark_bean_temp_c = self._last_valid_bean_temp_c
         plausibility = self._safety.evaluate_operator_first_crack_plausibility(
-            bean_temp_c=None if self._last_telemetry is None else self._last_telemetry.bean_temp_c,
+            bean_temp_c=mark_bean_temp_c,
             min_bean_temp_c=self._config.operator_first_crack_min_bean_temp_c,
         )
         await self._snapshots.persist_evaluation(plausibility)
-        if plausibility.verdict is not SafetyVerdict.ALLOW or not self._generation_is_current(
-            generation
-        ):
+        if not self._generation_is_current(generation):
+            return
+        if plausibility.verdict is not SafetyVerdict.ALLOW:
+            # Operator-visible: under operator_only the mark is the ONLY start
+            # of development, so a silent refusal would strand the roast.
+            self._events.emit(
+                RoastEventKind.COMMAND_FAILED,
+                {
+                    "command": RoastCommand.MARK_FIRST_CRACK.value,
+                    "outcome": "refused",
+                    "reason": plausibility.reason,
+                },
+            )
             return
         try:
             dispatched, _ = await self._run_routine_write(
@@ -7494,12 +7546,13 @@ class RoastController:
             return
         if not dispatched or not self._generation_is_current(generation):
             return
-        event_payload: dict[str, object] = {"source": RoastEventSource.OPERATOR.value}
         # #592 / Codex P2: operator FC is a supported server-authored path too.
-        # Preserve the last validated bean reading when one exists; never invent
-        # a landmark before the controller has consumed telemetry for this run.
-        if self._last_telemetry is not None:
-            event_payload["bean_temp_c"] = self._last_telemetry.bean_temp_c
+        # #1116: the landmark is the same reading the plausibility floor
+        # checked, so a mark can never be recorded at an unchecked value.
+        event_payload: dict[str, object] = {
+            "source": RoastEventSource.OPERATOR.value,
+            "bean_temp_c": mark_bean_temp_c,
+        }
         if self._human_run is not None:
             if self._human_run.endpoint is not EndpointDisposition.NONE:
                 return
