@@ -2,7 +2,7 @@
 
 Outcome: D239 (roastpilot-plan) anchors control on the 30 s slope (B) and runs the two-node model (C) in shadow, logged every second, until the first winter roast provides a cold-room calibration point.
 
-Reproduce: `scripts/extract.py` reads the local store read-only (path at the top of the script) and writes per-run series; `scripts/extract_nov07_sse.py` extracts the 7 Nov SSE capture; `python -I scripts/study.py <series_dir> <out_dir>` writes `tables.txt`, `fitted_params.json` and `results.json`. Roast series are not committed (repo rule); `results/` (added in its own follow-up PR, per the data/logic rule) holds the derived outputs only, and a re-run from the same series reproduces them exactly (`tables.txt` has trailing whitespace stripped for the repo whitespace check).
+Reproduce: `scripts/extract.py` reads the local store read-only (path at the top of the script) and writes per-run series; `scripts/extract_nov07_sse.py` extracts the 7 Nov SSE capture; `python -I scripts/study.py <series_dir> <out_dir>` writes `tables.txt`, `fitted_params.json` and `results.json`. Roast series are not committed (repo rule); `results/` holds the derived outputs only, and a re-run from the same series reproduces them exactly (`tables.txt` has trailing whitespace stripped for the repo whitespace check).
 
 Scope: offline only; no repo, production code or hardware touched. Scripts: `scripts/extract.py`, `scripts/extract_nov07_sse.py`, `scripts/study.py`. Results: `out/fitted_params.json`, `out/results.json`, `out/tables.txt`.
 

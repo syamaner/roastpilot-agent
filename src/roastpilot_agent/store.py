@@ -34,6 +34,7 @@ from roastpilot_agent.ambient_evidence import (
     derive_ambient_doctrine_evidence,
 )
 from roastpilot_agent.config import AppConfig, ControllerConfig, SafetyLimits
+from roastpilot_agent.fc_prediction import FcPredictionSnapshot
 from roastpilot_agent.human_persistence import (
     CommandAuditOwner,
     HistoryUnavailable,
@@ -709,6 +710,19 @@ CREATE TABLE start_attempt_hold (
 );
 """
 
+SCHEMA_V23_FC_ANCHOR_TRACE = """
+-- #1118 / D239 slice 2: observe-only first-crack evidence per telemetry row.
+-- The anchor estimator's ETA, the shadow two-node model's ETA, the anchor's
+-- state and charge-clock time, and the planned finish F/(1-p). Logging only.
+ALTER TABLE telemetry_snapshots ADD COLUMN fc_eta_slope_seconds REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN fc_eta_model_seconds REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN fc_anchor_state TEXT
+  CHECK (fc_anchor_state IS NULL OR
+         fc_anchor_state IN ('none', 'provisional', 'frozen', 'reanchored'));
+ALTER TABLE telemetry_snapshots ADD COLUMN fc_anchor_charge_seconds REAL;
+ALTER TABLE telemetry_snapshots ADD COLUMN fc_planned_finish_charge_seconds REAL;
+"""
+
 _BEAN_SOURCING_LEASE_DURATION = timedelta(minutes=2)
 _BEAN_SOURCING_LEASE_CONFIRMATION = timedelta(seconds=60)
 
@@ -738,6 +752,7 @@ MIGRATIONS: tuple[str, ...] = (
     SCHEMA_V20_PROCESS_EPOCH,
     SCHEMA_V21_CLOSURE_ONLY_RESTART_CLEARANCE,
     SCHEMA_V22_START_ATTEMPT_HOLD,
+    SCHEMA_V23_FC_ANCHOR_TRACE,
 )
 
 
@@ -3608,6 +3623,7 @@ class RoastStore:
         post_fc_smoothed_ror_c_per_min: float | None = None,
         post_fc_effective_heat_ceiling_percent: int | None = None,
         raw_state_json: str | None = None,
+        fc_prediction: FcPredictionSnapshot | None = None,
     ) -> bool:
         """Persist a periodic telemetry row or a D96 authority transition.
 
@@ -3645,8 +3661,11 @@ class RoastStore:
             "  charge_elapsed_seconds, post_fc_recovery_enabled,"
             "  post_fc_heat_authority_state, post_fc_ror_setpoint_c_per_min,"
             "  post_fc_smoothed_ror_c_per_min,"
-            "  post_fc_effective_heat_ceiling_percent, raw_state_json)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  post_fc_effective_heat_ceiling_percent, raw_state_json,"
+            "  fc_eta_slope_seconds, fc_eta_model_seconds, fc_anchor_state,"
+            "  fc_anchor_charge_seconds, fc_planned_finish_charge_seconds)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,"
+            "  ?, ?, ?, ?, ?)",
             (
                 run_id,
                 tick,
@@ -3673,6 +3692,11 @@ class RoastStore:
                 post_fc_smoothed_ror_c_per_min,
                 post_fc_effective_heat_ceiling_percent,
                 raw_state_json,
+                None if fc_prediction is None else fc_prediction.slope_eta_seconds,
+                None if fc_prediction is None else fc_prediction.model_eta_seconds,
+                None if fc_prediction is None else fc_prediction.anchor_state.value,
+                None if fc_prediction is None else fc_prediction.anchor_fc_charge_seconds,
+                None if fc_prediction is None else fc_prediction.planned_finish_charge_seconds,
             ),
         )
         await self._commit_connection(self.connection)

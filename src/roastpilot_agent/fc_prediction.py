@@ -115,6 +115,46 @@ def slope_fc_eta_seconds(
     return remaining / slope
 
 
+def smoothed_bean_env_c(
+    curve: Sequence[RoastCurveSample],
+    *,
+    window_seconds: float = DEFAULT_SLOPE_WINDOW_SECONDS,
+    min_samples: int = 3,
+) -> tuple[float, float] | None:
+    """The 30 s least-squares values of bean and environment at the newest sample.
+
+    The shadow model starts from this smoothed state, as the study's
+    ``state_at`` does, rather than from one integer-quantised reading.
+
+    Args:
+        curve: The roast-so-far curve (most recent last).
+        window_seconds: The fit window, in seconds.
+        min_samples: The minimum samples inside the window.
+
+    Returns:
+        ``(bean_c, env_c)``, or ``None`` with too few samples, a non-finite
+        sample, or times that do not vary.
+    """
+    if not curve:
+        return None
+    if not all(
+        math.isfinite(s.elapsed_since_charge_seconds)
+        and math.isfinite(s.bean_temp_c)
+        and math.isfinite(s.env_temp_c)
+        for s in curve
+    ):
+        return None
+    t_last = curve[-1].elapsed_since_charge_seconds
+    window = [s for s in curve if s.elapsed_since_charge_seconds >= t_last - window_seconds]
+    if len(window) < min_samples:
+        return None
+    bean = _least_squares_line([(s.elapsed_since_charge_seconds, s.bean_temp_c) for s in window])
+    env = _least_squares_line([(s.elapsed_since_charge_seconds, s.env_temp_c) for s in window])
+    if bean is None or env is None:
+        return None
+    return bean[1], env[1]
+
+
 @dataclass(frozen=True)
 class TwoNodeParameters:
     """Fitted constants of the shadow bean/environment model (per second).
@@ -146,7 +186,7 @@ class TwoNodeParameters:
         """Reject constants the integration cannot use.
 
         Raises:
-            ValueError: If any constant is non-finite or tau_seconds is not
+            ValueError: If any constant is non-finite or ``tau_seconds`` is not
                 positive.
         """
         values = (self.kb, self.cb, self.g, self.ka, self.ke, self.tau_seconds)
@@ -157,10 +197,10 @@ class TwoNodeParameters:
 class HeaterLagFilter:
     """The model's heater state Q, replayed from the heat actually applied.
 
-    Reproduces the study's heater_state: Q starts at the first applied
+    Reproduces the study's ``heater_state``: Q starts at the first applied
     heat fraction and, on a 1 s grid from the first sample, follows
-    Q += (h(g) - Q) / tau where h(g) is the heat in force at grid time
-    g (zero-order hold on the samples). Feed it only applied
+    ``Q += (h(g) - Q) / tau`` where ``h(g)`` is the heat in force at grid time
+    ``g`` (zero-order hold on the samples). Feed it only applied
     (acknowledged) heat, never a requested value.
     """
 
@@ -182,9 +222,9 @@ class HeaterLagFilter:
         return self._q
 
     def update(self, *, elapsed_seconds: float, heat_percent: float) -> float | None:
-        """Advance to elapsed_seconds; heat_percent applies from it on.
+        """Advance to ``elapsed_seconds``; ``heat_percent`` applies from it on.
 
-        Grid steps before elapsed_seconds use the heat of the previous
+        Grid steps before ``elapsed_seconds`` use the heat of the previous
         sample. Non-finite inputs and a sample earlier than the last one leave
         the state unchanged.
 
@@ -418,6 +458,27 @@ class FcAnchorTracker:
         else:
             self._anchor = FcAnchor(AnchorState.FROZEN, anchored, delta)
         return self._anchor
+
+
+@dataclass(frozen=True)
+class FcPredictionSnapshot:
+    """One tick's observe-only first-crack evidence, persisted with telemetry.
+
+    Attributes:
+        slope_eta_seconds: The anchor estimator's ETA, or ``None``.
+        model_eta_seconds: The shadow model's ETA, or ``None`` (including when
+            the room reading is missing or stale).
+        anchor_state: The anchor's lifecycle state.
+        anchor_fc_charge_seconds: The anchored first-crack time, or ``None``.
+        planned_finish_charge_seconds: ``F / (1 - p)`` for the anchor, or
+            ``None``.
+    """
+
+    slope_eta_seconds: float | None
+    model_eta_seconds: float | None
+    anchor_state: AnchorState
+    anchor_fc_charge_seconds: float | None
+    planned_finish_charge_seconds: float | None
 
 
 def planned_finish_charge_seconds(
