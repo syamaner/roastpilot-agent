@@ -5897,7 +5897,10 @@ async def test_operator_only_failed_pre_fc_guard_drop_fails_closed_to_heat_off(
     assert harness.controller._current_heat > 0  # pyright: ignore[reportPrivateUsage]
     if heat_before_guard_tick is not None:
         harness.controller._current_heat = heat_before_guard_tick  # pyright: ignore[reportPrivateUsage]
-    harness.clock.advance(10.0)  # clear the ordinary rate limit: a lever write is possible
+        # Clear the ordinary rate limit so a lever write is genuinely possible.
+        harness.clock.advance(10.0)
+    # ``None``: no clock advance — the cut lands inside the 2 s rate limit of
+    # the lever write one tick earlier, so its exemption is exercised.
     writes_before = list(harness.executor.targets)
     await harness.controller.tick()  # 197 °C: guard due, drop fails
     new_writes = harness.executor.targets[len(writes_before) :]
@@ -5905,6 +5908,33 @@ async def test_operator_only_failed_pre_fc_guard_drop_fails_closed_to_heat_off(
     assert [heat for heat, _ in new_writes] == expected
     assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
     assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_failed_pre_fc_guard_drop_latches_heat_off_until_operator_resume() -> None:
+    """#1116: after a failed pre-FC guard drop, a dip below the guard does not
+    let the lever re-raise heat (no 0 ↔ floor cycling); an operator resume
+    releases the latch."""
+    executor = FailingCommandExecutor({"drop_beans"})
+    harness = make_harness(
+        readings=[reading(bean=185.0), reading(bean=197.0), reading(bean=195.0)],
+        config=ControllerConfig(first_crack_source=FirstCrackSource.OPERATOR_ONLY),
+        executor=executor,
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    await harness.controller.tick()
+    await harness.controller.tick()  # 197 °C: drop fails, heat cut to 0, latched
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    harness.clock.advance(10.0)
+    writes_before = len(harness.executor.targets)
+    await harness.controller.tick()  # 195 °C: below the guard, lever would raise
+    assert harness.executor.targets[writes_before:] == []
+    assert harness.controller._current_heat == 0  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.operator_resume(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert harness.controller._pre_fc_guard_heat_off_latched is False  # pyright: ignore[reportPrivateUsage]
 
 
 def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
@@ -5915,6 +5945,9 @@ def test_last_valid_bean_reading_is_per_run_and_finite_only() -> None:
     assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
     note(None)
     assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
+    for bad in (math.nan, math.inf):
+        note(RoastTelemetry.model_construct(bean_temp_c=bad, env_temp_c=200.0))
+        assert harness.controller._last_valid_bean_temp_c == 182.0  # pyright: ignore[reportPrivateUsage]
     harness.controller._prepare_run_bookkeeping(PROFILE)  # pyright: ignore[reportPrivateUsage]
     assert harness.controller._last_valid_bean_temp_c is None  # pyright: ignore[reportPrivateUsage]
 

@@ -1903,6 +1903,10 @@ class RoastController:
         # reset), so a genuine mark is not refused because the previous tick's
         # read failed. Cleared only by the per-run bookkeeping reset.
         self._last_valid_bean_temp_c: float | None = None
+        # #1116: set when a pre-FC ceiling-guard drop FAILS; holds pre-FC heat
+        # off (no lever re-raise) until a drop succeeds, the phase leaves
+        # pre-FC, or a new run starts. Prevents 0 ↔ floor cycling at 196 °C.
+        self._pre_fc_guard_heat_off_latched = False
         # Monotonic instant of the debounced T0/charge transition into
         # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
@@ -3752,8 +3756,8 @@ class RoastController:
         # 100↔trim↔100 (the #218 lever-thrash). ``trim_window_open`` ignores the
         # carried latch, so a garbage ETA never arms it; the latch resets per
         # run/preheat in ``transition_to``.
-        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and self._ceiling_guard_eligible(
-            telemetry
+        if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK and (
+            self._pre_fc_guard_heat_off_latched or self._ceiling_guard_eligible(telemetry)
         ):
             # #1116: the guard drops this tick; never raise or hold heat first
             # (a failed drop would otherwise leave the lever target applied).
@@ -4885,7 +4889,9 @@ class RoastController:
             # next tick regardless (Codex round-2 finding #1's distinction).
             if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
                 # #1116: the pre-FC guard is the bean-temperature limit here;
-                # a failed drop at or above it must fail closed to heat off.
+                # a failed drop at or above it must fail closed to heat off,
+                # and stay off (latched) while the drop keeps being retried.
+                self._pre_fc_guard_heat_off_latched = True
                 await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
             else:
                 await self._clamp_heat_after_failed_drop(self_healing=True, generation=generation)
@@ -6792,6 +6798,7 @@ class RoastController:
         self._current_fan = 0
         self._last_telemetry = None  # never carry a prior run's reading into this run
         self._last_valid_bean_temp_c = None  # #1116: nor its mark-floor reading
+        self._pre_fc_guard_heat_off_latched = False  # #1116: nor its heat-off latch
         self._last_command_monotonic = None  # new run: rate-limit baseline resets
         # New run: advisory baselines reset too, so the first consult in the
         # new roast fires on its own merits, not on a previous run's timer.
@@ -7498,6 +7505,9 @@ class RoastController:
         # #1116: a pre-recovery reading may be minutes old; the mark floor must
         # wait for a fresh tick after the resume.
         self._last_valid_bean_temp_c = None
+        # #1116: an explicit operator resume is the operator acting; release the
+        # failed-guard-drop heat-off latch (the guard re-arms on the next read).
+        self._pre_fc_guard_heat_off_latched = False
         self.transition_to(target)  # table gates targets; starting is never legal
         # No post-charge settle re-arm under D35 (#222): the advisor is not
         # consulted pre-FC, so a resume into ROASTING_PRE_FIRST_CRACK has no
