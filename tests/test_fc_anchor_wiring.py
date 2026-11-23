@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from roastpilot_agent.config import ControllerConfig, FcAnchorConfig
@@ -24,12 +26,17 @@ def _charged(config: ControllerConfig | None = None) -> Harness:
 
 
 def _reading(
-    bean: float, *, room: float | None = None, age: float | None = None, fc: bool = False
+    bean: float,
+    *,
+    room: float | None = None,
+    age: float | None = None,
+    fc: bool = False,
+    env: float | None = None,
 ) -> RoastTelemetry:
     return RoastTelemetry.model_validate(
         {
             "bean_temp_c": bean,
-            "env_temp_c": bean + 50.0,
+            "env_temp_c": bean + 50.0 if env is None else env,
             "ambient_temp_c": room,
             "ambient_age_seconds": age,
             "first_crack_detected": fc,
@@ -123,15 +130,102 @@ async def test_anchor_disabled_publishes_nothing_and_a_new_run_resets_it() -> No
     assert tracker.anchor.state is AnchorState.NONE
 
 
+async def _full_run_trace(enabled: bool, source: FirstCrackSource) -> dict[str, object]:
+    """Charge → pre-FC ramp → first crack (MCP or mark) → development → drop."""
+    harness = _charged(
+        ControllerConfig(first_crack_source=source, fc_anchor=FcAnchorConfig(enabled=enabled))
+    )
+    phases: list[RoastPhase] = []
+    dev: list[float | None] = []
+
+    async def tick(reading: RoastTelemetry) -> None:
+        harness.reader.readings = [reading]
+        await harness.controller.tick()
+        phases.append(harness.controller.phase)
+        dev.append(harness.controller.snapshot().development_elapsed_seconds)
+        harness.clock.advance(1.0)
+
+    for i in range(60):
+        await tick(_reading(150.0 + 0.4 * i, room=19.5, age=5.0, env=220.0))
+    fc = RoastTelemetry.model_validate(
+        {
+            "bean_temp_c": 175.0,
+            "env_temp_c": 220.0,
+            "first_crack_detected": True,
+            "first_crack_backdate_seconds": 15.0,
+        }
+    )
+    await tick(fc)
+    if source is FirstCrackSource.OPERATOR_ONLY:
+        await harness.controller.operator_mark_first_crack()
+    for i in range(40):
+        await tick(_reading(176.0 + 0.6 * i, room=19.5, age=5.0, fc=True, env=220.0))
+    return {
+        "commands": list(harness.executor.commands),
+        "targets": list(harness.executor.targets),
+        "events": harness.events.kinds(),
+        "phases": phases,
+        "development_elapsed": dev,
+        "verdicts": [(e.rule, e.verdict) for e in harness.sink.evaluations],
+    }
+
+
 @pytest.mark.asyncio
-async def test_anchor_never_writes_to_the_roaster() -> None:
-    """Observe-only: identical heat/fan writes with the anchor on and off."""
-    writes: list[list[tuple[int, int]]] = []
-    for enabled in (True, False):
-        harness = _charged(ControllerConfig(fc_anchor=FcAnchorConfig(enabled=enabled)))
-        await _ramp(harness, 150.0, 0.3, 60)
-        writes.append(list(harness.executor.targets))
-    assert writes[0] == writes[1]
+@pytest.mark.parametrize("source", list(FirstCrackSource))
+async def test_anchor_is_observe_only_through_first_crack_development_and_drop(
+    source: FirstCrackSource,
+) -> None:
+    """Safety review (#1118): with the anchor on and off, the whole run is
+    identical: every roaster command and target, every event, the phase
+    sequence, the development clock and every persisted verdict."""
+    on = await _full_run_trace(True, source)
+    off = await _full_run_trace(False, source)
+    assert on == off
+    assert RoastPhase.DEVELOPMENT in on["phases"]  # type: ignore[operator]
+    assert "drop_beans" in on["commands"]  # type: ignore[operator]
+
+
+@pytest.mark.asyncio
+async def test_implausible_mcp_detection_never_takes_the_observation() -> None:
+    """A below-floor operator_only detection leaves the anchor for the mark."""
+    harness = _charged(OPERATOR_ONLY)
+    await _ramp(harness, 150.0, 0.2, 40)
+    harness.reader.readings = [_reading(120.0, fc=True)]  # false audio at 120 °C
+    await harness.controller.tick()
+    snap = harness.controller.snapshot().fc_prediction
+    assert snap is not None
+    assert snap.anchor_state is AnchorState.PROVISIONAL
+
+
+@pytest.mark.asyncio
+async def test_mcp_observation_uses_the_reported_crack_onset() -> None:
+    harness = _charged(OPERATOR_ONLY)
+    await _ramp(harness, 150.0, 0.2, 40)  # provisional anchor at 130 s
+    harness.reader.readings = [
+        RoastTelemetry.model_validate(
+            {
+                "bean_temp_c": 165.0,
+                "env_temp_c": 215.0,
+                "first_crack_detected": True,
+                "first_crack_backdate_seconds": 20.0,
+            }
+        )
+    ]
+    await harness.controller.tick()  # received at 40 s, onset 20 s earlier
+    snap = harness.controller.snapshot().fc_prediction
+    assert snap is not None
+    assert snap.anchor_state is AnchorState.REANCHORED
+    assert snap.anchor_fc_charge_seconds == pytest.approx(20.0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("age", "expected"), [(90.0, True), (float("nan"), False)])
+async def test_room_reading_age_boundaries(age: float, expected: bool) -> None:
+    harness = _charged()
+    await _ramp(harness, 150.0, 0.2, 40, room=19.5, age=age)
+    snap = harness.controller.snapshot().fc_prediction
+    assert snap is not None
+    assert (snap.model_eta_seconds is not None) is expected
 
 
 @pytest.mark.asyncio
@@ -203,3 +297,50 @@ async def test_anchor_does_not_move_in_development_without_an_observation() -> N
         AnchorState.PROVISIONAL,
         before.anchor_fc_charge_seconds,
     )
+
+
+def test_anchor_state_values_match_the_v23_check_constraint() -> None:
+    from roastpilot_agent.store import SCHEMA_V23_FC_ANCHOR_TRACE
+
+    for state in AnchorState:
+        assert f"'{state.value}'" in SCHEMA_V23_FC_ANCHOR_TRACE
+
+
+@pytest.mark.asyncio
+async def test_v23_upgrade_keeps_existing_rows_null_and_checks_the_state(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A real V22 store with telemetry upgrades with the five columns NULL on
+    old rows, and the CHECK rejects an unknown anchor state."""
+    import sqlite3
+
+    from roastpilot_agent import store as store_module
+    from roastpilot_agent.store import MIGRATIONS
+
+    db = tmp_path / "v22.sqlite3"
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS[:22])
+    old = RoastStore(db_path=db)
+    await seeded_store(old)
+    await old.connection.execute(
+        "INSERT INTO telemetry_snapshots (run_id, tick, recorded_at_utc, elapsed_seconds,"
+        " agent_phase, bean_temp_c, env_temp_c) VALUES"
+        " ('run-1', 1, '2026-11-23T00:00:00+00:00', 1.0, 'roasting_pre_first_crack', 150, 200)"
+    )
+    await old.connection.commit()
+    assert await old.schema_version() == 22
+    await old.close()
+    monkeypatch.setattr(store_module, "MIGRATIONS", MIGRATIONS)
+    upgraded = RoastStore(db_path=db)
+    await upgraded.initialize()
+    try:
+        assert await upgraded.schema_version() == 23
+        async with upgraded.connection.execute(
+            "SELECT fc_eta_slope_seconds, fc_anchor_state FROM telemetry_snapshots"
+        ) as cursor:
+            assert [tuple(r) for r in await cursor.fetchall()] == [(None, None)]
+        with pytest.raises(sqlite3.IntegrityError):
+            await upgraded.connection.execute(
+                "UPDATE telemetry_snapshots SET fc_anchor_state = 'bogus'"
+            )
+    finally:
+        await upgraded.close()

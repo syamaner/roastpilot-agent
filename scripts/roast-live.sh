@@ -138,11 +138,13 @@ case "${FC_SOURCE:-}" in
     exit 1 ;;
 esac
 
-# D239 slice 2 (#1118): log telemetry every second so the observe-only FC
-# anchor and the shadow model leave a 1 Hz calibration trace. The stale-session
-# guard keeps its 20 s floor at this cadence. Override with
-# TELEMETRY_LOG_INTERVAL_SECONDS=<seconds>.
-export ROASTPILOT_CONTROLLER__TELEMETRY_LOG_INTERVAL_SECONDS="${TELEMETRY_LOG_INTERVAL_SECONDS:-1.0}"
+# D239 slice 2 (#1118): log telemetry on every 1 s tick so the observe-only FC
+# anchor and the shadow model leave a 1 Hz calibration trace. 0.5 s, not 1.0:
+# the store throttles on (elapsed - last) < interval, and tick jitter would
+# drop rows at exactly 1.0. The stale-session guard keeps its 20 s floor. This
+# env value overrides any interval set in the saved config; override it here
+# with TELEMETRY_LOG_INTERVAL_SECONDS=<seconds>.
+export ROASTPILOT_CONTROLLER__TELEMETRY_LOG_INTERVAL_SECONDS="${TELEMETRY_LOG_INTERVAL_SECONDS:-0.5}"
 
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   echo "ERROR: MCP config not found: $COFFEE_ROASTER_MCP_CONFIG" >&2

@@ -5553,7 +5553,17 @@ class RoastController:
                     operator_only_first_crack=operator_only,
                 )
                 await self._snapshots.persist_evaluation(source)
-                self._observe_fc_for_anchor()
+                if (
+                    self._generation_is_current(generation)
+                    and math.isfinite(telemetry.bean_temp_c)
+                    and telemetry.bean_temp_c >= self._config.operator_first_crack_min_bean_temp_c
+                ):
+                    # D239: an MCP detection is anchor evidence only at a
+                    # plausible bean temperature (#1116's floor) and on a
+                    # current generation; origin it at the reported onset.
+                    self._observe_fc_for_anchor(
+                        backdate_seconds=telemetry.first_crack_backdate_seconds
+                    )
                 if operator_only:
                     # #1116: MCP detection is shadow evidence only. Record the
                     # REJECTed source evaluation once per run (the detected flag
@@ -8600,17 +8610,29 @@ class RoastController:
             planned_finish_charge_seconds=finish,
         )
 
-    def _observe_fc_for_anchor(self) -> None:
+    def _observe_fc_for_anchor(self, *, backdate_seconds: float | None = None) -> None:
         """Feed the first observed first crack to the anchor (D239, #1118).
 
-        Called for an MCP detection (including an operator_only shadow
-        detection) and for the operator's mark; only the first counts.
+        Called for a plausible MCP detection (including an operator_only
+        shadow detection) and for the operator's accepted mark; only the
+        first counts. The private HUMAN mark path does not call this: that
+        route is parked for the winter roast (D239) and its anchor stays
+        unobserved.
+
+        Args:
+            backdate_seconds: The MCP-reported crack-onset backdate, or
+                ``None`` (operator mark: receive time).
         """
         if not self._config.fc_anchor.enabled or self._charge_monotonic is None:
             return
-        self._fc_anchor_tracker.observe_first_crack(
-            charge_elapsed_seconds=self._charge_elapsed_seconds()
-        )
+        observed = self._charge_elapsed_seconds()
+        if (
+            backdate_seconds is not None
+            and math.isfinite(backdate_seconds)
+            and backdate_seconds > 0
+        ):
+            observed -= backdate_seconds
+        self._fc_anchor_tracker.observe_first_crack(charge_elapsed_seconds=observed)
         last = self._fc_prediction
         self._publish_fc_prediction(
             None if last is None else last.slope_eta_seconds,

@@ -3074,7 +3074,8 @@ class RoastRunner:
         await self._store.record_telemetry(
             run_id=self._run_id,
             tick=self._counter.value,
-            fc_prediction=snapshot.fc_prediction,
+            # A missed reading persists no prediction (never last tick's ETAs).
+            fc_prediction=None if telemetry is None else snapshot.fc_prediction,
             agent_phase=snapshot.phase,
             elapsed_seconds=snapshot.roast_elapsed_seconds,
             interval_seconds=self._config.controller.telemetry_log_interval_seconds,
