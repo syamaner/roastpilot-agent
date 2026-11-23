@@ -3336,6 +3336,7 @@ class RoastController:
         telemetry = evidence.telemetry
         self._last_telemetry = telemetry
         self._note_valid_bean_reading(telemetry)
+        self._fc_prediction = None
         if not latched:
             self._consecutive_read_failures = 0
         if evidence.bound_child_epoch is None:
@@ -3560,6 +3561,10 @@ class RoastController:
         # snapshot publishes the same telemetry it acted on (E9).
         self._last_telemetry = telemetry
         self._note_valid_bean_reading(telemetry)
+        # D239 (Codex P2 on #1125): a prediction is published only for the
+        # reading it was computed from; a tick that returns early (fault,
+        # recovery) persists NULL rather than the previous tick's ETAs.
+        self._fc_prediction = None
         await self._snapshots.persist_snapshot(telemetry)
         if not self._generation_is_current(generation):
             return

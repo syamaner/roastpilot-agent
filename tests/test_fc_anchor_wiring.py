@@ -387,3 +387,16 @@ async def test_negative_backdate_is_ignored() -> None:
     snap = harness.controller.snapshot().fc_prediction
     assert snap is not None
     assert snap.anchor_fc_charge_seconds == pytest.approx(40.0)
+
+
+@pytest.mark.asyncio
+async def test_a_faulting_reading_publishes_no_stale_prediction() -> None:
+    """Codex P2 on #1125: a reading that faults returns before the prediction
+    step, so the snapshot carries no prediction rather than last tick's."""
+    harness = _charged()
+    await _ramp(harness, 150.0, 0.2, 40, env=220.0)
+    assert harness.controller.snapshot().fc_prediction is not None
+    harness.reader.readings = [_reading(158.0, env=400.0)]  # over the env limit
+    await harness.controller.tick()
+    assert harness.controller.phase is RoastPhase.FAULTED
+    assert harness.controller.snapshot().fc_prediction is None
