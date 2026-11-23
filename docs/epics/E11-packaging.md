@@ -220,6 +220,7 @@ cold run.
 | D238 T1 (#1095) | Pure conservative HUMAN recipe timing evaluator | software complete on protected merge; producer qualification, controller integration and physical validation remain open |
 | D238 T2 (#1105) | Read-only consumer of synthetic P1 timing evidence | software complete on protected merge; no caller, producer/physical qualification and T3 remain open |
 | D238 T3a (#1111) | Private manual/mock pre-FC path and exact opt-in bootstrap inventory | software completion conditional on verified protected merge; combined focused proof passed; protected producer witness and full gate remain lead-owned and are not claimed here; physical, deployment, routine Drop, held-mark emergency and winter qualification work remain open |
+| D239 S1 (#1116) | Operator-only first crack, mark plausibility floor and 196 °C guard from charge (AUTOMATIC route) | software complete on protected merge; refused-mark dashboard notice deferred to #1121; D239 slices 2–4 and physical validation remain open |
 
 Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is in progress.**
 The **operator manual tests** (D28) are
