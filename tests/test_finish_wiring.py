@@ -469,3 +469,111 @@ async def test_low_development_alert_only_below_the_floor(fc_ago_s: float, alert
     )
     alerts = [p for k, p in harness.events.events if k is RoastEventKind.SAFETY_ALERT]
     assert bool(alerts) is alerted
+
+
+# --- failed drops fail closed (safety review on #1131) ---------------------------
+
+
+def _failing_drop(readings: list[RoastTelemetry], heat: int = 55) -> Harness:
+    from tests.test_controller import FailingCommandExecutor
+
+    first: list[RoastTelemetry | Exception | None] = [readings[0]]
+    harness = make_harness(
+        readings=first, config=ON, executor=FailingCommandExecutor({"drop_beans"})
+    )
+    harness.controller.load_profile(PROFILE)
+    for step in NORMAL_PATH[:3]:
+        harness.controller.transition_to(step)
+    harness.controller._charge_monotonic = harness.clock.now - 650.0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._current_heat = heat  # pyright: ignore[reportPrivateUsage]
+    harness.controller._current_fan = 30  # pyright: ignore[reportPrivateUsage]
+    _anchor(harness)
+    return harness
+
+
+def _drop_failures(harness: Harness) -> int:
+    return sum(
+        1
+        for k, p in harness.events.events
+        if k is RoastEventKind.COMMAND_FAILED and p.get("command") == "drop_beans"  # type: ignore[union-attr]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_bean", [195.2, 196.5])  # finish target, ceiling guard
+async def test_after_a_failed_pre_fc_drop_heat_never_returns(first_bean: float) -> None:
+    harness = _failing_drop([_reading(first_bean)])
+    await _tick(harness, _reading(first_bean, ror=6.0))
+    assert harness.executor.targets[-1][0] == 0
+    assert _drop_failures(harness) == 1  # one drop attempt in the tick, never two
+    for bean in (194.6, 194.2, 193.8, 193.5):  # cooling below target: a raise would follow
+        await _tick(harness, _reading(bean, ror=6.0))
+    assert {h for h, _ in harness.executor.targets[1:]} <= {0}
+    assert harness.controller.phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+
+
+@pytest.mark.asyncio
+async def test_after_a_failed_development_drop_heat_cuts_to_zero_at_once() -> None:
+    harness = _failing_drop([_reading(195.5)], heat=95)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.controller._first_crack_monotonic = harness.clock.now - 90.0  # pyright: ignore[reportPrivateUsage]
+    await _tick(harness, _reading(195.5, ror=6.0))
+    # The tick's ordinary step (95 -> 90) precedes the failed drop; the cut follows it.
+    assert harness.executor.targets[-1][0] == 0
+    cut = len(harness.executor.targets)
+    for bean in (195.0, 194.5):
+        await _tick(harness, _reading(bean, ror=6.0))
+    assert {h for h, _ in harness.executor.targets[cut:]} <= {0}
+
+
+@pytest.mark.asyncio
+async def test_below_floor_heat_walks_up_one_step_not_to_the_floor() -> None:
+    harness = _charged()
+    harness.controller._current_heat = 0  # pyright: ignore[reportPrivateUsage]
+    harness.controller._charge_monotonic = harness.clock.now - 720.0  # pyright: ignore[reportPrivateUsage]
+    _anchor(harness)
+    await _tick(harness, _reading(180.0, ror=6.0))
+    assert harness.executor.targets == [(5, 30)]
+
+
+def test_a_recovery_resume_keeps_the_law_off_and_only_a_new_run_re_arms() -> None:
+    harness = _charged()
+    _anchor(harness)
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.PREHEATING)
+    assert harness.controller._finish_disabled_for_run  # pyright: ignore[reportPrivateUsage]
+    harness.controller.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    harness.controller.transition_to(RoastPhase.IDLE)
+    harness.controller.transition_to(RoastPhase.STARTING)
+    assert not harness.controller._finish_disabled_for_run  # pyright: ignore[reportPrivateUsage]
+
+
+def test_the_env_raise_cap_must_sit_below_the_env_fault() -> None:
+    from pydantic import ValidationError
+
+    from roastpilot_agent.config import AppConfig, SafetyLimits
+
+    with pytest.raises(ValidationError, match="env_raise_cap_c must be below"):
+        AppConfig(controller=ON, safety=SafetyLimits(max_env_temp_c=230.0))
+    AppConfig(controller=ON, safety=SafetyLimits(max_env_temp_c=231.0))
+
+
+@pytest.mark.asyncio
+async def test_an_estop_during_the_finish_drop_ends_the_tick(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _charged()
+    _anchor(harness)
+
+    async def stale(*_a: object, **_k: object) -> None:
+        harness.controller.admit_emergency_stop()
+
+    called: list[str] = []
+
+    async def d84(*_a: object, **_k: object) -> None:
+        called.append("d84")
+
+    monkeypatch.setattr(harness.controller, "_maybe_finish_drop", stale)
+    monkeypatch.setattr(harness.controller, "_maybe_deterministic_drop", d84)
+    await _tick(harness, _reading(185.0, ror=12.0))
+    assert called == []

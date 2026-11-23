@@ -2648,6 +2648,28 @@ class AppConfig(BaseSettings):
         return self
 
     @model_validator(mode="after")
+    def _check_finish_raise_cap_below_env_fault(self) -> "AppConfig":
+        """The finish law's environment raise cap must sit below the env fault (#1131).
+
+        A cap at or above ``safety.max_env_temp_c`` would never block a raise
+        before the environment fault already forced the issue.
+
+        Returns:
+            The validated application config.
+
+        Raises:
+            ValueError: If ``controller.finish_control.env_raise_cap_c`` is not
+                strictly below ``safety.max_env_temp_c``.
+        """
+        cap_c = self.controller.finish_control.env_raise_cap_c
+        if cap_c >= self.safety.max_env_temp_c:
+            raise ValueError(
+                "controller.finish_control.env_raise_cap_c must be below "
+                f"safety.max_env_temp_c ({cap_c} >= {self.safety.max_env_temp_c})"
+            )
+        return self
+
+    @model_validator(mode="after")
     def _check_ambient_freshness_bound_outlives_the_poll_interval(self) -> "AppConfig":
         """The doctrine's freshness bound must exceed the ambient POLL interval (#732).
 
