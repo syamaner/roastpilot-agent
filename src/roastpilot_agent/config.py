@@ -1507,16 +1507,17 @@ class FinishControlConfig(BaseModel):
     heat_ceiling_percent: int = Field(default=100, ge=0, le=100)
     #: Largest heat change per decision.
     step_percent: int = Field(default=5, ge=1, le=50)
-    #: Candidates span current heat ± this many steps.
+    #: Subdivisions of one step either side of the applied heat that the
+    #: predictive search considers (D239: heat moves at most one step).
     candidate_steps: int = Field(default=2, ge=1, le=5)
     #: With the planned finish near or past, aim to reach the target this far
     #: ahead (owner, 23 Nov: a late finish keeps raising heat).
     late_horizon_seconds: float = Field(default=60.0, gt=0.0, le=600.0)
     correction_window_seconds: float = Field(default=60.0, gt=0.0, le=300.0)
     correction_alpha: float = Field(default=0.3, gt=0.0, le=1.0)
-    max_rate_bias_c_per_min: float = Field(default=3.0, gt=0.0)
-    max_prediction_error_c: float = Field(default=5.0, gt=0.0)
-    feedback_gain: float = Field(default=2.0, gt=0.0)
+    max_rate_bias_c_per_min: float = Field(default=3.0, gt=0.0, le=10.0)
+    max_prediction_error_c: float = Field(default=5.0, gt=0.0, le=20.0)
+    feedback_gain: float = Field(default=2.0, gt=0.0, le=10.0)
     lag_horizon_seconds: float = Field(default=30.0, gt=0.0, le=120.0)
     #: A target drop with development this many percentage points under the
     #: profile target raises a SAFETY_ALERT (owner, 23 Nov).
@@ -1751,12 +1752,14 @@ class ControllerConfig(BaseModel):
 
     @model_validator(mode="after")
     def _check_finish_control_prerequisites(self) -> "ControllerConfig":
-        """Forbid the finish law without its anchor and its 196 °C backstop.
+        """Forbid the finish law without its anchor and the 196 °C guard flag.
 
         D239 slice 3 (#1131): the law starts from the first-crack anchor, so it
         needs ``fc_anchor.enabled``; and it may keep raising heat when the
         finish runs late (owner, 23 Nov), so the deterministic ceiling guard
-        must be armed to bound it.
+        flag must be on. The flag alone does not arm the guard before first
+        crack in the default ``first_crack_source``: slice 3c must also arm it
+        in ROASTING_PRE_FIRST_CRACK whenever the law owns heat (D239 item 5).
 
         Returns:
             The validated config.
