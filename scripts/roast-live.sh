@@ -138,6 +138,12 @@ case "${FC_SOURCE:-}" in
     exit 1 ;;
 esac
 
+# D239 slice 2 (#1118): log telemetry every second so the observe-only FC
+# anchor and the shadow model leave a 1 Hz calibration trace. The stale-session
+# guard keeps its 20 s floor at this cadence. Override with
+# TELEMETRY_LOG_INTERVAL_SECONDS=<seconds>.
+export ROASTPILOT_CONTROLLER__TELEMETRY_LOG_INTERVAL_SECONDS="${TELEMETRY_LOG_INTERVAL_SECONDS:-1.0}"
+
 if [ ! -f "$COFFEE_ROASTER_MCP_CONFIG" ]; then
   echo "ERROR: MCP config not found: $COFFEE_ROASTER_MCP_CONFIG" >&2
   echo "       Set COFFEE_ROASTER_MCP_CONFIG to your coffee-roaster-mcp.yaml" >&2
