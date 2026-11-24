@@ -1,93 +1,90 @@
 # First crack: temperature threshold or roast-dependent target? (offline, 24 Nov 2026, #1138)
 
-Outcome: first crack behaves more like a time event after dry end than like a fixed temperature. The fixed 176 °C target is consistently early, the per-bean temperature (#1135) removes most of that bias, and a dry-end timing model matches or beats it. Recommendation: log the dry-end timing prediction and a blend in shadow next to the D239 anchor, and decide on switching the anchor target from winter roasts, not from this study alone.
+Outcome: the largest and most robust error is calibration. The fixed 176 °C target fires early on every dataset, and a crack temperature calibrated on the roaster's own runs removes most of that bias. Beyond calibration, this data cannot tell a temperature threshold from a dry-end timing model on the Artisan logs. The agent's own runs favour timing, but only under one heat schedule. A per-bean temperature adds nothing over a calibrated global value once whole roasting days are held out. Recommendation: recalibrate the default crack temperature from the agent's own runs, treat crack temperatures taken from Artisan logs as non-transferable, and log a timing prediction in shadow before any change to what the anchor aims at.
 
-Reproduce: `scripts/extract_alog.py <alog_dir> <series_dir>` reads the Artisan logs, and `scripts/extract_store.py <sqlite> <series_dir>` reads the agent store read-only. Then `python -I scripts/study.py <series_dir>... <out_dir>` writes `tables.txt` and `results.json`. Roast series are not committed (repo rule); `results/` holds derived aggregates only, and a re-run from the same series reproduces them byte for byte.
+Reproduce: `scripts/extract_alog.py <alog_dir> <series_dir>` reads the Artisan logs, and `scripts/extract_store.py <sqlite> <series_dir>` reads the agent store read-only. Then `python -I scripts/study.py <series_dir>... <out_dir>` writes `tables.txt` and `results.json`; `python -I scripts/fan_check.py <alog_dir>` prints the fan and burner check. Roast series are not committed (repo rule); `results/` holds derived aggregates only, and a re-run from the same series reproduces them byte for byte.
 
 ## Question
 
-The first study (`docs/research/fc-predictor`) scored predictors against T176, the moment the bean reaches 176 °C. This study scores against first crack itself, and asks whether a fixed crack temperature is the right target for the anchor.
+The first study (`docs/research/fc-predictor`) scored predictors against T176, the moment the bean reaches 176 °C. This study scores against first crack itself. It asks whether a crack temperature, fixed or per bean, is the right target for the D239 anchor, or whether a roast-dependent target does better.
 
 ## Data
 
-- Artisan: the operator's 47 Hottop logs (June 2024 to October 2025, 14 coarse bean labels, 16 roasts November to March). Truth is the operator's marked first crack, so it carries ear-timing error.
-- Agent: 20 summer runs from the agent store (6 bean origins, about one row per 6 s). Truth is the controller's backdated first-crack onset.
-- Dry end is defined as the live controller defines it (#351): the first crossing of 150 °C after the turning point.
+- Artisan: the operator's 47 Hottop logs (June 2024 to October 2025, 16 roasts from November to March). Bean labels are coarse and come from file names. Two same-session roasts with no origin in the name are assigned to Cuba by hand, and "unknown" counts as a label. Truth is the operator's marked first crack, by ear.
+- Agent: 19 summer runs from the agent store (5 origins, about one row per 6 s). Truth is the controller's first-crack onset, recovered from the stored development percentage. The event payload has no backdate field, so a run is kept only when that onset sits more than 5 s before the detection event (16 runs, 20.6-27.9 s earlier) or the crack was operator-marked (3 runs). One run (21 Jun 2026, before the backdate feature) is excluded.
+- Dry end is defined as the live controller defines it (#351): the first crossing of 150 °C after the turning point. On the Artisan data this sits a median 3 s from Artisan's own dry mark.
 
-## Targets compared
+## Method
 
-Every target feeds the same live 30 s least-squares slope the anchor uses, except the time models, which do not use the slope. Every fitted value is leave-one-out.
-
-- `fixed`: 176 °C.
-- `bean`: the bean's median crack temperature, falling back to the global median for a bean seen once.
-- `time_global`: dry end plus the median dry-end-to-crack time.
-- `time_bean`: the same, using the bean's median duration.
-- `blend`: the mean of the `bean` and `time_global` predictions.
-- `dry` and `bean_dry`: a crack temperature that rises linearly with time since dry end.
+- Targets:
+  - `fixed`: 176 °C.
+  - `global`: the median crack temperature.
+  - `bean`: the bean's median crack temperature, falling back to `global` when the bean has no other roast.
+  - `time_global`: dry end plus the median dry-end-to-crack time.
+  - `time_bean`: dry end plus the bean's median dry-end-to-crack time.
+  - `blend`: the mean of the `bean` and `time_global` predictions.
+  - `dry` and `bean_dry`: a crack temperature that rises linearly with time since dry end.
+- The temperature targets feed the same live 30 s least-squares slope the anchor uses; the timing models do not use the slope.
+- Every fitted value is fitted with the scored roast's whole roasting day left out, because same-day roasts share a lot and leaving out only the roast flatters the per-bean values.
+- `freeze` is the decision moment. It replays the live anchor window (open at 155 °C with an ETA of at most 120 s; freeze at an ETA of 45 s or at 171 °C, moved by the target's offset from 176 °C) and scores each temperature target's own frozen anchor. The timing models and the blend are read at the per-bean target's freeze.
+- The fixed-lead rows (-120 s to -45 s before the marked crack) are anchored on the outcome. The -120 s row drops the roasts with the shortest dry-end-to-crack times, so it is shown only for reference.
 
 ## Results
 
-Each cell is median |error| / median bias / p90 |error|, in seconds (predicted minus marked). The full table, including `global`, `dry` and `bean_dry`, is in `results/tables.txt`.
+Each cell is median |error| / median bias / p90 |error|, in seconds (predicted minus marked). `results/tables.txt` has every target, every point and the n per cell.
 
 Artisan, all 47:
 
 ```
-point   fixed            bean             time_global      time_bean        blend
--120s   19.7/-16.9/35.7  13.2/ -5.9/29.9  12.0/ -2.0/28.5  11.0/ -4.0/37.0  11.2/ -2.3/28.8
--90s    18.0/-12.2/38.7  12.2/ -4.1/40.5  13.0/ +0.5/40.5  14.0/ -2.0/55.0  13.0/ +0.8/37.1
--60s    17.9/-14.2/36.2  11.9/ -2.9/38.2  13.0/ +0.5/40.5  14.0/ -2.0/55.0  14.7/ +0.2/34.8
--45s    14.9/-12.7/37.4  10.3/ +0.4/39.3  13.0/ +0.5/40.5  14.0/ -2.0/55.0  10.4/ +0.8/32.8
-BT170   16.1/-14.0/33.1   9.8/ -0.6/37.3  12.8/ -1.5/36.5  12.0/ -4.0/44.5   8.4/ +0.8/31.3
+point   fixed            global           bean             time_global      blend
+freeze  20.3/-13.4/38.6  12.1/ -1.1/38.8  12.2/ -2.0/38.8  13.0/ -1.0/37.5  14.7/ +1.0/33.9
+-60s    17.9/-14.2/36.2  11.5/ +0.1/35.7  12.3/ +0.7/32.5  13.0/ +0.0/40.0  15.5/ +1.2/34.7
+BT170   16.1/-14.0/33.1  12.7/ -2.0/35.6  11.9/ -1.0/38.9  13.0/ -1.2/37.0  14.4/ +0.7/25.6
 ```
 
 Artisan, 16 winter roasts:
 
 ```
-point   fixed            bean             time_global      blend
--120s   22.5/-21.9/38.2  13.9/ -5.9/32.7   9.0/ -9.0/26.0  11.2/ -3.1/28.8
--60s    17.8/-16.2/36.2   8.2/ +1.3/38.2  10.8/ -5.5/27.0   4.5/ -0.5/29.1
--45s    16.4/-14.4/37.4  11.7/ -1.5/39.3  10.8/ -5.5/27.0   2.8/ -0.2/29.6
-BT170   17.6/-15.3/32.3   8.1/ -1.5/26.6   9.0/ -9.0/26.0   3.3/ -0.1/26.3
+point   fixed            global           bean             time_global      blend
+freeze  19.9/-16.9/41.3   7.2/ -4.8/30.2   7.0/ -2.2/26.6   9.0/ -9.0/26.0   2.5/ -0.4/25.1
+-60s    17.8/-16.2/36.2   7.9/ -5.2/46.4   7.8/ +1.0/27.5  10.8/ -5.5/27.0   4.1/ -0.4/26.8
+BT170   17.6/-15.3/32.3   8.5/ -4.8/31.1   6.0/ -1.4/26.6   9.0/ -9.0/26.0   2.7/ -0.0/25.6
 ```
 
-Agent, 20 summer runs:
+Agent, 19 summer runs:
 
 ```
-point   fixed            bean             time_global      blend
--120s   63.7/-63.7/101.6 27.9/-23.0/65.9  10.1/ +0.0/30.9  15.9/-11.7/48.4
--60s    50.1/-50.1/60.0  12.0/ -4.7/52.1  10.1/ +0.0/30.9  12.3/ +0.6/40.6
-BT165   69.1/-69.1/106.1 34.8/-34.8/64.1  10.1/ +0.0/30.9  15.9/-14.6/46.6
-BT170   53.1/-53.1/112.9 26.3/ -3.6/74.2  10.1/ +0.0/30.9  16.8/ +0.1/52.5
+point   fixed             global           bean             time_global      blend
+freeze  63.3/-63.3/118.5  18.6/ +1.6/54.1  30.8/ -8.6/60.1  11.5/ +2.3/30.9  19.1/ +0.7/41.0
+-60s    49.1/-49.1/60.0   12.9/ -5.0/53.9  24.4/-11.3/52.1  11.2/ +1.5/30.9  18.0/ -1.3/40.6
+BT170   51.7/-51.7/112.9  22.7/ -5.7/79.7  31.7/ -7.5/66.4  11.2/ +1.5/30.9  16.3/ -0.4/45.7
 ```
 
-Crack temperature against the dry-end-to-crack time:
-
-| Data | Crack °C median (sd) | Dry end to crack, s median (sd) | r overall | r within bean | Slope within bean |
-|---|---|---|---|---|---|
-| Artisan | 178.0 (3.9) | 154 (24) | 0.91 | 0.89 (10 beans, 43 roasts) | 8.8 °C/min |
-| Agent | 182.0 (3.2) | 227 (18) | 0.39 | 0.74 (4 beans, 18 runs) | 7.7 °C/min |
+| Data | Crack °C median (sd) | Dry end to crack, s median (sd) |
+|---|---|---|
+| Artisan | 178.0 (3.9) | 154 (24) |
+| Agent | 182.0 (3.0) | 227 (16) |
 
 ## Findings
 
-- The fixed 176 °C target is early everywhere: by 12-22 s on the Artisan roasts and 45-69 s on the agent runs, where the bean is still climbing when the anchor freezes.
-- The per-bean temperature removes most of that bias on the Artisan data (median error about 10-13 s), which supports #1135.
-- Crack temperature rises with the time spent after dry end, and the effect holds within beans (r 0.89 and 0.74). It is not a bean mix effect. A longer Maillard phase cracks hotter, at roughly 8-9 °C per extra minute.
-- That explains most of the agent/Artisan gap. The agent's summer profile spends about 73 s longer between dry end and crack, and cracks about 4 °C hotter. So per-bean values taken from Artisan logs are likely to sit a few degrees low for the agent's own profile, and will anchor early.
-- The simple timing model (dry end plus the median duration) matches the per-bean temperature on the Artisan data and clearly beats it on the agent data (10 s against 12-35 s, no bias). Per-bean durations are worse, because most beans have very few roasts.
-- The blend is the best candidate near the freeze point in winter (2.8-4.5 s median error at 45-60 s out), and is never far behind elsewhere.
-- A crack temperature that rises with time is badly conditioned: the target climbs at nearly the bean's own rate, so the crossing is unstable (p90 errors from about 60 s to over 500 s). It is rejected.
+- **Calibration dominates.** The fixed 176 °C target is early at the freeze by a median 13-17 s on the Artisan logs and 63 s on the agent runs. A calibrated global median removes most of that: 12.1 s on Artisan, 18.6 s on agent. The agent runs crack at a median 182 °C, so 176 °C is about 6 °C low for the agent's own profile.
+- **Per-bean temperature adds nothing measurable here.** With whole days held out, `bean` ties `global` on the Artisan logs (12.2 against 12.1 at the freeze) and is worse on the agent runs (30.8 against 18.6). Same-bean roasts on different days crack at different temperatures, and most beans have very few roasts.
+- **Temperature against timing is a tie on the Artisan logs and favours timing on the agent runs.** At the freeze, Artisan gives `global` 12.1 against `time_global` 13.0; agent gives 18.6 against 11.5. The agent result comes from one heat schedule: a 100 to 60-65 % trim shortly after dry end, with the fan fixed at 30 %.
+- **The crack-temperature drift with time is not evidence of a time event.** Because dry end is the 150 °C crossing, crack temperature minus 150 is the mean rate of rise times the dry-end-to-crack time. So a strong correlation between the two (r 0.89 within bean on Artisan) follows largely from that identity. A late ear mark, which reads both later and hotter, would produce the same pattern. This study cannot separate the two explanations.
+- **Fan does not explain the spread.** On the 40 Artisan roasts with a control track, the time-weighted fan between dry end and crack ranged from 0 to 87 %. It barely related to crack temperature (r 0.10) or to dry-end-to-crack time (r 0.16). Burner was 97-100 % on every roast, so these logs say nothing about the effect of heat changes.
+- **The agent/Artisan gap is confounded.** The agent cracks 4 °C hotter with 73 s more between dry end and crack. A pure rate-of-rise effect would predict about 10 °C, more than double what is observed. The datasets also differ in crack truth (ear against backdated audio), lots, years and heat schedule. Crack temperatures taken from Artisan logs should not be assumed to transfer to the agent.
+- **The winter blend result is fragile.** The blend has the best median in the 15 winter roasts at the freeze (2.5 s), but it was picked after the fact from many candidates. Its p90 (25 s) is no better than the other calibrated targets, and across all 47 roasts it is behind `global` and `bean`.
+- **A crack temperature that rises with time is rejected.** The target climbs at close to, and on the agent runs faster than, the bean's own rate of rise. The crossing is then unstable or does not exist, and `tables.txt` shows the shrinking n.
 
 ## Limits
 
-- The timing model assumes this roast follows the heat pattern of the roasts it was fitted on. It cannot see a change of heat, while the slope-fed temperature targets can. Under the finish law, the controller's own heat changes would bias a pure timing model, which is why the blend and a shadow trial come before any switch.
-- Artisan crack marks are by ear; agent crack truth is the backdated audio onset. Neither is exact.
-- 47 + 20 roasts, one roaster. The agent has no winter runs in this store, and many beans have one or two roasts.
-- The agent store samples about every 6 s, which coarsens the slope.
+- 47 + 19 roasts, one roaster, many beans with one or two roasts. The agent has no winter runs in this store.
+- Artisan crack marks are by ear; agent crack truth is the backdated audio onset.
+- The timing models assume this roast follows the heat schedule of the roasts they were fitted on. Under the finish law the controller changes heat, so a duration fitted on the old trim schedule would be biased and would need refitting or conditioning on heat.
+- Errors are pooled across beans; the #1138 rule's "within beans" condition is approximated by leave-one-day-out, not tested bean by bean.
 
 ## Recommendation
 
-Under the decision rule in #1138 (change the anchor target only if a model clearly beats the per-bean value, within beans), the timing model and the blend qualify on the agent data, and the effect holds within beans. But the open-loop caveat is real, so the proposed next step is observe-only:
-
-1. Log a dry-end timing prediction and the blend in shadow every tick next to the anchor (the slice 2c pattern), with the duration fitted from the agent's own runs.
-2. Treat per-bean temperatures taken from Artisan logs as provisional. They come from a faster profile and probably read 2-4 °C low for the agent's.
-3. Decide on switching the anchor target after the first winter roasts, against the logged predictions.
+1. **Recalibrate the default crack temperature from the agent's own runs.** The agent cracks at a median 182 °C on its own probe and profile; 176 °C anchors about a minute early. This is a config default with a plan decision, so it is proposed here, not changed.
+2. **Treat Artisan-derived per-bean crack temperatures as non-transferable**, and leave the #1135 field blank unless a bean has agent-recorded cracks.
+3. **Log a dry-end timing prediction in shadow** next to the anchor (the slice 2c pattern), refitted on the agent's runs and conditioned on, or at least labelled with, the heat schedule. Decide on any change to the anchor's target after winter roasts, when heat actually varies.

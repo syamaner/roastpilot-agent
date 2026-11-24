@@ -3,9 +3,12 @@
 Usage: python -I extract_store.py <sqlite_path> <out_dir>
 
 One CSV per completed run with a first crack (``t`` seconds from charge, ``bt``
-°C) plus ``runs.json``. First-crack truth is the controller's backdated onset
-(recovered from the stored development percent) when present, else the event
-time, which lags the true crack by the audio detector's 12-28 s.
+°C) plus ``runs.json``. First-crack truth is the controller's onset, recovered
+from the stored development percent. The event payload carries no backdate
+field, so a run counts as backdated only when that onset sits more than 5 s
+before the event; otherwise the onset is the detection time, which lags the
+true crack by 12-28 s, and the run is flagged ``truth_ok: false``. Operator
+marks are taken as truth.
 """
 
 import csv
@@ -24,7 +27,7 @@ for n, (rid, started, profile_json) in enumerate(
     1,
 ):
     ev = con.execute(
-        "select monotonic_seconds from roast_events where run_id=? and kind='first_crack'"
+        "select monotonic_seconds, source from roast_events where run_id=? and kind='first_crack'"
         " order by id limit 1",
         (rid,),
     ).fetchone()
@@ -49,6 +52,8 @@ for n, (rid, started, profile_json) in enumerate(
     fc_event = (ev[0] - start[0]) - off
     dev = [(r[1], r[4]) for r in rows if r[2] == "development" and r[4] and r[1] > 0]
     fc = dev[-1][0] * (1 - dev[-1][1] / 100.0) if dev else fc_event
+    lag = fc_event - fc
+    truth_ok = ev[1] == "operator" or lag > 5.0
     label = f"agent-{n:02d}"
     with open(os.path.join(OUT, f"{label}.csv"), "w", newline="") as fh:
         w = csv.writer(fh)
@@ -58,6 +63,7 @@ for n, (rid, started, profile_json) in enumerate(
                 w.writerow([round(r[1], 3), r[3]])
     bt_fc = min(rows, key=lambda r: abs(r[1] - fc))[3]
     name = (json.loads(profile_json or "{}").get("bean_origin") or "unknown").lower()
+    name = name.replace("el salvador", "el-salvador")
     month = int(started[5:7])
     runs.append(
         {
@@ -68,7 +74,9 @@ for n, (rid, started, profile_json) in enumerate(
             "winter": month in (11, 12, 1, 2, 3),
             "fc_s": round(fc, 2),
             "fc_bt": bt_fc,
-            "fc_backdated": bool(dev),
+            "fc_source": ev[1],
+            "event_minus_onset_s": round(lag, 1),
+            "truth_ok": truth_ok,
         }
     )
 

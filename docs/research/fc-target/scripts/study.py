@@ -19,6 +19,11 @@ import sys
 os.makedirs(OUT, exist_ok=True)
 
 FIXED_C = 176.0
+# The live anchor window (config.FcAnchorConfig defaults, #1118 / #1135).
+OPEN_MIN_C = 155.0
+OPEN_MAX_ETA_S = 120.0
+FREEZE_ETA_S = 45.0
+FREEZE_C = 171.0
 DRY_C = 150.0
 WINDOW_S = 30.0
 LEADS_S = (120.0, 90.0, 60.0, 45.0)
@@ -37,7 +42,7 @@ def load(series_dir):
         # 150 °C after the turning point.
         tp = min(range(len(pts)), key=lambda i: pts[i][1] if pts[i][0] < r["fc_s"] else 1e9)
         dry = next((t for t, b in pts[tp:] if b >= DRY_C), None)
-        if dry is None or dry >= r["fc_s"]:
+        if dry is None or dry >= r["fc_s"] or not r.get("truth_ok", True):
             continue
         out.append(r | {"pts": pts, "dry_s": dry, "d2fc": r["fc_s"] - dry})
     return out
@@ -127,19 +132,64 @@ def predict(kind, p, t0, bt0, s, dry):
     return t0 + max(0.0, (target - bt0) / s)
 
 
+TEMP_KINDS = ("fixed", "global", "bean")
+
+
+def freeze(pts, dry, fc_s, target):
+    """Replay the live anchor toward ``target``; return (freeze time, anchor).
+
+    The anchor opens at 155 °C with an ETA of at most 120 s and freezes once
+    the ETA is 45 s or less, or the bean reaches the freeze temperature (171 °C
+    moved by the target's offset from 176, never below 155 or above the
+    target). ``None`` when it never froze before the marked crack.
+    """
+    freeze_c = min(target, max(OPEN_MIN_C, FREEZE_C + target - FIXED_C))
+    for t, b in pts:
+        if t <= dry or t >= fc_s or b < OPEN_MIN_C:
+            continue
+        sl = slope_at(pts, t)
+        if sl is None or sl[0] <= 1e-6:
+            continue
+        eta = (target - sl[1]) / sl[0]
+        if eta < 0 or eta > OPEN_MAX_ETA_S:
+            if b >= freeze_c:
+                return None
+            continue
+        if eta <= FREEZE_ETA_S or b >= freeze_c:
+            return t, t + eta
+    return None
+
+
 KINDS = ["fixed", "global", "bean", "dry", "bean_dry", "time_global", "time_bean", "blend"]
 
 
 def score(runs):
     errs = {}
     for r in runs:
-        train = [x for x in runs if x is not r]
+        # Leave the whole roasting day out: same-day roasts share a lot.
+        train = [x for x in runs if x["date"][:10] != r["date"][:10]]
         p = fitted(train, r)
         points = [(f"-{int(lead)}s", r["fc_s"] - lead) for lead in LEADS_S]
         for temp in TEMPS_C:
             t = next((t for t, b in r["pts"] if b >= temp and t > r["dry_s"]), None)
             if t is not None and t < r["fc_s"]:
                 points.append((f"BT{int(temp)}", t))
+        # The decision moment: each temperature target's own live freeze;
+        # the timing models and the blend are read at the per-bean freeze.
+        frozen = {k: freeze(r["pts"], r["dry_s"], r["fc_s"], p[k]) for k in TEMP_KINDS}
+        for k in TEMP_KINDS:
+            if frozen[k] is not None:
+                errs.setdefault(("freeze", k), []).append(
+                    (frozen[k][1] - r["fc_s"], r["winter"], r["label"])
+                )
+        if frozen["bean"] is not None:
+            t_f, anchor = frozen["bean"]
+            tg = r["dry_s"] + p["time_global"]
+            tb = r["dry_s"] + p["time_bean"]
+            for k, pred in (("time_global", tg), ("time_bean", tb), ("blend", (anchor + tg) / 2)):
+                errs.setdefault(("freeze", k), []).append(
+                    (pred - r["fc_s"], r["winter"], r["label"])
+                )
         for name, t_eval in points:
             if t_eval <= r["dry_s"]:
                 continue  # the dry-end models need a dry end already seen
@@ -168,19 +218,19 @@ def summary(es):
 
 
 def table(errs, subset):
-    names = sorted({n for n, _ in errs}, key=lambda n: (n[0] != "-", n))
-    lines = ["point     " + "".join(f"{k:>18}" for k in KINDS)]
+    names = sorted({n for n, _ in errs}, key=lambda n: (n != "freeze", n[0] != "-", n))
+    lines = ["point     " + "".join(f"{k:>23}" for k in KINDS)]
     out = {}
     for n in names:
         cells = []
         for k in KINDS:
             es = [e for e, w, _ in errs.get((n, k), []) if subset(w)]
             if not es:
-                cells.append(f"{'-':>18}")
+                cells.append(f"{'-':>23}")
                 continue
             sm = summary(es)
             out[f"{n}/{k}"] = sm
-            cells.append(f"{sm['median_abs']:>6}/{sm['bias']:>+6}/{sm['p90_abs']:>5}")
+            cells.append(f"{sm['median_abs']:>5}/{sm['bias']:>+6}/{sm['p90_abs']:>5} n{sm['n']:<3}")
         lines.append(f"{n:<10}" + "".join(cells))
     return lines, out
 
