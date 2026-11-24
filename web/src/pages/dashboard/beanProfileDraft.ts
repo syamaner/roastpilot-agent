@@ -46,6 +46,8 @@ export interface BeanProfileDraft {
   initial_fan_percent: string;
   target_drop_temp_c: string;
   target_development_percent: string;
+  /** Expected first-crack bean temperature (#1135); "" = the config default. */
+  first_crack_bean_temp_c: string;
   default_bean_weight_grams: string;
   /**
    * Marks `is_blend` as an UNRESOLVED tri-state from a draft-from-URL response
@@ -315,6 +317,10 @@ export const ALTITUDE_MAX_M = 4000;
 export const TEMP_MIN_C = 100;
 export const TEMP_MAX_C = 240;
 
+/** Expected first-crack bounds (#1135) — mirror `models` first_crack_bean_temp_c. */
+export const FIRST_CRACK_MIN_C = 160;
+export const FIRST_CRACK_MAX_C = 195;
+
 /** Pre-filled defaults (mirror `models` field defaults + the empirical median). */
 export const DEFAULT_BEAN_PROFILE_DRAFT: BeanProfileDraft = {
   name: "",
@@ -335,6 +341,7 @@ export const DEFAULT_BEAN_PROFILE_DRAFT: BeanProfileDraft = {
   // Aligned with prompt v4 + the operator's empirical median (drop 195 °C / 15 % DTR).
   target_drop_temp_c: "195",
   target_development_percent: "15",
+  first_crack_bean_temp_c: "",
   default_bean_weight_grams: "250",
 };
 
@@ -358,6 +365,8 @@ export function draftFromBeanProfile(profile: BeanProfileInput): BeanProfileDraf
     initial_fan_percent: String(profile.initial_fan_percent),
     target_drop_temp_c: String(profile.target_drop_temp_c),
     target_development_percent: String(profile.target_development_percent),
+    first_crack_bean_temp_c:
+      profile.first_crack_bean_temp_c == null ? "" : String(profile.first_crack_bean_temp_c),
     default_bean_weight_grams: String(profile.default_bean_weight_grams),
   };
 }
@@ -415,6 +424,8 @@ export function draftFromBeanProfileDraft(
       initial_fan_percent: String(response.initial_fan_percent),
       target_drop_temp_c: String(response.target_drop_temp_c),
       target_development_percent: String(response.target_development_percent),
+      // A vendor page never states this roaster's crack temperature.
+      first_crack_bean_temp_c: "",
       default_bean_weight_grams: String(response.default_bean_weight_grams),
       field_sources: response.field_sources,
       field_evidence: response.field_evidence,
@@ -542,6 +553,19 @@ export function validateBeanProfile(
   if (!Number.isFinite(dev) || dev <= 0 || dev >= 100)
     errors.target_development_percent = "0–100 (exclusive).";
 
+  const firstCrackRaw = draft.first_crack_bean_temp_c.trim();
+  let firstCrack: number | null = null;
+  if (firstCrackRaw !== "") {
+    const fc = Number(firstCrackRaw);
+    if (!Number.isFinite(fc) || fc < FIRST_CRACK_MIN_C || fc > FIRST_CRACK_MAX_C) {
+      errors.first_crack_bean_temp_c = `${FIRST_CRACK_MIN_C}–${FIRST_CRACK_MAX_C} °C, or blank.`;
+    } else if (errors.target_drop_temp_c === undefined && fc >= drop) {
+      errors.first_crack_bean_temp_c = "Must be below the target drop.";
+    } else {
+      firstCrack = fc;
+    }
+  }
+
   if (Object.keys(errors).length > 0) return { errors };
 
   return {
@@ -563,6 +587,7 @@ export function validateBeanProfile(
       initial_fan_percent: fan,
       target_drop_temp_c: drop,
       target_development_percent: dev,
+      first_crack_bean_temp_c: firstCrack,
       default_bean_weight_grams: defaultWeight,
     },
   };

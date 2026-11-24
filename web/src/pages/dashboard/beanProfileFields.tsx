@@ -20,6 +20,8 @@ import {
   ALTITUDE_MIN_M,
   fieldEvidenceFor,
   fieldSourceFor,
+  FIRST_CRACK_MAX_C,
+  FIRST_CRACK_MIN_C,
   PROCESSING_OPTIONS,
   SPECIES_OPTIONS,
   stripBidiControls,
@@ -616,6 +618,19 @@ export function BeanProfileFields({
           onChange={set("target_development_percent")}
           error={errors.target_development_percent}
           hint="0–100 (exclusive)"
+          testIdPrefix={testIdPrefix}
+        />
+        <Field
+          id="first_crack_bean_temp_c"
+          label="Expected first crack (°C, optional)"
+          type="number"
+          min={FIRST_CRACK_MIN_C}
+          max={FIRST_CRACK_MAX_C}
+          step={0.1}
+          value={draft.first_crack_bean_temp_c}
+          onChange={set("first_crack_bean_temp_c")}
+          error={errors.first_crack_bean_temp_c}
+          hint={`${FIRST_CRACK_MIN_C}–${FIRST_CRACK_MAX_C} °C, below the drop; blank = controller default`}
           testIdPrefix={testIdPrefix}
         />
       </fieldset>
