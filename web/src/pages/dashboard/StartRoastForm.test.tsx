@@ -66,7 +66,34 @@ describe("StartRoastForm", () => {
       initial_fan_percent: 40,
       target_drop_temp_c: 195,
       target_development_percent: 15,
+      // #1135: blank expected first crack = the config default.
+      first_crack_bean_temp_c: null,
     });
+  });
+
+  it("carries an entered expected first crack into the started profile (#1135)", async () => {
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-first_crack_bean_temp_c"), {
+      target: { value: "179.5" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.first_crack_bean_temp_c).toBe(179.5);
+  });
+
+  it("blocks start on an out-of-range expected first crack (#1135)", () => {
+    const onStart = vi.fn();
+    render(<StartRoastForm onStart={onStart} />);
+    fillMinimum();
+    fireEvent.change(screen.getByTestId("start-roast-first_crack_bean_temp_c"), {
+      target: { value: "150" },
+    });
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    expect(onStart).not.toHaveBeenCalled();
+    expect(screen.getByText("160–195 °C, or blank.")).toBeInTheDocument();
   });
 
   it("renders the bean-identity fields and the blend toggle (#164)", () => {
@@ -564,5 +591,20 @@ describe("StartRoastForm — clears provenance on edit (#627 Codex round-2)", ()
     render(<StartRoastForm onStart={vi.fn()} />);
     fireEvent.click(screen.getByTestId("start-roast-is_blend"));
     expect(spy).toHaveBeenCalledWith(expect.anything(), "is_blend", true);
+  });
+});
+
+describe("StartRoastForm saved first crack (#1135)", () => {
+  it("a saved profile's expected first crack fills the form and reaches the roast", async () => {
+    const saved: BeanProfile = { ...FIXTURE_KOKE, first_crack_bean_temp_c: 172 };
+    const { onStart } = renderWithLibrary({ profiles: [saved] });
+    fireEvent.change(screen.getByTestId("bean-profile-select"), {
+      target: { value: saved.id },
+    });
+    expect(screen.getByTestId("start-roast-first_crack_bean_temp_c")).toHaveValue(172);
+    fireEvent.submit(screen.getByTestId("start-roast-form"));
+    await waitFor(() => expect(onStart).toHaveBeenCalledTimes(1));
+    const profile = onStart.mock.calls[0][0] as RoastProfile;
+    expect(profile.first_crack_bean_temp_c).toBe(172);
   });
 });

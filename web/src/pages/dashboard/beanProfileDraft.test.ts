@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DEFAULT_BEAN_PROFILE_DRAFT,
+  draftFromBeanProfile,
   draftFromBeanProfileDraft,
   fieldEvidenceFor,
   fieldSourceFor,
@@ -13,7 +14,7 @@ import {
   type BeanProfileDraft,
   type ProvenanceTrackedField,
 } from "./beanProfileDraft";
-import { FIXTURE_DRAFT_RESPONSE } from "./beanProfileFixture";
+import { FIXTURE_DRAFT_RESPONSE, FIXTURE_KOKE } from "./beanProfileFixture";
 
 /** A draft with the given `field_sources`/`field_evidence` maps layered on
  *  the default (the shape the draft-review UI reads from, #627). */
@@ -393,5 +394,66 @@ describe("draftFromBeanProfileDraft — strips bidi controls from drafted free t
     const { draft } = draftFromBeanProfileDraft(FIXTURE_DRAFT_RESPONSE);
     expect(draft.name).toBe(FIXTURE_DRAFT_RESPONSE.name);
     expect(draft.bean_origin).toBe(FIXTURE_DRAFT_RESPONSE.bean_origin);
+  });
+});
+
+describe("expected first crack (#1135)", () => {
+  const base: BeanProfileDraft = { ...DEFAULT_BEAN_PROFILE_DRAFT, name: "n", bean_origin: "o" };
+  const validate = (fc: string, drop = "195") =>
+    validateBeanProfile({ ...base, first_crack_bean_temp_c: fc, target_drop_temp_c: drop });
+
+  it("defaults blank and submits null (the config default)", () => {
+    expect(DEFAULT_BEAN_PROFILE_DRAFT.first_crack_bean_temp_c).toBe("");
+    const result = validate("  ");
+    expect("input" in result && result.input.first_crack_bean_temp_c).toBeNull();
+  });
+
+  it.each([
+    ["160", 160],
+    ["179.5", 179.5],
+    ["195", 195],
+  ])("accepts %s", (raw, expected) => {
+    const result = validate(raw, "200");
+    expect("input" in result && result.input.first_crack_bean_temp_c).toBe(expected);
+  });
+
+  it.each(["159.9", "195.1", "abc", "Infinity"])("rejects %s", (raw) => {
+    const result = validate(raw);
+    expect("errors" in result && result.errors.first_crack_bean_temp_c).toBe(
+      "160–195 °C, or blank.",
+    );
+  });
+
+  it.each([
+    ["190", "190"],
+    ["190", "189"],
+  ])("rejects a first crack of %s at or above a %s drop", (fc, drop) => {
+    const result = validate(fc, drop);
+    expect("errors" in result && result.errors.first_crack_bean_temp_c).toBe(
+      "Must be below the target drop.",
+    );
+  });
+
+  it("accepts a first crack just below the drop", () => {
+    const result = validate("189.9", "190");
+    expect("input" in result && result.input.first_crack_bean_temp_c).toBe(189.9);
+  });
+
+  it("leaves the drop error alone when the drop itself is invalid", () => {
+    const result = validate("180", "50");
+    expect("errors" in result && result.errors.first_crack_bean_temp_c).toBeUndefined();
+  });
+
+  it("round-trips a saved value through the edit draft", () => {
+    const saved = { ...FIXTURE_KOKE, first_crack_bean_temp_c: 172 };
+    expect(draftFromBeanProfile(saved).first_crack_bean_temp_c).toBe("172");
+    expect(draftFromBeanProfile(FIXTURE_KOKE).first_crack_bean_temp_c).toBe("");
+    const cleared = { ...FIXTURE_KOKE, first_crack_bean_temp_c: null };
+    expect(draftFromBeanProfile(cleared).first_crack_bean_temp_c).toBe("");
+  });
+
+  it("a draft from a vendor URL never guesses the crack temperature", () => {
+    const { draft } = draftFromBeanProfileDraft(FIXTURE_DRAFT_RESPONSE);
+    expect(draft.first_crack_bean_temp_c).toBe("");
   });
 });
