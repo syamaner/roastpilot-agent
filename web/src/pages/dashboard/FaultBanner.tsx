@@ -24,8 +24,10 @@
  * page renders the affordance only when the server's `enabled_actions` mirror
  * enables `acknowledge_fault` — render-from-server, no client-side command matrix.
  *
- * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
- * accumulates the trail). All temperatures Celsius.
+ * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads and by
+ * verdict-less `safety_alert` notices such as `{"alert": "finish_drop_failed"}`,
+ * which render as ALERT rows (the page accumulates the trail). All temperatures
+ * Celsius.
  */
 
 import type { ReactNode } from "react";
@@ -110,9 +112,11 @@ export function FaultBanner({
                 data-testid="safety-trail-row"
                 className="flex items-center justify-between gap-3 rounded border border-roast-fault/30 px-3 py-1.5 text-sm"
               >
-                <span className="truncate">{entry.evaluation.reason}</span>
+                <span className="truncate">
+                  {entry.kind === "notice" ? entry.alert.replace(/_/g, " ") : entry.evaluation.reason}
+                </span>
                 <span className="numeric shrink-0 text-xs uppercase tracking-wide text-roast-fault">
-                  {verdictLabel(entry.evaluation.verdict)}
+                  {entry.kind === "notice" ? "ALERT" : verdictLabel(entry.evaluation.verdict)}
                 </span>
               </li>
             ))}

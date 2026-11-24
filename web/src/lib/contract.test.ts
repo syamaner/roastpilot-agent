@@ -586,10 +586,13 @@ describe("dashboard page parser — folds every event it consumes", () => {
       event: frame("safety_alert"),
     });
     expect(next.safetyTrail.some((e) => e.kind === "safety_alert")).toBe(true);
-    expectKeys(
-      next.safetyTrail[0].evaluation as unknown as Record<string, unknown>,
-      ["rule", "verdict", "reason"],
-    );
+    const entry = next.safetyTrail[0];
+    if (entry.kind === "notice") throw new Error("fixture frame is an evaluation, not a notice");
+    expectKeys(entry.evaluation as unknown as Record<string, unknown>, [
+      "rule",
+      "verdict",
+      "reason",
+    ]);
   });
 
   it("t0_detected records the detection; the T0 marker is placed by the first post-charge telemetry (#326/#404)", () => {
