@@ -142,6 +142,11 @@ def freeze(pts, dry, fc_s, target):
     the ETA is 45 s or less, or the bean reaches the freeze temperature (171 °C
     moved by the target's offset from 176, never below 155 or above the
     target). ``None`` when it never froze before the marked crack.
+
+    Two deliberate simplifications against ``FcAnchorTracker``: a temperature
+    freeze uses this tick's projection (live keeps the previous tick's anchor),
+    and a roast that never freezes is dropped (live would hold a provisional
+    anchor). Both move the calibrated targets' medians by about 1 s or less.
     """
     freeze_c = min(target, max(OPEN_MIN_C, FREEZE_C + target - FIXED_C))
     for t, b in pts:

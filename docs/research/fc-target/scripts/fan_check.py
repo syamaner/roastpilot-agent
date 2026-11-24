@@ -50,19 +50,21 @@ def residuals(y, columns):
 def mean_setting(events, kind, dry, fc):
     """Time-weighted mean of a piecewise-constant setting over [dry, fc]."""
     pts = sorted((t, v) for t, k, v in events if k == kind)
-    cur, acc, last = None, 0.0, dry
+    cur, acc, last, start = None, 0.0, dry, dry
     for t, v in pts:
         if t <= dry:
             cur = v
             continue
         if t >= fc:
             break
-        if cur is not None:
+        if cur is None:
+            start = t  # no setting known before this event: average from here
+        else:
             acc += cur * (t - last)
         cur, last = v, t
     if cur is None:
         return None
-    return (acc + cur * (fc - last)) / (fc - dry)
+    return (acc + cur * (fc - last)) / (fc - start)
 
 
 rows = []
