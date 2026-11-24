@@ -291,7 +291,7 @@ for sdir in SERIES:
     report.append("")
 
 with open(os.path.join(OUT, "tables.txt"), "w") as fh:
-    fh.write("\n".join(line.rstrip() for line in report) + "\n")
+    fh.write("\n".join(line.rstrip() for line in report).rstrip("\n") + "\n")
 with open(os.path.join(OUT, "results.json"), "w") as fh:
     json.dump(results, fh, indent=1, sort_keys=True)
 print("\n".join(report))
