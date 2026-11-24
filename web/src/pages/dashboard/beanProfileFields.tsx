@@ -622,7 +622,7 @@ export function BeanProfileFields({
         />
         <Field
           id="first_crack_bean_temp_c"
-          label="Expected first crack (°C)"
+          label="Expected first crack (°C, optional)"
           type="number"
           min={FIRST_CRACK_MIN_C}
           max={FIRST_CRACK_MAX_C}
@@ -630,7 +630,7 @@ export function BeanProfileFields({
           value={draft.first_crack_bean_temp_c}
           onChange={set("first_crack_bean_temp_c")}
           error={errors.first_crack_bean_temp_c}
-          hint={`Optional, ${FIRST_CRACK_MIN_C}–${FIRST_CRACK_MAX_C} °C; blank uses the default`}
+          hint={`${FIRST_CRACK_MIN_C}–${FIRST_CRACK_MAX_C} °C, below the drop; blank = controller default`}
           testIdPrefix={testIdPrefix}
         />
       </fieldset>
