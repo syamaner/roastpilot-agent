@@ -1094,6 +1094,7 @@ def _banner_mapping_block() -> str:
         ("A\nT\nF\nL\n", 0, ["A", "T", "F", "L"]),
         ("A\nT\nF\n", 0, ["A", "T", "F", "<u>"]),
         ("", 1, ["<u>", "<u>", "<u>", "<u>"]),
+        ("A\nT\nF\nL\n", 1, ["<u>", "<u>", "<u>", "<u>"]),
     ],
 )
 def test_roast_live_maps_banner_lines_positionally(

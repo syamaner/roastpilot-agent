@@ -173,7 +173,8 @@ def _trim_line(config: AppConfig) -> str:
         config: The resolved application config.
 
     Returns:
-        The disabled line when the trim is off, the adaptive-depth line when
+        The suppressed line when the finish law is on (#1131), the disabled
+        line when the trim is off, the adaptive-depth line when
         ``adaptive_depth_enabled``, otherwise the fixed-depth line, tagged when
         the resolved state is non-default.
     """
