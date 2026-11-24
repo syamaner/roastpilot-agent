@@ -1,5 +1,20 @@
 # RoastPilot Agent Project State Registry
 
+**24 Nov 2026: #1135 (PR #1136 and the form slice): per-bean expected first crack.**
+Bean profiles gain an optional `first_crack_bean_temp_c` (160-195 °C, below
+the drop target), editable in the Start form and the profile modal. When set,
+the D239 anchor, its freeze point and the advisor's first-crack ETA aim at it;
+blank keeps the 176 °C config default. The pre-FC late-Maillard trim stays on
+the config target (retargeting it is a separate decision). The operator's 47
+Artisan logs show no seasonal first-crack shift but a wide per-bean spread
+(about 172 °C Taiwan, 180 °C Cuba and Kona). No live-readiness claim.
+
+**23-24 Nov 2026: D239 S3 (#1131, PRs #1132/#1133/#1134): finish law, flag off.**
+A closed-loop two-node plant harness (3a), the pure predictive finish-tracking
+law (3b) and its controller wiring behind `finish_control.enabled`, default
+off (3c), with fail-closed heat on any failed drop. Next: 3d, the
+`roast-live.sh` switch and launch banner. No live-readiness claim.
+
 **23 Nov 2026 — D239 S2 (#1118, PRs #1120/#1123/#1125): first-crack anchor, observe-only.**
 The 30 s slope ETA anchors D239's predicted first crack; a fitted two-node
 model using the live room reading runs in shadow. The offline study

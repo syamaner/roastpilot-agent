@@ -222,6 +222,8 @@ cold run.
 | D238 T3a (#1111) | Private manual/mock pre-FC path and exact opt-in bootstrap inventory | software completion conditional on verified protected merge; combined focused proof passed; protected producer witness and full gate remain lead-owned and are not claimed here; physical, deployment, routine Drop, held-mark emergency and winter qualification work remain open |
 | D239 S1 (#1116) | Operator-only first crack, mark plausibility floor and 196 °C guard from charge (AUTOMATIC route) | software complete on protected merge; refused-mark dashboard notice deferred to #1121; D239 slices 2–4 and physical validation remain open |
 | D239 S2 (#1118) | First-crack predictors, anchor and observe-only per-tick logging (30 s slope anchor, shadow two-node model with room temperature, schema V23, 1 Hz telemetry) | software complete on protected merge; research #1123, module #1120, wiring #1125; no control change; D239 slices 3–4 and physical validation remain open |
+| D239 S3 (#1131) | Predictive finish-tracking law: plant harness, pure law, controller wiring behind `finish_control.enabled` (default off) | in progress; 3a #1132, 3b #1133, 3c #1134 merged; 3d live switch and physical validation remain open |
+| #1135 | Per-bean expected first-crack temperature for the D239 anchor (trim stays on the config target) | software complete on protected merge; BE #1136, form slice 2; physical validation remains open |
 
 Epic status: **in progress — E11-S1 and E11-S2 are done; E11-S3 is in progress.**
 The **operator manual tests** (D28) are
