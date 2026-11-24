@@ -49,7 +49,7 @@ ADVISOR_PHASES = frozenset(AUTO_ADVICE_PHASES)
 
 @dataclass(frozen=True)
 class LaunchBannerLines:
-    """The resolved text for the launcher's three config-derived banner lines.
+    """The resolved text for the launcher's four config-derived banner lines.
 
     Attributes:
         advisor_cfg: The ``Advisor cfg:`` line — model slug, control-teaching
@@ -59,11 +59,14 @@ class LaunchBannerLines:
             conditional coupling to post-FC D88/D96 bases at first crack.
         first_crack: The ``First crack:`` line — which evidence may start
             development and the operator-mark plausibility floor (#1116).
+        finish: The ``Finish law:`` line — whether the D239 predictive finish
+            law owns heat and drop this roast, and its limits (#1131).
     """
 
     advisor_cfg: str
     trim: str
     first_crack: str
+    finish: str
 
 
 def _changed_fields(model: BaseModel) -> set[str]:
@@ -243,6 +246,30 @@ def _first_crack_line(config: AppConfig) -> str:
     return line
 
 
+def _finish_line(config: AppConfig) -> str:
+    """Format the ``Finish law:`` line from a fully-resolved config (#1131).
+
+    Args:
+        config: The resolved application config.
+
+    Returns:
+        ``off`` with what runs instead, or ``ON`` with the heat box, the
+        environment raise cap and the first-crack temperature the anchor aims
+        at, tagged as an experiment because the law is off by default.
+    """
+    controller = config.controller
+    finish = controller.finish_control
+    if not finish.enabled:
+        return "off (post-FC taper and deterministic drop, as summer)"
+    return (
+        f"ON (D239: heat {finish.heat_floor_percent}-{finish.heat_ceiling_percent}% "
+        f"toward the drop target from the FC anchor, drop at target bean; raise cap "
+        f"env {finish.env_raise_cap_c:.0f} °C; anchor aims at "
+        f"{controller.first_crack_target_bean_temp_c:.1f} °C unless the bean sets one)"
+        f"{EXPERIMENT_TAG}"
+    )
+
+
 def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:
     """Render both banner lines from an already-resolved config.
 
@@ -259,6 +286,7 @@ def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:
         advisor_cfg=_advisor_line(config),
         trim=_trim_line(config),
         first_crack=_first_crack_line(config),
+        finish=_finish_line(config),
     )
 
 
@@ -327,6 +355,7 @@ def main() -> int:
     print(_one_line(lines.advisor_cfg))
     print(_one_line(lines.trim))
     print(_one_line(lines.first_crack))
+    print(_one_line(lines.finish))
     return 0
 
 

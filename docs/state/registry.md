@@ -9,11 +9,16 @@ the config target (retargeting it is a separate decision). The operator's 47
 Artisan logs show no seasonal first-crack shift but a wide per-bean spread
 (about 172 °C Taiwan, 180 °C Cuba and Kona). No live-readiness claim.
 
-**23-24 Nov 2026: D239 S3 (#1131, PRs #1132/#1133/#1134): finish law, flag off.**
+**23-24 Nov 2026: D239 S3 (#1131, PRs #1132/#1133/#1134 and 3d): finish law.**
 A closed-loop two-node plant harness (3a), the pure predictive finish-tracking
 law (3b) and its controller wiring behind `finish_control.enabled`, default
-off (3c), with fail-closed heat on any failed drop. Next: 3d, the
-`roast-live.sh` switch and launch banner. No live-readiness claim.
+off (3c), with fail-closed heat on any failed drop. 3d adds the
+`FINISH_CONTROL=1|0` switch to `roast-live.sh` and a "Finish law:" banner
+line. Operator decision (#1138): the first cold roast runs supervised with
+the law on, the first-crack default stays 176 °C (not recalibrated from
+summer runs) and the per-bean field stays blank; winter runs then
+recalibrate. Software complete; physical validation open. No live-readiness
+claim.
 
 **23 Nov 2026 — D239 S2 (#1118, PRs #1120/#1123/#1125): first-crack anchor, observe-only.**
 The 30 s slope ETA anchors D239's predicted first crack; a fitted two-node
