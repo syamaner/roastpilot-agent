@@ -732,8 +732,9 @@ class _BeanProfileFieldsBase(BaseModel):
     first_crack_bean_temp_c: float | None = Field(default=None, ge=160.0, le=195.0)
     """This bean's expected first-crack bean temperature on the roaster's
     indicated probe (#1135). When set, the D239 first-crack anchor, its freeze
-    point and the advisor's first-crack ETA aim at it; ``None`` keeps the config
-    default (``ControllerConfig.first_crack_target_bean_temp_c``). Optional for
+    point and the advisor's first-crack ETA aim at it; the pre-FC late-Maillard
+    trim stays on the config target. ``None`` keeps the config default
+    (``ControllerConfig.first_crack_target_bean_temp_c``). Optional for
     back-compat with every frozen profile. Bounded to 160-195 °C (the operator's
     logged crack range is 168-184 °C) and must sit below ``target_drop_temp_c``."""
     roast_style: RoastStyle | None = None

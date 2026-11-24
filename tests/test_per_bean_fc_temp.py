@@ -1,7 +1,8 @@
 """Per-bean expected first-crack temperature (#1135).
 
 A profile's ``first_crack_bean_temp_c`` re-aims the D239 anchor, its freeze
-point and the advisor's first-crack ETA; ``None`` keeps the config default.
+point and the advisor's first-crack ETA; the pre-FC late-Maillard trim stays on
+the config target. ``None`` keeps the config default.
 """
 
 from __future__ import annotations
@@ -15,7 +16,11 @@ from roastpilot_agent.config import ControllerConfig, FcAnchorConfig
 from roastpilot_agent.fc_prediction import AnchorState
 from roastpilot_agent.models import BeanProfile, RoastPhase, RoastProfile
 from tests.test_controller import PROFILE, Harness, make_harness
-from tests.test_fc_anchor_wiring import _charged, _ramp  # pyright: ignore[reportPrivateUsage]
+from tests.test_fc_anchor_wiring import (
+    _charged,  # pyright: ignore[reportPrivateUsage]
+    _ramp,  # pyright: ignore[reportPrivateUsage]
+    _reading,  # pyright: ignore[reportPrivateUsage]
+)
 
 PER_BEAN = PROFILE.model_copy(update={"first_crack_bean_temp_c": 184.0})
 
@@ -108,6 +113,15 @@ async def test_per_bean_anchor_is_taken_against_the_per_bean_target() -> None:
     assert snap.slope_eta_seconds == pytest.approx((184.0 - 167.8) / 0.2, rel=1e-6)
     assert snap.anchor_state is AnchorState.PROVISIONAL
     assert snap.anchor_fc_charge_seconds == pytest.approx(39.0 + 81.0, rel=1e-6)
+    # The finish law's planned finish is F / (1 - p) of the per-bean anchor.
+    assert snap.planned_finish_charge_seconds == pytest.approx(120.0 / 0.8, rel=1e-6)
+    # A crack observed well before the late per-bean anchor re-anchors it once.
+    harness.reader.readings = [_reading(168.0, fc=True)]
+    await harness.controller.tick()
+    snap = harness.controller.snapshot().fc_prediction
+    assert snap is not None
+    assert snap.anchor_state is AnchorState.REANCHORED
+    assert snap.anchor_fc_charge_seconds == pytest.approx(40.0)
 
 
 @pytest.mark.parametrize(
@@ -117,6 +131,7 @@ async def test_per_bean_anchor_is_taken_against_the_per_bean_target() -> None:
         (184.0, 155.0, 179.0),  # 8 °C later crack: freeze 8 °C later
         (170.0, 155.0, 165.0),  # 6 °C earlier crack: freeze 6 °C earlier
         (160.0, 158.0, 158.0),  # never below the opening temperature
+        (165.0, 170.0, 165.0),  # ...and never above the expected crack
     ],
 )
 def test_freeze_temperature_moves_with_the_per_bean_first_crack(
@@ -179,11 +194,39 @@ async def test_advisor_first_crack_eta_uses_the_per_bean_target() -> None:
         harness.controller.transition_to(step)
     harness.controller._charge_monotonic = harness.clock.now  # pyright: ignore[reportPrivateUsage]
     await _ramp(harness, 160.0, 0.2, 40)
-    per_bean = harness.controller._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
+    ctrl = harness.controller
+    per_bean = ctrl._advisor_first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
 
     default = _charged()
     await _ramp(default, 160.0, 0.2, 40)
-    base = default.controller._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
+    dctrl = default.controller
+    base = dctrl._advisor_first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
     assert per_bean is not None and base is not None
     # The same curve, 8 °C further to go at about 0.2 °C/s: about 40 s longer.
     assert per_bean - base == pytest.approx(8.0 / 0.2, rel=0.05)
+    # The trim's ETA stays on the config target, identical to the default run.
+    trim_eta = ctrl._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
+    assert trim_eta == dctrl._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
+    assert trim_eta == base
+    signal = ctrl._trim_signal(None)  # pyright: ignore[reportPrivateUsage]
+    assert signal is not None and signal.first_crack_eta_seconds == base
+    # The advisor's context carries the per-bean ETA.
+    limits = ctrl._control_limits()  # pyright: ignore[reportPrivateUsage]
+    ctx = ctrl._build_advisor_context(_reading(167.8), limits)  # pyright: ignore[reportPrivateUsage]
+    assert ctx.first_crack_eta_seconds == per_bean
+
+
+def test_new_run_leaving_starting_through_recovery_is_not_aimed_at_the_last_bean() -> None:
+    """STARTING builds the anchor before the new profile is set; a run that then
+    goes STARTING -> recovery -> pre-FC (no PREHEATING reset) must still aim at
+    its own profile, not the previous run's per-bean crack."""
+    harness = make_harness(readings=[])
+    ctrl = harness.controller
+    ctrl.load_profile(PER_BEAN)
+    ctrl.transition_to(RoastPhase.STARTING)
+    assert _freeze_temp(harness) == 179.0  # built against the previous profile
+    ctrl._prepare_run_bookkeeping(PROFILE)  # pyright: ignore[reportPrivateUsage]
+    ctrl.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
+    ctrl.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
+    assert ctrl._fc_target_bean_temp_c() == 176.0  # pyright: ignore[reportPrivateUsage]
+    assert _freeze_temp(harness) == 171.0

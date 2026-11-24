@@ -6933,6 +6933,10 @@ class RoastController:
     def _prepare_run_bookkeeping(self, profile: RoastProfile) -> None:
         """Initialize the unchanged per-run controller bookkeeping."""
         self._profile = profile
+        # #1135: the STARTING reset built the anchor against the previous
+        # run's profile, and a run can leave STARTING through recovery without
+        # the PREHEATING reset, so aim it at this run's profile now.
+        self._fc_anchor_tracker = self._new_fc_anchor_tracker()
         self._run_started_monotonic = self._clock()
         self._current_heat = 0
         self._current_fan = 0
@@ -8630,11 +8634,15 @@ class RoastController:
 
         A per-bean first-crack temperature (#1135) moves the freeze temperature
         by the same offset from the config default, never below the opening
-        temperature, so the anchor freezes the same distance before the crack.
+        temperature and never above the expected crack, so the anchor freezes
+        the same distance before the crack.
         """
         cfg = self._config.fc_anchor
-        offset = self._fc_target_bean_temp_c() - self._config.first_crack_target_bean_temp_c
-        freeze_bean_temp_c = max(cfg.open_min_bean_temp_c, cfg.freeze_bean_temp_c + offset)
+        target = self._fc_target_bean_temp_c()
+        offset = target - self._config.first_crack_target_bean_temp_c
+        freeze_bean_temp_c = min(
+            target, max(cfg.open_min_bean_temp_c, cfg.freeze_bean_temp_c + offset)
+        )
         return FcAnchorTracker(
             AnchorSettings(
                 open_min_bean_temp_c=cfg.open_min_bean_temp_c,
@@ -9072,11 +9080,25 @@ class RoastController:
         """The FC-ETA for the current pre-FC curve, or ``None`` (#275 / #229).
 
         Extrapolates the recent bean RoR toward the configured FC-band target
-        (the profile's ``first_crack_bean_temp_c`` when set, #1135, else
-        :attr:`ControllerConfig.first_crack_target_bean_temp_c`) — the
+        (:attr:`ControllerConfig.first_crack_target_bean_temp_c`) — the
         #229-validated anticipation trigger. ``None`` once first crack is detected
         (the development clock is armed) or before there is enough curve to
-        project. Context only; never a lever move on its own.
+        project. It opens the pre-FC late-Maillard trim window
+        (:meth:`_trim_signal`), so it deliberately ignores a per-bean first
+        crack (#1135): retargeting that heat lever is a separate decision.
+        """
+        if self._first_crack_monotonic is not None:
+            return None
+        return estimate_first_crack_eta_seconds(
+            self._history.curve_window(),
+            fc_target_bean_temp_c=self._config.first_crack_target_bean_temp_c,
+        )
+
+    def _advisor_first_crack_eta_seconds(self) -> float | None:
+        """The advisor-context FC-ETA, aimed at this bean's crack (#1135).
+
+        As :meth:`_first_crack_eta_seconds` but toward
+        :meth:`_fc_target_bean_temp_c`. Advisor context only; no lever reads it.
         """
         if self._first_crack_monotonic is not None:
             return None
@@ -9357,7 +9379,7 @@ class RoastController:
             roast_milestones=self._history.milestones(),
             decision_trace=self._history.decision_trace(),
             development_time_ratio=self._development_time_ratio(),
-            first_crack_eta_seconds=self._first_crack_eta_seconds(),
+            first_crack_eta_seconds=self._advisor_first_crack_eta_seconds(),
             # #497 (D89 Tier 1): the ACTUATED heat/fan, never the advisor's own
             # prior recommendation — ``self._current_heat``/``self._current_fan``
             # are the SAME actuated-output fields the told==enforced safety box
