@@ -60,10 +60,18 @@ export interface AdvisoryRecord {
   beanTempC: number | null;
 }
 
-/** One row in the safety event trail (FaultBanner). */
-export interface SafetyTrailEntry {
-  kind: "safety_alert" | "fault" | "recovery_required";
-  evaluation: SafetyEvaluationData;
+/** One row in the safety event trail (FaultBanner). A `safety_alert` frame
+ *  carries either a full SafetyEvaluation or a plain notice such as
+ *  `{"alert": "operator_timeout", ...}` / `{"alert": "finish_drop_failed"}`
+ *  (#1131); the notice has no verdict, so it gets its own row kind rather than
+ *  being cast to an evaluation the trail would then read a verdict from. */
+export type SafetyTrailEntry =
+  | { kind: "safety_alert" | "fault" | "recovery_required"; evaluation: SafetyEvaluationData }
+  | { kind: "notice"; alert: string };
+
+/** True when a `safety_alert` payload is a SafetyEvaluation (has a verdict). */
+function isEvaluationPayload(data: Record<string, unknown>): boolean {
+  return typeof data.verdict === "string" && typeof data.reason === "string";
 }
 
 /** Latest server-owned D96 diagnostics, retained separately from chart points. */
@@ -685,11 +693,16 @@ export function dashboardReducer(
       };
     }
     case "safety_alert": {
-      const evaluation = event.data as unknown as SafetyEvaluationData;
-      return {
-        ...state,
-        safetyTrail: [...state.safetyTrail, { kind: "safety_alert", evaluation }],
-      };
+      const data = event.data as Record<string, unknown>;
+      if (isEvaluationPayload(data)) {
+        const evaluation = data as unknown as SafetyEvaluationData;
+        return {
+          ...state,
+          safetyTrail: [...state.safetyTrail, { kind: "safety_alert", evaluation }],
+        };
+      }
+      const alert = typeof data.alert === "string" ? data.alert : "unrecognised safety alert";
+      return { ...state, safetyTrail: [...state.safetyTrail, { kind: "notice", alert }] };
     }
     case "t0_detected": {
       const data = event.data as unknown as T0DetectedData;

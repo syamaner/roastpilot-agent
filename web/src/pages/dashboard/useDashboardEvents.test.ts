@@ -469,6 +469,20 @@ describe("dashboardReducer", () => {
     expect(s.safetyTrail.map((e) => e.kind)).toEqual(["safety_alert", "fault"]);
   });
 
+  it("folds a verdict-less alert notice into the trail as a notice, never as an evaluation (#1131)", () => {
+    let s = dashboardReducer(initialDashboardViewModel, ev("safety_alert", { alert: "finish_drop_failed" }));
+    s = dashboardReducer(s, ev("safety_alert", { alert: "operator_timeout", phase: "operator_recovery_required", waited_seconds: 61 }));
+    s = dashboardReducer(s, ev("safety_alert", { unexpected: true }));
+    // A payload with a verdict but no reason is not a usable evaluation either.
+    s = dashboardReducer(s, ev("safety_alert", { verdict: "reject" }));
+    expect(s.safetyTrail).toEqual([
+      { kind: "notice", alert: "finish_drop_failed" },
+      { kind: "notice", alert: "operator_timeout" },
+      { kind: "notice", alert: "unrecognised safety alert" },
+      { kind: "notice", alert: "unrecognised safety alert" },
+    ]);
+  });
+
   it("adds T0 and first-crack markers at the serve-elapsed of detection (once each, #326)", () => {
     // Markers key on serve elapsed (#326): plot a preheat frame, then the charge
     // tick (serve 510) at which T0 fires, then a post-charge tick before FC.

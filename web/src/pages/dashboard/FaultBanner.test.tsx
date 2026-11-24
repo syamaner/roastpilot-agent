@@ -43,6 +43,19 @@ describe("FaultBanner", () => {
     expect(banner).toHaveTextContent(/100 % \(safe\)/);
   });
 
+  it("renders an alert notice next to evaluations without throwing (#1131)", () => {
+    const trail: SafetyTrailEntry[] = [
+      ...TRAIL,
+      { kind: "notice", alert: "finish_drop_failed" },
+    ];
+    render(<FaultBanner fault={FAULT} trail={trail} />);
+    const rows = screen.getAllByTestId("safety-trail-row");
+    expect(rows).toHaveLength(3);
+    expect(rows[2]).toHaveTextContent("finish drop failed");
+    expect(rows[2]).toHaveTextContent("ALERT");
+    expect(rows[0]).toHaveTextContent("EMERGENCY STOP");
+  });
+
   it("accumulates the safety event trail with verdict labels", () => {
     render(<FaultBanner fault={FAULT} trail={TRAIL} />);
     const rows = screen.getAllByTestId("safety-trail-row");

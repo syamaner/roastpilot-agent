@@ -110,9 +110,11 @@ export function FaultBanner({
                 data-testid="safety-trail-row"
                 className="flex items-center justify-between gap-3 rounded border border-roast-fault/30 px-3 py-1.5 text-sm"
               >
-                <span className="truncate">{entry.evaluation.reason}</span>
+                <span className="truncate">
+                  {entry.kind === "notice" ? entry.alert.replace(/_/g, " ") : entry.evaluation.reason}
+                </span>
                 <span className="numeric shrink-0 text-xs uppercase tracking-wide text-roast-fault">
-                  {verdictLabel(entry.evaluation.verdict)}
+                  {entry.kind === "notice" ? "ALERT" : verdictLabel(entry.evaluation.verdict)}
                 </span>
               </li>
             ))}
