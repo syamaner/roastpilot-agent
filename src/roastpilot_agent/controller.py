@@ -55,6 +55,13 @@ from roastpilot_agent.fc_prediction import (
     smoothed_bean_env_c,
     two_node_fc_eta_seconds,
 )
+from roastpilot_agent.finish_control import (
+    FinishDecision,
+    FinishInputs,
+    FinishMode,
+    FinishTracker,
+    settings_from_config,
+)
 from roastpilot_agent.human_persistence import (
     CommandAuditOwner,
     CommandReference,
@@ -1927,6 +1934,18 @@ class RoastController:
         self._fc_anchor_tracker = self._new_fc_anchor_tracker()
         self._fc_heater_lag = HeaterLagFilter(self._fc_model_parameters)
         self._fc_prediction: FcPredictionSnapshot | None = None
+        # D239 slice 3c (#1131): the predictive finish law, re-armed per run and
+        # never resumed after a recovery or fault (owner: resume unsupported).
+        self._finish_tracker = self._new_finish_tracker()
+        self._finish_disabled_for_run = False
+        self._finish_last_decision_monotonic: float | None = None
+        self._finish_last_decision: FinishDecision | None = None
+        self._finish_alerts_sent: set[str] = set()
+        # Safety review on #1131: after any failed policy drop with the law
+        # enabled, heat is held at 0 (retried every tick) for the rest of the run.
+        self._finish_failed_drop_latched = False
+        # Counts deterministic drop attempts, so one tick never sends two.
+        self._policy_drop_attempts = 0
         # Monotonic instant of the debounced T0/charge transition into
         # ROASTING_PRE_FIRST_CRACK (#219), set in ``_apply_phase_rules`` and
         # cleared on a new run/preheat. Stamps the charge clock for the advisor's
@@ -2553,6 +2572,10 @@ class RoastController:
             self._private_pre_fc.end()
         if target is RoastPhase.FAULTED:
             self._release_emergency_stop_transition_gate_if_safe()
+        if target in (RoastPhase.FAULTED, RoastPhase.OPERATOR_RECOVERY_REQUIRED):
+            # D239 (owner, 23 Nov): resuming is unsupported; the finish law
+            # never re-engages for the rest of this run.
+            self._finish_disabled_for_run = True
         # Safety-review fix (post-B2, Opus finding, MEDIUM): ``_post_fc_engaged``
         # is True IFF the current DEVELOPMENT dwell was entered via the TRUE
         # first-crack edge (``ROASTING_PRE_FIRST_CRACK -> DEVELOPMENT``) — set
@@ -2656,6 +2679,16 @@ class RoastController:
             self._fc_anchor_tracker = self._new_fc_anchor_tracker()
             self._fc_heater_lag = HeaterLagFilter(self._fc_model_parameters)
             self._fc_prediction = None
+            # D239 slice 3c (#1131): a fresh finish law per run.
+            self._finish_tracker = self._new_finish_tracker()
+            if target is RoastPhase.STARTING:
+                # Only a new run (IDLE -> STARTING) re-arms the law: a recovery
+                # resume into PREHEATING keeps it off (resume is unsupported).
+                self._finish_disabled_for_run = False
+            self._finish_failed_drop_latched = False
+            self._finish_last_decision_monotonic = None
+            self._finish_last_decision = None
+            self._finish_alerts_sent = set()
             # A new run/preheat clears any staged FC backdating delta (#337):
             # belt-and-braces with the consume-on-stamp clear, so a delta from a
             # prior roast can never anchor a fresh roast's development clock.
@@ -3609,9 +3642,17 @@ class RoastController:
         # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
         # lever, and a tick that just hit FC does NOT (it falls to the advisor).
         # The advisory step below is a no-op in these phases (gated out).
-        await self._apply_deterministic_pre_fc_levers(telemetry, generation=generation)
-        if not self._generation_is_current(generation):
-            return
+        if self._finish_owns_levers():
+            # D239 slice 3c (#1131): the predictive finish law owns heat from the
+            # anchor through development; the pre-FC lever and the post-FC PI
+            # loop are bypassed while it does.
+            await self._apply_finish_control(telemetry, generation=generation)
+            if not self._generation_is_current(generation):
+                return
+        else:
+            await self._apply_deterministic_pre_fc_levers(telemetry, generation=generation)
+            if not self._generation_is_current(generation):
+                return
         # D82/D83 (#405 Slice B2): the deterministic post-FC RoR-target PI
         # loop, called immediately AFTER the pre-FC lever step for the same
         # reason the pre-FC comment documents its own ordering — a tick that
@@ -3622,9 +3663,10 @@ class RoastController:
         # picks the loop up in the SAME tick the phase flips. No-op entirely
         # unless ``post_first_crack_control.enabled`` is True (default False —
         # today's advisor-driven post-FC path is unaffected).
-        await self._apply_deterministic_post_fc_levers(telemetry, generation=generation)
-        if not self._generation_is_current(generation):
-            return
+        if not self._finish_owns_levers():
+            await self._apply_deterministic_post_fc_levers(telemetry, generation=generation)
+            if not self._generation_is_current(generation):
+                return
         # D88 amendment A1 (#405): the decoupled ceiling-guard drop, called
         # BEFORE the dev%/temp anchor below. Ordering decision: the guard is
         # the HARDER of the two safety bounds (a run where the loop keeps
@@ -3636,9 +3678,17 @@ class RoastController:
         # (default False — today's fully advisor-driven drop is unaffected) —
         # deliberately its OWN flag, unconnected to the RoR-taper loop's
         # ``enabled``/``_post_fc_engaged`` bundle the anchor below uses.
+        drop_attempts_before_guard = self._policy_drop_attempts
         await self._maybe_ceiling_guard_drop(telemetry, generation=generation)
         if not self._generation_is_current(generation):
             return
+        # D239 slice 3c (#1131): the finish law's temperature-led drop, after
+        # the ceiling guard (which keeps first refusal) and before D84; never a
+        # second drop_beans in a tick the guard already tried one.
+        if self._policy_drop_attempts == drop_attempts_before_guard:
+            await self._maybe_finish_drop(telemetry, generation=generation)
+            if not self._generation_is_current(generation):
+                return
         # D84 (#405 Slice C): the deterministic drop anchor, called immediately
         # AFTER the post-FC RoR loop step and the ceiling guard above, and
         # BEFORE the advisory consult below. Ordering decision: this must run
@@ -3658,9 +3708,15 @@ class RoastController:
         # already sees COOLING and no-ops). No-op entirely unless
         # ``post_first_crack_control.enabled`` is True (default False —
         # today's fully advisor-driven drop is unaffected).
-        await self._maybe_deterministic_drop(telemetry, generation=generation)
-        if not self._generation_is_current(generation):
-            return
+        if not (
+            self._config.finish_control.enabled
+            and self._policy_drop_attempts != drop_attempts_before_guard
+        ):
+            # #1131: with the finish law enabled, never a second drop_beans in
+            # a tick an earlier policy drop already tried one.
+            await self._maybe_deterministic_drop(telemetry, generation=generation)
+            if not self._generation_is_current(generation):
+                return
         # D40.3 (#275): accumulate the roast-so-far curve + milestones for the
         # per-tick control-loop context AFTER the phase rules + deterministic
         # pre-FC levers have run, so the sample captures the charge tick itself
@@ -3802,7 +3858,13 @@ class RoastController:
             # #1116: the guard drops this tick; never raise or hold heat first
             # (a failed drop would otherwise leave the lever target applied).
             return
-        trim_signal = self._arm_trim_latch(self._trim_signal(telemetry))
+        # D239 (owner, 23 Nov): with the finish law enabled the late-Maillard
+        # trim never arms; heat holds the flat pre-FC level until the anchor.
+        trim_signal = (
+            None
+            if self._config.finish_control.enabled and not self._finish_disabled_for_run
+            else self._arm_trim_latch(self._trim_signal(telemetry))
+        )
         box = self._control_limits(trim_signal=trim_signal)
         if not box.has_deterministic_target:
             return
@@ -4891,6 +4953,7 @@ class RoastController:
         if self._human_run is not None:
             self._join_human_drop()
             return False
+        self._policy_drop_attempts += 1
         if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
             # #1116: only the operator_only ceiling guard reaches here pre-FC.
             # The advisor drop-eligibility rule is development-only by design,
@@ -4927,11 +4990,16 @@ class RoastController:
             # dev%/temp-anchor callers) fires on EVERY DEVELOPMENT tick with
             # no cadence gate, so a failed corrective write is retried again
             # next tick regardless (Codex round-2 finding #1's distinction).
+            law_owned_heat = self._finish_note_failed_drop()
             if self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK:
                 # #1116: the pre-FC guard is the bean-temperature limit here;
                 # a failed drop at or above it must fail closed to heat off,
                 # and stay off (latched) while the drop keeps being retried.
                 self._pre_fc_guard_heat_off_latched = True
+                await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
+            elif law_owned_heat:
+                # No post-FC loop state exists to restore while the law owns
+                # heat, so fail closed to 0 exactly as pre-FC does.
                 await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
             else:
                 await self._clamp_heat_after_failed_drop(self_healing=True, generation=generation)
@@ -4957,6 +5025,8 @@ class RoastController:
         rate limit is exempted (``seconds_since_last_command=None``) because a
         same-tick collision with an earlier write is exactly when this matters;
         the write can only remove heat. The guard retries the drop next tick.
+        The D239 finish law (#1131) uses the same cut, in development too, after
+        any failed policy drop while it owned heat.
 
         Args:
             generation: The tick's command generation.
@@ -4969,7 +5039,7 @@ class RoastController:
             command=RoastCommand.SET_HEAT, phase=self._phase
         )
         await self._snapshots.persist_evaluation(phase_validity)
-        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — pre-FC allows
+        if phase_validity.verdict is not SafetyVerdict.ALLOW:  # pragma: no cover — pre-FC/dev allow
             return
         evaluation = self._safety.evaluate_command(
             requested_heat=0,
@@ -5393,7 +5463,12 @@ class RoastController:
         Returns:
             The set of phases in which the guard may fire.
         """
-        if self._config.first_crack_source is FirstCrackSource.OPERATOR_ONLY:
+        if (
+            self._config.first_crack_source is FirstCrackSource.OPERATOR_ONLY
+            or self._config.finish_control.enabled
+        ):
+            # #1131: the finish law drives heat from the predicted anchor,
+            # before first crack, so the guard must be armed from charge too.
             return frozenset({RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT})
         return frozenset({RoastPhase.DEVELOPMENT})
 
@@ -6514,6 +6589,10 @@ class RoastController:
                     and evaluation.adjusted_fan == control_box.fan_ceiling_percent
                     else None
                 )
+            elif self._finish_owns_levers():
+                # D239 slice 3c (#1131): the finish law owns heat and fan; the
+                # advisor's levers are never actuated while it does.
+                pass
             else:
                 await self._execute_advisor_levers(
                     heat=evaluation.adjusted_heat,
@@ -6599,9 +6678,15 @@ class RoastController:
                     # (AdvisoryCallPolicy) — there is no guaranteed retry next
                     # tick, so the raise-suppression latch must arm here even
                     # if the clamp's own corrective write also fails.
-                    await self._clamp_heat_after_failed_drop(
-                        self_healing=False, generation=advisory_epoch
-                    )
+                    if self._finish_note_failed_drop():
+                        # #1131: the finish law owned heat; fail closed to 0.
+                        await self._cut_heat_after_failed_pre_fc_guard_drop(
+                            generation=advisory_epoch
+                        )
+                    else:
+                        await self._clamp_heat_after_failed_drop(
+                            self_healing=False, generation=advisory_epoch
+                        )
                     return
                 if not dispatched or not self._generation_is_current(advisory_epoch):
                     return
@@ -7868,7 +7953,13 @@ class RoastController:
                 # operator's drop is one-shot — never automatically retried
                 # — so the raise-suppression latch must arm here even if
                 # the clamp's own corrective write also fails.
-                await self._clamp_heat_after_failed_drop(self_healing=False, generation=generation)
+                if self._finish_note_failed_drop():
+                    # #1131: the finish law owned heat; fail closed to 0.
+                    await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
+                else:
+                    await self._clamp_heat_after_failed_drop(
+                        self_healing=False, generation=generation
+                    )
             return
         if not dispatched or not self._generation_is_current(generation):
             return
@@ -8531,6 +8622,243 @@ class RoastController:
                 reanchor_threshold_seconds=cfg.reanchor_threshold_seconds,
             )
         )
+
+    def _new_finish_tracker(self) -> FinishTracker:
+        """A fresh finish law with this config's settings (#1131)."""
+        return FinishTracker(
+            settings=settings_from_config(self._config.finish_control),
+            parameters=self._fc_model_parameters,
+        )
+
+    def _finish_target_below_guard(self) -> bool:
+        """Whether the profile's drop target sits below the 196 °C guard (#1131).
+
+        A target at or above the guard would make the guard the drop; the
+        finish law then never engages and the existing levers keep heat.
+        """
+        profile = self._profile
+        guard = self._config.post_first_crack_control.ceiling_guard_temp_c
+        return profile is not None and profile.target_drop_temp_c < guard
+
+    def _finish_owns_levers(self) -> bool:
+        """Whether the D239 predictive finish law owns heat and fan this tick.
+
+        True only with the flag on, on the AUTOMATIC route, while pre-FC or in
+        development, once the first-crack anchor exists, with the profile's
+        target below the ceiling guard, and never again in a run that has
+        entered recovery or a fault (resume is unsupported, owner 23 Nov).
+
+        Returns:
+            ``True`` when the finish law, and nothing else, moves heat.
+        """
+        return (
+            self._config.finish_control.enabled
+            and not self._finish_disabled_for_run
+            and self._human_run is None
+            and self._phase in (RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT)
+            and self._fc_anchor_tracker.anchor.fc_charge_seconds is not None
+            and self._finish_target_below_guard()
+        )
+
+    def _finish_note_failed_drop(self) -> bool:
+        """Latch the finish law off after any failed drop, and alert once (#1131).
+
+        With the law enabled, any failed drop (policy, advisor or operator)
+        means the law never writes heat again this run: heat is held at 0 and
+        an unconfirmed cut is retried every tick.
+
+        Returns:
+            ``True`` when the law owned heat at the failure, so the caller
+            must cut heat to 0 (no post-FC loop state exists to restore).
+        """
+        if not self._config.finish_control.enabled:
+            return False
+        owned = self._finish_owns_levers()
+        self._finish_failed_drop_latched = True
+        self._finish_alert("finish_drop_failed")
+        return owned
+
+    def _finish_alert(self, alert: str, **details: object) -> None:
+        """Emit one SAFETY_ALERT per alert kind per run (#1131)."""
+        if alert in self._finish_alerts_sent:
+            return
+        self._finish_alerts_sent.add(alert)
+        self._events.emit(RoastEventKind.SAFETY_ALERT, {"alert": alert, **details})
+
+    def _finish_limits(self, heat: int) -> PhaseControlLimits:
+        """The box a finish-law write is evaluated against (#1131).
+
+        Heat floor and ceiling are the law's own bounds (told == enforced, so
+        the safety clamp only fires on a law bug); the fan range is widened to
+        include the current fan so a heat move never changes the fan.
+        """
+        cfg = self._config.finish_control
+        box = self._control_limits()
+        return box.model_copy(
+            update={
+                # The law itself walks below-floor heat back one step at a
+                # time; the box floor must not turn that step into a jump.
+                "heat_floor_percent": min(cfg.heat_floor_percent, heat),
+                "heat_ceiling_percent": cfg.heat_ceiling_percent,
+                "heat_target_percent": heat,
+                "fan_floor_percent": min(box.fan_floor_percent, self._current_fan),
+                "fan_ceiling_percent": max(box.fan_ceiling_percent, self._current_fan),
+                "fan_target_percent": None,
+            }
+        )
+
+    def _finish_raise_blocked(
+        self, telemetry: RoastTelemetry, charge_s: float, finish_s: float
+    ) -> bool:
+        """Whether this tick forbids the finish law from RAISING heat (#1131).
+
+        No raise on a tick a drop is due (the guard or the target drop), past
+        the overrun window (alerted once), on a stalled RoR (a frozen or
+        detached probe must not drive heat up), or with the environment at
+        its raise cap.
+        """
+        cfg = self._config.finish_control
+        profile = self._profile
+        assert profile is not None
+        if (
+            self._ceiling_guard_eligible(telemetry)
+            or telemetry.bean_temp_c >= profile.target_drop_temp_c
+        ):
+            return True
+        if charge_s > finish_s + cfg.max_overrun_seconds:
+            self._finish_alert("finish_overrun", planned_finish_charge_seconds=finish_s)
+            return True
+        ror = telemetry.bean_ror_c_per_min
+        if ror is None or not math.isfinite(ror) or ror <= cfg.stall_ror_c_per_min:
+            return True
+        return telemetry.env_temp_c >= cfg.env_raise_cap_c
+
+    async def _apply_finish_control(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
+        """Run one finish-law cadence and write any heat change through safety.
+
+        The anchor and planned finish come from the anchor tracker; the law
+        observes every tick (pruning predictions made at another heat) and
+        decides every ``finish_control.cadence_seconds``. A proposal is written
+        only through ``evaluate_command_phase`` and ``evaluate_command`` on the
+        finish box; the fan is never changed.
+
+        Args:
+            telemetry: The reading this tick consumed, or ``None``.
+            generation: The tick's command generation.
+        """
+        if self._finish_failed_drop_latched or (
+            self._phase is RoastPhase.ROASTING_PRE_FIRST_CRACK
+            and self._pre_fc_guard_heat_off_latched
+        ):
+            # After a failed drop the law never writes heat again; an
+            # unconfirmed heat-off is retried every tick until heat reads 0.
+            await self._cut_heat_after_failed_pre_fc_guard_drop(generation=generation)
+            return
+        profile = self._profile
+        anchor_fc = self._fc_anchor_tracker.anchor.fc_charge_seconds
+        if (
+            telemetry is None
+            or profile is None
+            or anchor_fc is None
+            or self._charge_monotonic is None
+        ):
+            return
+        finish_s = planned_finish_charge_seconds(
+            anchor_fc, target_development_percent=profile.target_development_percent
+        )
+        if finish_s is None:
+            return
+        cfg = self._config.finish_control
+        charge_s = self._charge_elapsed_seconds()
+        self._finish_tracker.observe(
+            charge_seconds=charge_s,
+            bean_temp_c=telemetry.bean_temp_c,
+            current_heat_percent=self._current_heat,
+        )
+        now = self._clock()
+        last = self._finish_last_decision_monotonic
+        if last is not None and now - last < cfg.cadence_seconds:
+            return
+        self._finish_last_decision_monotonic = now
+        smoothed = smoothed_bean_env_c(
+            self._history.curve_window(), window_seconds=self._config.fc_anchor.slope_window_seconds
+        )
+        bean, env = (
+            smoothed if smoothed is not None else (telemetry.bean_temp_c, telemetry.env_temp_c)
+        )
+        decision = self._finish_tracker.decide(
+            FinishInputs(
+                charge_seconds=charge_s,
+                bean_temp_c=bean,
+                env_temp_c=env,
+                bean_ror_c_per_min=telemetry.bean_ror_c_per_min,
+                heater_state=self._fc_heater_lag.value,
+                ambient_temp_c=self._fresh_model_ambient_c(telemetry),
+                current_heat_percent=self._current_heat,
+                finish_charge_seconds=finish_s,
+                target_bean_c=profile.target_drop_temp_c,
+            )
+        )
+        self._finish_last_decision = decision
+        heat = decision.heat_percent
+        if decision.mode is FinishMode.HOLD or heat == self._current_heat:
+            return
+        if heat > self._current_heat and self._finish_raise_blocked(telemetry, charge_s, finish_s):
+            return
+        phase_validity = self._safety.evaluate_command_phase(
+            command=RoastCommand.SET_HEAT, phase=self._phase
+        )
+        await self._snapshots.persist_evaluation(phase_validity)
+        if phase_validity.verdict is not SafetyVerdict.ALLOW or not self._generation_is_current(
+            generation
+        ):
+            return
+        evaluation = self._safety.evaluate_command(
+            requested_heat=heat,
+            requested_fan=self._current_fan,
+            seconds_since_last_command=self._seconds_since_last_command(),
+            bounds=self._finish_limits(heat),
+        )
+        await self._snapshots.persist_evaluation(evaluation)
+        if not self._generation_is_current(generation):
+            return
+        await self._execute_targets(evaluation, generation=generation)
+
+    async def _maybe_finish_drop(
+        self, telemetry: RoastTelemetry | None, *, generation: int
+    ) -> None:
+        """The finish law's temperature-led drop (D239 item 4, #1131).
+
+        With the law enabled, drop when the bean reaches the profile's target,
+        whatever the development percentage; a development shortfall of more
+        than ``low_development_alert_points`` raises a SAFETY_ALERT.
+        """
+        cfg = self._config.finish_control
+        profile = self._profile
+        if (
+            not cfg.enabled
+            or self._finish_disabled_for_run
+            or self._human_run is not None
+            or telemetry is None
+            or profile is None
+            or self._phase not in (RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT)
+            or telemetry.bean_temp_c < profile.target_drop_temp_c
+        ):
+            return
+        development = self._development_percent()
+        if not await self._execute_deterministic_drop(
+            DropReason.FINISH_TARGET, generation=generation
+        ):
+            return
+        floor = profile.target_development_percent - cfg.low_development_alert_points
+        if development is None or development < floor:
+            self._finish_alert(
+                "low_development",
+                development_percent=development,
+                target_development_percent=profile.target_development_percent,
+            )
 
     def _fresh_model_ambient_c(self, telemetry: RoastTelemetry) -> float | None:
         """The room reading for the shadow model, or ``None`` if missing/stale.

@@ -271,7 +271,9 @@ def classify_termination(
         if reason is None:
             event_evidence.append(_unknown_evidence())
             continue
-        if reason is DropReason.DEVELOPMENT_TARGET:
+        if reason is DropReason.DEVELOPMENT_TARGET or reason is DropReason.FINISH_TARGET:
+            # A planned policy drop (D84 or the D239 finish target, #1131):
+            # ordinary termination, never abnormal evidence.
             continue
         if reason is DropReason.CEILING_GUARD:
             if event_kind is RoastEventKind.COMMAND_EXECUTED:

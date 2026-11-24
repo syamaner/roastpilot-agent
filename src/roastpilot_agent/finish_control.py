@@ -183,16 +183,27 @@ class FinishTracker:
     _pending: list[_Pending] = field(default_factory=lambda: list[_Pending]())
     _last_decide_at: float | None = None
 
-    def observe(self, *, charge_seconds: float, bean_temp_c: float) -> None:
+    def observe(
+        self,
+        *,
+        charge_seconds: float,
+        bean_temp_c: float,
+        current_heat_percent: int | None = None,
+    ) -> None:
         """Compare matured predictions with the bean and update the bias.
 
         Only a prediction compared within ``_MAX_MATURITY_LATENESS_SECONDS`` of
-        its due time trains the correction; a later one is discarded.
+        its due time, at a heat still unchanged, trains the correction; a late
+        one, or one made at a heat other than ``current_heat_percent``, is
+        discarded.
 
         Args:
             charge_seconds: Seconds since charge now.
             bean_temp_c: The bean temperature now.
+            current_heat_percent: The heat applied now, when known.
         """
+        if current_heat_percent is not None:
+            self._pending = [p for p in self._pending if p.heat_percent == current_heat_percent]
         if not (math.isfinite(charge_seconds) and math.isfinite(bean_temp_c)):
             return
         s = self.settings

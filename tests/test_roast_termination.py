@@ -233,6 +233,21 @@ def test_absent_reason_on_advisor_drop_is_normal() -> None:
     assert result.evidence == ()
 
 
+@pytest.mark.parametrize("reason", [DropReason.DEVELOPMENT_TARGET, DropReason.FINISH_TARGET])
+def test_planned_policy_drops_are_normal(reason: DropReason) -> None:
+    """The D84 and D239 finish-target drops are ordinary terminations (#1131)."""
+    result = classify_termination(
+        run_found=True,
+        run_outcome="completed",
+        drop_anchor=DropEventAnchor(1, "2026-08-26T12:00:00+00:00"),
+        event_rows=(_event(1, RoastEventKind.COMMAND_EXECUTED, _drop_payload(reason)),),
+        emergency_stop_recorded_at_utc=(),
+    )
+
+    assert result.classification is TerminationClassification.NORMAL
+    assert result.evidence == ()
+
+
 def test_non_drop_commands_are_ignored() -> None:
     """Other command events do not become termination evidence."""
     result = classify_termination(

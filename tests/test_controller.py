@@ -7602,13 +7602,16 @@ async def test_ceiling_guard_fires_identically_with_joint_window_flag_on_or_off(
 
 
 def test_drop_reason_has_closed_members() -> None:
-    """Pin the two automatic reasons and the D230 human protection reason."""
+    """Pin the automatic reasons, the D239 finish-target reason (#1131) and
+    the D230 human protection reason."""
     assert set(DropReason) == {
         DropReason.DEVELOPMENT_TARGET,
         DropReason.CEILING_GUARD,
+        DropReason.FINISH_TARGET,
         DropReason.HUMAN_PROTECTION,
     }
     assert DropReason.HUMAN_PROTECTION.value == "human_protection"
+    assert DropReason.FINISH_TARGET.value == "finish_target"
 
 
 def test_fan_ceiling_release_latch_survives_transitions_within_a_run() -> None:
