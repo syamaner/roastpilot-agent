@@ -35,6 +35,12 @@
 #            boundary reverts to the advisor's own judgment alone, e.g.
 #            POST_FC_LOOP=0 CEILING_GUARD=0 ./scripts/roast-live.sh for the
 #            full pre-promotion baseline
+#          FINISH_CONTROL=1  the D239 predictive finish law (#1131) owns heat and
+#            the drop once the first-crack anchor exists; FINISH_CONTROL=0 forces
+#            it off. Unset keeps the configured value (off by default). Winter
+#            supervised roast, e.g. FC_SOURCE=operator_only FINISH_CONTROL=1
+#            ./scripts/roast-live.sh. The env value pins every roast of the
+#            session; /api/config does not show this setting.
 #          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION set the advisor
 #            model + control-teaching prompt (schema defaults openai/gpt-4o +
 #            c3). The banner prints the RESOLVED values — env over the saved
@@ -135,6 +141,21 @@ case "${FC_SOURCE:-}" in
     export ROASTPILOT_CONTROLLER__FIRST_CRACK_SOURCE="$FC_SOURCE" ;;
   *)
     echo "ERROR: FC_SOURCE must be operator_only or mcp_or_operator (got '$FC_SOURCE')" >&2
+    exit 1 ;;
+esac
+
+# D239 slice 3d (#1131): the predictive finish law. FINISH_CONTROL=1 hands heat
+# and the drop to the finish law once the first-crack anchor exists (it keeps
+# the 196 °C ceiling guard, e-stop and every safety path); FINISH_CONTROL=0
+# forces it off (the summer taper). Unset leaves the configured value (off by
+# default). Any other value is refused, so a typo can never silently run the
+# wrong arm. The banner's "Finish law:" line prints the resolved state.
+case "${FINISH_CONTROL:-}" in
+  "") ;;
+  1) export ROASTPILOT_CONTROLLER__FINISH_CONTROL__ENABLED=true ;;
+  0) export ROASTPILOT_CONTROLLER__FINISH_CONTROL__ENABLED=false ;;
+  *)
+    echo "ERROR: FINISH_CONTROL must be 1 or 0 (got '$FINISH_CONTROL')" >&2
     exit 1 ;;
 esac
 
@@ -242,15 +263,18 @@ ADV="advisor configured"
 # is the agent's own parser (Augment #402).
 #
 # Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text, line 3 =
-# the "First crack:" text (#1116). A
+# the "First crack:" text (#1116), line 4 = the "Finish law:" text (#1131). A
 # malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
-# exit) and both lines read "unresolved" — never a plausible-but-wrong version.
+# exit) and every line reads "unresolved" — never a plausible-but-wrong version.
 #
 # ⚠ SCOPE: this is a LAUNCH-TIME snapshot, printed once. `start_roast` re-reads
 # the saved config per roast, so an arm switched in /config AFTER launch is live
 # for the next roast but is NOT reflected here. For roast 2 of an A/B, confirm
 # the arm at GET /api/config (saved vs effective per field) or on the live
 # dashboard — not by re-reading this banner, which still shows roast 1's arm.
+# The finish law (#1131) is NOT in GET /api/config or the dashboard: launch with
+# FINISH_CONTROL=1 or 0 so it is pinned for the whole session; afterwards the
+# per-run config_json in the trace DB records which arm each roast ran.
 BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
 BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
 # `|| true` so a missing/broken sed degrades to the "unresolved" banner below
@@ -260,9 +284,11 @@ BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
 ADVISOR_CFG="$(printf '%s\n' "$BANNER_LINES" | sed -n '1p' || true)"
 TRIM="$(printf '%s\n' "$BANNER_LINES" | sed -n '2p' || true)"
 FIRST_CRACK="$(printf '%s\n' "$BANNER_LINES" | sed -n '3p' || true)"
+FINISH="$(printf '%s\n' "$BANNER_LINES" | sed -n '4p' || true)"
 [ -n "$ADVISOR_CFG" ] || ADVISOR_CFG="$BANNER_UNRESOLVED"
 [ -n "$TRIM" ] || TRIM="$BANNER_UNRESOLVED"
 [ -n "$FIRST_CRACK" ] || FIRST_CRACK="$BANNER_UNRESOLVED"
+[ -n "$FINISH" ] || FINISH="$BANNER_UNRESOLVED"
 
 echo "→ starting agent + spawning MCP child (takes a few seconds — don't Ctrl-C yet)…"
 echo "  MCP config: ${COFFEE_ROASTER_MCP_CONFIG}"
@@ -290,6 +316,7 @@ for _ in $(seq 1 120); do
   Advisor cfg: ${ADVISOR_CFG}
   Pre-FC trim: ${TRIM}
   First crack: ${FIRST_CRACK}
+  Finish law : ${FINISH}
   Dashboard  : http://${IP}:${PORT}/
   Trace DB   : ${ROASTPILOT_DB}  (persists after shutdown — #161)
 

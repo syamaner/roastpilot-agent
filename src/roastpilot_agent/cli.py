@@ -936,7 +936,7 @@ async def _serve_live(
         print(f"error: saved-config file is malformed — {exc}")
         return 1
     except ValidationError as exc:
-        print(f"error: saved-config file has invalid values — {exc}")
+        print(f"error: config (saved file or ROASTPILOT_* env) has invalid values — {exc}")
         return 1
     except OSError as exc:
         print(f"error: saved-config file is unreadable — {exc}")
@@ -1212,7 +1212,7 @@ async def _serve_replay(args: argparse.Namespace) -> int:
         print(f"error: saved-config file is malformed — {exc}")
         return 1
     except _ValErr as exc:
-        print(f"error: saved-config file has invalid values — {exc}")
+        print(f"error: config (saved file or ROASTPILOT_* env) has invalid values — {exc}")
         return 1
     except OSError as exc:
         print(f"error: saved-config file is unreadable — {exc}")
