@@ -846,7 +846,7 @@ def test_main_prints_advisor_then_trim(
     assert len(out) == 4
     assert out[0] == "openai/gpt-4o  ·  prompt c10" + EXPERIMENT_TAG
     assert out[2] == "MCP detection or operator mark, first wins; mark floor 150.0 °C"
-    assert out[3] == "off (post-FC taper and deterministic drop, as summer)"
+    assert out[3] == "off (post-FC taper and deterministic drop; ceiling guard on)"
     assert out[1] == (
         "fixed 65% (open: bean pre_fc_heat binds lower; loop on: actual FC heat sets D88 "
         "base; recovery off; proven roast-6 default)"
@@ -953,7 +953,7 @@ def test_finish_line_is_off_by_default_and_untagged() -> None:
     from roastpilot_agent.config import AppConfig
 
     line = resolve_banner_lines(AppConfig()).finish
-    assert line == "off (post-FC taper and deterministic drop, as summer)"
+    assert line == "off (post-FC taper and deterministic drop; ceiling guard on)"
     assert EXPERIMENT_TAG not in line
 
 
@@ -972,7 +972,7 @@ def test_finish_line_on_names_its_limits_and_the_anchor_target() -> None:
     )
     assert resolve_banner_lines(config).finish == (
         "ON (D239: heat 30-95% toward the drop target from the FC anchor, drop at target "
-        "bean; raise cap env 225 °C; anchor aims at 178.5 °C unless the bean sets one)"
+        "bean; raise cap env 225.0 °C; anchor aims at 178.5 °C unless the bean sets one)"
         + EXPERIMENT_TAG
     )
 
@@ -1026,3 +1026,96 @@ def test_roast_live_finish_switch(value: str | None, code: int, exported: str) -
         assert result.stdout.strip() == exported
     else:
         assert "FINISH_CONTROL must be 1 or 0" in result.stderr
+
+
+def test_finish_off_line_names_what_actually_runs() -> None:
+    """The off text follows the post-FC loop and guard switches, not a fixed claim."""
+    from roastpilot_agent.config import AppConfig, ControllerConfig, PostFirstCrackControl
+
+    def line(**post: bool) -> str:
+        controller = ControllerConfig(post_first_crack_control=PostFirstCrackControl(**post))
+        return resolve_banner_lines(AppConfig(controller=controller)).finish
+
+    assert line(enabled=False) == "off (advisor-driven post-FC, no taper; ceiling guard on)"
+    assert line(ceiling_guard_drop_enabled=False) == (
+        "off (post-FC taper and deterministic drop; ceiling guard OFF)"
+    )
+
+
+def test_trim_line_says_suppressed_when_the_finish_law_is_on() -> None:
+    """With the law on the late-Maillard cut never fires, so the trim line must
+    not advertise a depth (#1131 safety review)."""
+    from roastpilot_agent.config import AppConfig, ControllerConfig, FinishControlConfig
+
+    on = AppConfig(controller=ControllerConfig(finish_control=FinishControlConfig(enabled=True)))
+    assert resolve_banner_lines(on).trim == (
+        "SUPPRESSED by the finish law: flat 100% pre-FC until the FC anchor; "
+        "bean pre_fc_heat replaces it up/down" + EXPERIMENT_TAG
+    )
+    assert "SUPPRESSED" not in resolve_banner_lines(AppConfig()).trim
+
+
+def test_env_false_overrides_a_saved_finish_on(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """FINISH_CONTROL=0 beats a saved config that switched the law on."""
+    config_file.write_text("controller:\n  finish_control:\n    enabled: true\n")
+    assert main() == 0
+    assert capsys.readouterr().out.splitlines()[3].startswith("ON ")
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__FINISH_CONTROL__ENABLED", "false")
+    assert main() == 0
+    assert capsys.readouterr().out.splitlines()[3].startswith("off ")
+
+
+def test_env_that_fails_validation_makes_the_banner_unresolved(
+    config_file: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Finish on with the anchor off is refused; the error names env as a source."""
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__FINISH_CONTROL__ENABLED", "true")
+    monkeypatch.setenv("ROASTPILOT_CONTROLLER__FC_ANCHOR__ENABLED", "false")
+    assert main() == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "config (saved file or ROASTPILOT_* env) has invalid values" in captured.err
+
+
+def _banner_mapping_block() -> str:
+    """The launcher's banner-line block, from BANNER_UNRESOLVED to the FINISH default."""
+    script = (Path(__file__).resolve().parent.parent / "scripts" / "roast-live.sh").read_text()
+    start = script.index("BANNER_UNRESOLVED=")
+    marker = '[ -n "$FINISH" ] || FINISH="$BANNER_UNRESOLVED"'
+    end = script.index(marker) + len(marker)
+    return script[start:end]
+
+
+@pytest.mark.parametrize(
+    ("printed", "status", "expected"),
+    [
+        ("A\nT\nF\nL\n", 0, ["A", "T", "F", "L"]),
+        ("A\nT\nF\n", 0, ["A", "T", "F", "<u>"]),
+        ("", 1, ["<u>", "<u>", "<u>", "<u>"]),
+    ],
+)
+def test_roast_live_maps_banner_lines_positionally(
+    printed: str, status: int, expected: list[str]
+) -> None:
+    """Line 4 lands in FINISH; a missing line, or a failed resolution, reads unresolved."""
+    import subprocess
+
+    stub = f"python() {{ printf '{printed}'; return {status}; }}"
+    show = 'printf "%s|%s|%s|%s" "$ADVISOR_CFG" "$TRIM" "$FIRST_CRACK" "$FINISH"'
+    result = subprocess.run(
+        ["bash", "-c", f"set -e\n{stub}\n{_banner_mapping_block()}\n{show}"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    unresolved = "unresolved (config read failed — see the error above)"
+    assert result.stdout.split("|") == [unresolved if e == "<u>" else e for e in expected]
+
+
+def test_roast_live_prints_the_finish_line() -> None:
+    """The READY banner carries the Finish law line next to First crack."""
+    script = (Path(__file__).resolve().parent.parent / "scripts" / "roast-live.sh").read_text()
+    assert "  First crack: ${FIRST_CRACK}\n  Finish law : ${FINISH}\n" in script

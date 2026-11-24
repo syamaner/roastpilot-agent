@@ -39,7 +39,8 @@
 #            the drop once the first-crack anchor exists; FINISH_CONTROL=0 forces
 #            it off. Unset keeps the configured value (off by default). Winter
 #            supervised roast, e.g. FC_SOURCE=operator_only FINISH_CONTROL=1
-#            ./scripts/roast-live.sh
+#            ./scripts/roast-live.sh. The env value pins every roast of the
+#            session; /api/config does not show this setting.
 #          ROASTPILOT_ADVISOR__MODEL_SLUG / …__PROMPT_VERSION set the advisor
 #            model + control-teaching prompt (schema defaults openai/gpt-4o +
 #            c3). The banner prints the RESOLVED values — env over the saved
@@ -264,13 +265,16 @@ ADV="advisor configured"
 # Line 1 = the "Advisor cfg:" text, line 2 = the "Pre-FC trim:" text, line 3 =
 # the "First crack:" text (#1116), line 4 = the "Finish law:" text (#1131). A
 # malformed/unreadable saved config fails LOUD (reason on stderr, non-zero
-# exit) and both lines read "unresolved" — never a plausible-but-wrong version.
+# exit) and every line reads "unresolved" — never a plausible-but-wrong version.
 #
 # ⚠ SCOPE: this is a LAUNCH-TIME snapshot, printed once. `start_roast` re-reads
 # the saved config per roast, so an arm switched in /config AFTER launch is live
 # for the next roast but is NOT reflected here. For roast 2 of an A/B, confirm
 # the arm at GET /api/config (saved vs effective per field) or on the live
 # dashboard — not by re-reading this banner, which still shows roast 1's arm.
+# The finish law (#1131) is NOT in GET /api/config or the dashboard: launch with
+# FINISH_CONTROL=1 or 0 so it is pinned for the whole session; afterwards the
+# per-run config_json in the trace DB records which arm each roast ran.
 BANNER_UNRESOLVED='unresolved (config read failed — see the error above)'
 BANNER_LINES="$(python -m roastpilot_agent.launch_banner)" || BANNER_LINES=""
 # `|| true` so a missing/broken sed degrades to the "unresolved" banner below

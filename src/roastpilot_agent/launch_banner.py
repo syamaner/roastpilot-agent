@@ -14,7 +14,7 @@ genuinely ran the saved value.
 
 This module is the launcher's read-only view of the SAME resolution the serving
 agent uses.  It has **no runtime authority**: it never constructs a controller,
-never touches MCP, and never mutates config — it formats three strings.
+never touches MCP, and never mutates config — it formats four strings.
 
 Fail-loud contract: a malformed / unreadable saved-config file makes the banner
 *unresolved*, never a plausible-looking schema default.  :func:`main` reports the
@@ -180,6 +180,13 @@ def _trim_line(config: AppConfig) -> str:
     trim = config.controller.pre_first_crack_levers.late_maillard_trim
     post_fc = config.controller.post_first_crack_control
     heat_target = config.controller.pre_first_crack_levers.heat_target_percent
+    if config.controller.finish_control.enabled:
+        # #1131: the finish law suppresses the late-Maillard trim, so naming a
+        # cut depth here would announce a lever the roast never pulls.
+        return (
+            f"SUPPRESSED by the finish law: flat {heat_target}% pre-FC until the FC anchor; "
+            f"bean pre_fc_heat replaces it up/down{EXPERIMENT_TAG}"
+        )
     if not post_fc.enabled:
         authority = "loop off: advisor-driven; no D88/D96 caps"
         compact_authority = authority
@@ -260,11 +267,18 @@ def _finish_line(config: AppConfig) -> str:
     controller = config.controller
     finish = controller.finish_control
     if not finish.enabled:
-        return "off (post-FC taper and deterministic drop, as summer)"
+        post_fc = controller.post_first_crack_control
+        path = (
+            "post-FC taper and deterministic drop"
+            if post_fc.enabled
+            else "advisor-driven post-FC, no taper"
+        )
+        guard = "on" if post_fc.ceiling_guard_drop_enabled else "OFF"
+        return f"off ({path}; ceiling guard {guard})"
     return (
         f"ON (D239: heat {finish.heat_floor_percent}-{finish.heat_ceiling_percent}% "
         f"toward the drop target from the FC anchor, drop at target bean; raise cap "
-        f"env {finish.env_raise_cap_c:.0f} °C; anchor aims at "
+        f"env {finish.env_raise_cap_c:.1f} °C; anchor aims at "
         f"{controller.first_crack_target_bean_temp_c:.1f} °C unless the bean sets one)"
         f"{EXPERIMENT_TAG}"
     )
@@ -291,14 +305,14 @@ def resolve_banner_lines(config: AppConfig) -> LaunchBannerLines:
 
 
 def load_banner_lines() -> LaunchBannerLines:
-    """Resolve config the way the serving agent does, then render both lines.
+    """Resolve config the way the serving agent does, then render all four lines.
 
     Returns:
         The rendered :class:`LaunchBannerLines`.
 
     Raises:
         ConfigFileError: If the saved-config file exists but is malformed.
-        ValidationError: If the saved-config file holds invalid values.
+        ValidationError: If the saved file or the ROASTPILOT_* env holds invalid values.
         OSError: If the saved-config file exists but cannot be read.
     """
     # Imported here (not at module scope) so this module stays importable in a
@@ -324,17 +338,17 @@ def _one_line(text: str) -> str:
 
 
 def main() -> int:
-    """Print the two banner lines on stdout for ``scripts/roast-live.sh``.
+    """Print the four banner lines on stdout for ``scripts/roast-live.sh``.
 
-    Line 1 is the ``Advisor cfg:`` text, line 2 the ``Pre-FC trim:`` text and
-    line 3 the ``First crack:`` text; the launcher reads them positionally.  A
+    Line 1 is the ``Advisor cfg:`` text, line 2 the ``Pre-FC trim:`` text,
+    line 3 the ``First crack:`` text and line 4 the ``Finish law:`` text; the
+    launcher reads them positionally.  A
     config failure prints the reason on stderr and returns non-zero so the
     launcher falls back to ``unresolved`` instead of showing a plausible but wrong prompt version.
 
     Any newline inside a resolved value (a hand-edited saved config can hold a
     multi-line ``model_slug``) is folded to a space, so a value can never split
-    the positional two-line contract and shift the trim text onto the advisor
-    line.
+    the positional four-line contract and shift one line's text onto another.
 
     Returns:
         ``0`` on success, ``1`` when the saved config could not be resolved.
@@ -347,7 +361,10 @@ def main() -> int:
         print(f"error: saved-config file is malformed — {exc}", file=sys.stderr)
         return 1
     except ValidationError as exc:
-        print(f"error: saved-config file has invalid values — {exc}", file=sys.stderr)
+        print(
+            f"error: config (saved file or ROASTPILOT_* env) has invalid values — {exc}",
+            file=sys.stderr,
+        )
         return 1
     except OSError as exc:
         print(f"error: saved-config file is unreadable — {exc}", file=sys.stderr)
