@@ -417,6 +417,8 @@ export interface RoastProfile {
   initial_fan_percent: number;
   target_drop_temp_c: number;
   target_development_percent: number;
+  /** Expected first-crack bean temperature (#1135); null = the config default. */
+  first_crack_bean_temp_c?: number | null;
 }
 
 // --- Bean-profile library (#303, models.BeanProfile / BeanProfileInput /
@@ -452,6 +454,8 @@ export interface BeanProfileFields {
   initial_fan_percent: number;
   target_drop_temp_c: number;
   target_development_percent: number;
+  /** Expected first-crack bean temperature (#1135); null = the config default. */
+  first_crack_bean_temp_c?: number | null;
   /** Pre-fills (but does not fix) each roast's charge weight; adjustable per roast. */
   default_bean_weight_grams: number;
 }
