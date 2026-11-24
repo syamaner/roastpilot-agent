@@ -24,8 +24,10 @@
  * page renders the affordance only when the server's `enabled_actions` mirror
  * enables `acknowledge_fault` — render-from-server, no client-side command matrix.
  *
- * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads (the page
- * accumulates the trail). All temperatures Celsius.
+ * Driven by the real `fault` + `safety_alert` SafetyEvaluation payloads and by
+ * verdict-less `safety_alert` notices such as `{"alert": "finish_drop_failed"}`,
+ * which render as ALERT rows (the page accumulates the trail). All temperatures
+ * Celsius.
  */
 
 import type { ReactNode } from "react";
