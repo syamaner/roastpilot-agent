@@ -94,6 +94,7 @@
       "country": null,
       "description": null,
       "farm": null,
+      "first_crack_bean_temp_c": null,
       "initial_fan_percent": 10,
       "initial_heat_percent": 100,
       "is_blend": false,
