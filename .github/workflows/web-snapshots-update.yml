@@ -29,7 +29,7 @@ concurrency:
 jobs:
   update-baselines:
     name: Regenerate + commit Playwright baselines
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # The SAME GHCR-mirrored image as the ci.yml `web-snapshots` gate (#262):
     # MCR rate-limits anonymous pulls. The mirror-playwright.yml workflow keeps
     # this ref in sync — bump the v1.55.1-noble pin together with
