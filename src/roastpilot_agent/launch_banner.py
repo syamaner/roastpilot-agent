@@ -278,9 +278,10 @@ def _finish_line(config: AppConfig) -> str:
         return f"off ({path}; ceiling guard {guard})"
     return (
         f"ON (D239: heat {finish.heat_floor_percent}-{finish.heat_ceiling_percent}% "
-        f"toward the drop target from the FC anchor, drop at target bean; raise cap "
-        f"env {finish.env_raise_cap_c:.1f} °C; anchor aims at "
-        f"{controller.first_crack_target_bean_temp_c:.1f} °C unless the bean sets one)"
+        f"toward the drop target from the FC anchor, drop at target bean; needs a drop "
+        f"target below {controller.post_first_crack_control.ceiling_guard_temp_c:.1f} °C; "
+        f"raise cap env {finish.env_raise_cap_c:.1f} °C; anchor aims at "
+        f"{controller.fc_anchor.first_crack_bean_temp_c:.1f} °C unless the bean sets one)"
         f"{EXPERIMENT_TAG}"
     )
 

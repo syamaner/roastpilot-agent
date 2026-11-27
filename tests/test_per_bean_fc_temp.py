@@ -84,20 +84,31 @@ def test_saved_template_carries_the_field_into_the_roast_profile() -> None:
 def test_target_resolves_to_the_profile_value_else_the_config_default() -> None:
     harness = make_harness(readings=[])
     ctrl = harness.controller
-    assert ctrl._fc_target_bean_temp_c() == 176.0  # pyright: ignore[reportPrivateUsage]
+    assert ctrl._fc_target_bean_temp_c() == 180.0  # pyright: ignore[reportPrivateUsage]
     ctrl.load_profile(PROFILE)
-    assert ctrl._fc_target_bean_temp_c() == 176.0  # pyright: ignore[reportPrivateUsage]
+    assert ctrl._fc_target_bean_temp_c() == 180.0  # pyright: ignore[reportPrivateUsage]
     ctrl.load_profile(PER_BEAN)
     assert ctrl._fc_target_bean_temp_c() == 184.0  # pyright: ignore[reportPrivateUsage]
 
 
 def test_config_default_is_honoured_when_the_profile_is_silent() -> None:
     harness = make_harness(
-        readings=[], config=ControllerConfig(first_crack_target_bean_temp_c=180.0)
+        readings=[],
+        config=ControllerConfig(fc_anchor=FcAnchorConfig(first_crack_bean_temp_c=182.0)),
+    )
+    harness.controller.load_profile(PROFILE)
+    assert harness.controller._fc_target_bean_temp_c() == 182.0  # pyright: ignore[reportPrivateUsage]
+    assert _freeze_temp(harness) == 175.0  # freeze is configured, not derived
+
+
+def test_the_trim_trigger_no_longer_moves_the_anchor() -> None:
+    """#1138: the 176 °C trim trigger and the anchor target are separate."""
+    harness = make_harness(
+        readings=[], config=ControllerConfig(first_crack_target_bean_temp_c=170.0)
     )
     harness.controller.load_profile(PROFILE)
     assert harness.controller._fc_target_bean_temp_c() == 180.0  # pyright: ignore[reportPrivateUsage]
-    assert _freeze_temp(harness) == 171.0
+    assert _freeze_temp(harness) == 175.0
 
 
 @pytest.mark.asyncio
@@ -127,7 +138,7 @@ async def test_per_bean_anchor_is_taken_against_the_per_bean_target() -> None:
 @pytest.mark.parametrize(
     ("fc", "open_min", "expected"),
     [
-        (None, 155.0, 171.0),  # the config default: unchanged
+        (None, 155.0, 175.0),  # the config default: 5 °C before 180
         (184.0, 155.0, 179.0),  # 8 °C later crack: freeze 8 °C later
         (170.0, 155.0, 165.0),  # 6 °C earlier crack: freeze 6 °C earlier
         (160.0, 158.0, 158.0),  # never below the opening temperature
@@ -166,7 +177,7 @@ async def test_start_run_rebuilds_the_anchor_for_the_new_profile() -> None:
     """start_run sets the profile, then the PREHEATING phase reset rebuilds the
     anchor, so a per-bean freeze applies from the first tick."""
     harness = make_harness(readings=[])
-    assert _freeze_temp(harness) == 171.0
+    assert _freeze_temp(harness) == 175.0
     await harness.controller.start_run(PER_BEAN)
     assert _freeze_temp(harness) == 179.0
 
@@ -183,7 +194,7 @@ async def test_load_profile_never_resets_a_live_anchor() -> None:
     assert before.anchor.state is AnchorState.PROVISIONAL
     harness.controller.load_profile(PER_BEAN)
     assert harness.controller._fc_anchor_tracker is before  # pyright: ignore[reportPrivateUsage]
-    assert _freeze_temp(harness) == 171.0
+    assert _freeze_temp(harness) == 175.0
 
 
 @pytest.mark.asyncio
@@ -202,14 +213,16 @@ async def test_advisor_first_crack_eta_uses_the_per_bean_target() -> None:
     dctrl = default.controller
     base = dctrl._advisor_first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
     assert per_bean is not None and base is not None
-    # The same curve, 8 °C further to go at about 0.2 °C/s: about 40 s longer.
-    assert per_bean - base == pytest.approx(8.0 / 0.2, rel=0.05)
-    # The trim's ETA stays on the config target, identical to the default run.
+    # The same curve, 4 °C further (184 against the 180 default) at about
+    # 0.2 °C/s: about 20 s longer.
+    assert per_bean - base == pytest.approx(4.0 / 0.2, rel=0.05)
+    # The trim's ETA stays on the 176 °C config target, identical to the
+    # default run and 4 °C (about 20 s) short of the default anchor target.
     trim_eta = ctrl._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
     assert trim_eta == dctrl._first_crack_eta_seconds()  # pyright: ignore[reportPrivateUsage]
-    assert trim_eta == base
+    assert trim_eta is not None and base - trim_eta == pytest.approx(4.0 / 0.2, rel=0.05)
     signal = ctrl._trim_signal(None)  # pyright: ignore[reportPrivateUsage]
-    assert signal is not None and signal.first_crack_eta_seconds == base
+    assert signal is not None and signal.first_crack_eta_seconds == trim_eta
     # The advisor's context carries the per-bean ETA.
     limits = ctrl._control_limits()  # pyright: ignore[reportPrivateUsage]
     ctx = ctrl._build_advisor_context(_reading(167.8), limits)  # pyright: ignore[reportPrivateUsage]
@@ -228,5 +241,15 @@ def test_new_run_leaving_starting_through_recovery_is_not_aimed_at_the_last_bean
     ctrl._prepare_run_bookkeeping(PROFILE)  # pyright: ignore[reportPrivateUsage]
     ctrl.transition_to(RoastPhase.OPERATOR_RECOVERY_REQUIRED)
     ctrl.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
-    assert ctrl._fc_target_bean_temp_c() == 176.0  # pyright: ignore[reportPrivateUsage]
-    assert _freeze_temp(harness) == 171.0
+    assert ctrl._fc_target_bean_temp_c() == 180.0  # pyright: ignore[reportPrivateUsage]
+    assert _freeze_temp(harness) == 175.0
+
+
+@pytest.mark.parametrize(("freeze", "crack", "ok"), [(175.0, 180.0, True), (180.0, 180.0, False)])
+def test_anchor_freeze_must_precede_its_crack(freeze: float, crack: float, ok: bool) -> None:
+    """D242: overriding one anchor temperature cannot put the freeze at the crack."""
+    if ok:
+        FcAnchorConfig(freeze_bean_temp_c=freeze, first_crack_bean_temp_c=crack)
+    else:
+        with pytest.raises(ValidationError, match="freeze_bean_temp_c must be below"):
+            FcAnchorConfig(freeze_bean_temp_c=freeze, first_crack_bean_temp_c=crack)

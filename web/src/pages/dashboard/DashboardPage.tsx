@@ -51,8 +51,8 @@ import { OperatorActionBar, type OperatorActionResultView } from "./OperatorActi
 import { PostFcRecoveryStatus } from "./PostFcRecoveryStatus";
 import { RecoveryModal } from "./RecoveryModal";
 import { RoastHeader } from "./RoastHeader";
-import { firstCrackFromTimeline } from "./events";
-import { snapshotFault, useDashboardEvents } from "./useDashboardEvents";
+import { firstCrackFromTimeline, safetyNoticesFromTimeline } from "./events";
+import { snapshotFault, useDashboardEvents, type SafetyTrailEntry } from "./useDashboardEvents";
 
 type PersistedFaultAcknowledgement = FaultAcknowledgementExecutedEventData & {
   /** Position in the append-only server timeline, used only to reject stale reload fallback. */
@@ -196,6 +196,18 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
   // The timeline carries that SAME persisted server event (payload + source), so
   // a reload keeps the FC landmark without inferring it from phase/curve data.
   const persistedFirstCrack = firstCrackFromTimeline(timeline.data);
+  // #1131 (Codex P2): one-shot safety notices are recovered from the persisted
+  // timeline on reload or on a second device; a live frame for the same notice
+  // is never shown twice.
+  const safetyTrail = useMemo((): SafetyTrailEntry[] => {
+    const live = new Set(
+      view.safetyTrail.flatMap((entry) => (entry.kind === "notice" ? [entry.alert] : [])),
+    );
+    const persisted = [...new Set(safetyNoticesFromTimeline(timeline.data, runId))]
+      .filter((alert) => !live.has(alert))
+      .map((alert): SafetyTrailEntry => ({ kind: "notice", alert }));
+    return persisted.length === 0 ? view.safetyTrail : [...persisted, ...view.safetyTrail];
+  }, [timeline.data, runId, view.safetyTrail]);
   const firstCrack = view.firstCrack ?? persistedFirstCrack;
 
   // A named SSE stream is scoped to `runId`, but a reconnect/reload can miss its
@@ -478,7 +490,7 @@ export function DashboardPage({ healthStale = false }: DashboardPageProps): Reac
             current SSE stream confirms completion. */}
         <FaultBanner
           fault={effectiveFault}
-          trail={view.safetyTrail}
+          trail={safetyTrail}
           showCommandPosture={view.fault === null ? legacyPostureAllowed : !humanDisclosureAvailable}
           // Render permission still comes solely from the server mirror. The
           // component adds only the operator's cooling-safe confirmation and

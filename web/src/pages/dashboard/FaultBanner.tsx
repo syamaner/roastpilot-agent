@@ -58,7 +58,12 @@ export function FaultBanner({
   acknowledgeAffordance,
   className,
 }: FaultBannerProps): React.JSX.Element | null {
-  if (fault === null) return null;
+  if (fault === null) {
+    // #1131 review: a verdict-less notice (e.g. the finish law will not engage)
+    // arrives with no fault, so it needs its own strip or it is never seen.
+    const notices = trail.flatMap((entry) => (entry.kind === "notice" ? [entry.alert] : []));
+    return notices.length > 0 ? <SafetyNotices alerts={notices} className={className} /> : null;
+  }
   return (
     <section
       data-testid="fault-banner"
@@ -123,6 +128,38 @@ export function FaultBanner({
           </ul>
         </div>
       )}
+    </section>
+  );
+}
+
+/** Safety alerts with no fault behind them, newest last, deduplicated by name. */
+function SafetyNotices({
+  alerts,
+  className,
+}: {
+  alerts: string[];
+  className?: string;
+}): React.JSX.Element {
+  const unique = [...new Set(alerts)];
+  return (
+    <section
+      data-testid="safety-notices"
+      role="status"
+      className={cn(
+        "flex flex-col gap-1 rounded-lg border-2 border-roast-caution bg-roast-caution/10 px-4 py-3",
+        className,
+      )}
+    >
+      <h2 className="text-xs font-semibold uppercase tracking-wide text-roast-caution">
+        Safety alerts
+      </h2>
+      <ul className="flex flex-col gap-0.5 text-sm">
+        {unique.map((alert) => (
+          <li key={alert} data-testid="safety-notice-row">
+            {alert.replace(/_/g, " ")}
+          </li>
+        ))}
+      </ul>
     </section>
   );
 }

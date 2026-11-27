@@ -305,10 +305,10 @@ def test_slope_window_includes_the_sample_exactly_at_its_edge() -> None:
 
 
 def test_anchor_freezes_on_temperature_without_an_eta() -> None:
-    """A cold-room stall at/above 171 °C (no usable ETA) still freezes."""
+    """A cold-room stall at/above the 175 °C default freeze (no usable ETA) still freezes."""
     tracker = FcAnchorTracker()
     tracker.update(charge_elapsed_seconds=420.0, bean_temp_c=157.0, eta_seconds=110.0)
-    stalled = tracker.update(charge_elapsed_seconds=600.0, bean_temp_c=172.0, eta_seconds=None)
+    stalled = tracker.update(charge_elapsed_seconds=600.0, bean_temp_c=176.0, eta_seconds=None)
     assert (stalled.state, stalled.fc_charge_seconds) == (AnchorState.FROZEN, 530.0)
 
 

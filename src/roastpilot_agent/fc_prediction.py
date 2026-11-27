@@ -385,7 +385,7 @@ class AnchorSettings:
     open_min_bean_temp_c: float = 155.0
     open_max_eta_seconds: float = 120.0
     freeze_eta_seconds: float = 45.0
-    freeze_bean_temp_c: float = 171.0
+    freeze_bean_temp_c: float = 175.0
     reanchor_threshold_seconds: float = 30.0
 
 

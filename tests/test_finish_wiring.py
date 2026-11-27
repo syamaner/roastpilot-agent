@@ -689,3 +689,73 @@ async def test_an_estop_during_the_d84_step_ends_the_tick(
     monkeypatch.setattr(harness.controller, "_maybe_run_advisory", advisory)
     await _tick(harness, _reading(185.0, ror=12.0))
     assert called == []
+
+
+# --- a drop target at or above the guard (#1131 review) ------------------------------
+
+AT_GUARD = PROFILE.model_copy(update={"target_drop_temp_c": 196.0})
+
+
+def _guard_alerts(harness: Harness) -> list[object]:
+    return [
+        p
+        for k, p in harness.events.events
+        if k is RoastEventKind.SAFETY_ALERT and p.get("alert") == "finish_disabled_target_at_guard"  # type: ignore[union-attr]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_target_at_the_guard_says_the_law_will_not_engage_once() -> None:
+    """The banner cannot see the bean, so the run says it from charge, once."""
+    harness = _charged()
+    harness.controller.load_profile(AT_GUARD)
+    _anchor(harness)
+    assert not harness.controller._finish_owns_levers()  # pyright: ignore[reportPrivateUsage]
+    await _tick(harness, _reading(180.0))
+    await _tick(harness, _reading(181.0))
+    assert _guard_alerts(harness) == [
+        {
+            "alert": "finish_disabled_target_at_guard",
+            "target_drop_temp_c": 196.0,
+            "ceiling_guard_temp_c": 196.0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("config", "profile", "disabled", "phase"),
+    [
+        (ON, PROFILE, False, RoastPhase.ROASTING_PRE_FIRST_CRACK),  # below the guard
+        (OFF, AT_GUARD, False, RoastPhase.ROASTING_PRE_FIRST_CRACK),  # law off
+        (ON, AT_GUARD, True, RoastPhase.ROASTING_PRE_FIRST_CRACK),  # recovered run
+        (ON, AT_GUARD, False, RoastPhase.PREHEATING),  # not charged yet
+    ],
+)
+async def test_no_guard_alert_when_the_law_was_never_going_to_run(
+    config: ControllerConfig, profile: RoastProfile, disabled: bool, phase: RoastPhase
+) -> None:
+    harness = make_harness(readings=[_reading(150.0)], config=config)
+    harness.controller.load_profile(profile)
+    for step in NORMAL_PATH[: NORMAL_PATH.index(phase) + 1]:
+        harness.controller.transition_to(step)
+    harness.controller._finish_disabled_for_run = disabled  # pyright: ignore[reportPrivateUsage]
+    harness.controller._maybe_alert_finish_target_at_guard()  # pyright: ignore[reportPrivateUsage]
+    assert _guard_alerts(harness) == []
+
+
+@pytest.mark.asyncio
+async def test_no_guard_alert_on_the_human_route() -> None:
+    harness = _charged()
+    harness.controller.load_profile(AT_GUARD)
+    harness.controller._human_run = object()  # type: ignore[assignment]  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    harness.controller._maybe_alert_finish_target_at_guard()  # pyright: ignore[reportPrivateUsage]
+    assert _guard_alerts(harness) == []
+
+
+def test_the_guard_alert_fires_in_development_too() -> None:
+    harness = _charged()
+    harness.controller.load_profile(AT_GUARD)
+    harness.controller.transition_to(RoastPhase.DEVELOPMENT)
+    harness.controller._maybe_alert_finish_target_at_guard()  # pyright: ignore[reportPrivateUsage]
+    assert len(_guard_alerts(harness)) == 1

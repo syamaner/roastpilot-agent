@@ -60,9 +60,9 @@ async def test_pre_fc_ramp_publishes_slope_eta_and_a_provisional_anchor() -> Non
     await _ramp(harness, 150.0, 0.2, 40)  # ends at 157.8 °C, t = 39 s
     snap = harness.controller.snapshot().fc_prediction
     assert snap is not None
-    assert snap.slope_eta_seconds == pytest.approx((176.0 - 157.8) / 0.2, rel=1e-6)
+    assert snap.slope_eta_seconds == pytest.approx((180.0 - 157.8) / 0.2, rel=1e-6)
     assert snap.anchor_state is AnchorState.PROVISIONAL
-    assert snap.anchor_fc_charge_seconds == pytest.approx(39.0 + 91.0, rel=1e-6)
+    assert snap.anchor_fc_charge_seconds == pytest.approx(39.0 + 111.0, rel=1e-6)
     anchored = snap.anchor_fc_charge_seconds
     assert anchored is not None
     assert snap.planned_finish_charge_seconds == pytest.approx(anchored / 0.8)
@@ -97,14 +97,14 @@ async def test_operator_only_shadow_detection_reanchors_when_far_from_the_anchor
 @pytest.mark.asyncio
 async def test_operator_mark_near_the_anchor_freezes_it() -> None:
     harness = _charged()
-    await _ramp(harness, 165.0, 0.2, 40)  # anchor ≈ t 39 + (176-172.8)/0.2 = 55 s
+    await _ramp(harness, 165.0, 0.2, 40)  # anchor ≈ t 39 + (180-172.8)/0.2 = 75 s
     harness.clock.advance(10.0)  # mark at about 50 s: within the 30 s threshold
     await harness.controller.operator_mark_first_crack()
     snap = harness.controller.snapshot().fc_prediction
     assert harness.controller.phase is RoastPhase.DEVELOPMENT
     assert snap is not None
     assert snap.anchor_state is AnchorState.FROZEN
-    assert snap.anchor_fc_charge_seconds == pytest.approx(55.0, abs=1.0)
+    assert snap.anchor_fc_charge_seconds == pytest.approx(75.0, abs=1.0)
 
 
 @pytest.mark.asyncio

@@ -109,6 +109,28 @@ export function firstCrackFromTimeline(
     : { source, bean_temp_c: beanTempC };
 }
 
+/**
+ * Verdict-less `safety_alert` notices persisted for this run (#1131), oldest
+ * first. The server emits each notice once per run and a fresh SSE connection
+ * replays nothing, so a reload or a second device recovers them from the
+ * persisted timeline, the same fallback the first-crack marker uses (#592).
+ * A timeline for another run yields nothing.
+ */
+export function safetyNoticesFromTimeline(
+  timeline: RoastTimeline | undefined,
+  runId: string | null,
+): string[] {
+  if (timeline === undefined || runId === null || timeline.run_id !== runId) return [];
+  const notices: string[] = [];
+  for (const event of timeline.events) {
+    const payload = event.payload;
+    if (event.kind !== "safety_alert" || payload === null) continue;
+    if (typeof payload.verdict === "string") continue; // a SafetyEvaluation, not a notice
+    if (typeof payload.alert === "string") notices.push(payload.alert);
+  }
+  return notices;
+}
+
 /** The `turning_point` payload (#409) — the post-charge bean-temp minimum. Carries
  *  the bean temp at the RoR-zero cross + the charge-referenced elapsed clock at that
  *  tick; the clock IS the authoritative marker x (unlike `drying_end`, which has no
