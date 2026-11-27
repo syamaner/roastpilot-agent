@@ -204,9 +204,10 @@ vi.mock("@/hooks/useRoastStream", () => ({
 // `fault` is mutable so the #124 sticky-faulted-pin behavior can be exercised.
 // `snapshotFault` is the REAL helper (the page uses it for the #329 restore/reload
 // banner) — only `useDashboardEvents` is stubbed; the pure synthesizer is genuine.
-const viewState: { fault: unknown; points: CurvePoint[] } = {
+const viewState: { fault: unknown; points: CurvePoint[]; safetyTrail: unknown[] } = {
   fault: null,
   points: [],
+  safetyTrail: [],
 };
 vi.mock("./useDashboardEvents", async () => {
   const actual =
@@ -222,7 +223,7 @@ vi.mock("./useDashboardEvents", async () => {
       latestAdvisory: null,
       advisoryHistory: [],
       advisoryPaused: false,
-      safetyTrail: [],
+      safetyTrail: viewState.safetyTrail,
     }),
   };
 });
@@ -249,6 +250,7 @@ beforeEach(() => {
   roastState.isSuccess = false;
   viewState.fault = null;
   viewState.points = [];
+  viewState.safetyTrail = [];
   streamState.enabledActions = null;
   streamState.humanProtection = null;
   streamState.humanHistoryDurability = null;
@@ -686,6 +688,37 @@ describe("DashboardPage faulted-run sticky banner (#124)", () => {
 });
 
 describe("DashboardPage restored/reloaded fault (#329)", () => {
+  it("restores a one-shot safety notice from the persisted timeline on reload (#1131)", () => {
+    healthState.isSuccess = true;
+    healthState.data = { active_run_id: "run-live", mcp_child: "running" };
+    viewState.safetyTrail = [{ kind: "notice", alert: "low_development" }];
+    timelineState.data = {
+      run_id: "run-live",
+      events: [
+        {
+          kind: "safety_alert",
+          source: "controller",
+          monotonic_seconds: 5,
+          recorded_at_utc: "2026-11-28T09:00:00Z",
+          payload: { alert: "finish_disabled_target_at_guard", target_drop_temp_c: 196 },
+        },
+        {
+          kind: "safety_alert",
+          source: "controller",
+          monotonic_seconds: 6,
+          recorded_at_utc: "2026-11-28T09:00:01Z",
+          payload: { alert: "low_development" },
+        },
+      ],
+      safety_evaluations: [],
+      advisor_decisions: [],
+      commands: [],
+    };
+    renderPage();
+    const rows = screen.getAllByTestId("safety-notice-row").map((row) => row.textContent);
+    expect(rows).toEqual(["finish disabled target at guard", "low development"]);
+  });
+
   it("restores a persisted acknowledgement outcome for the exact faulted run", async () => {
     healthState.isSuccess = true;
     healthState.data = { active_run_id: "run-fault", mcp_child: "stopped" };
