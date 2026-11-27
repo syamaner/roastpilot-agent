@@ -960,20 +960,25 @@ def test_finish_line_is_off_by_default_and_untagged() -> None:
 def test_finish_line_on_names_its_limits_and_the_anchor_target() -> None:
     """#1131: switched on, the banner shows the heat box, the raise cap and the
     first-crack temperature the anchor aims at, tagged as an experiment."""
-    from roastpilot_agent.config import AppConfig, ControllerConfig, FinishControlConfig
+    from roastpilot_agent.config import (
+        AppConfig,
+        ControllerConfig,
+        FcAnchorConfig,
+        FinishControlConfig,
+    )
 
     config = AppConfig(
         controller=ControllerConfig(
             finish_control=FinishControlConfig(
                 enabled=True, heat_floor_percent=30, heat_ceiling_percent=95, env_raise_cap_c=225.0
             ),
-            first_crack_target_bean_temp_c=178.5,
+            fc_anchor=FcAnchorConfig(first_crack_bean_temp_c=178.5),
         )
     )
     assert resolve_banner_lines(config).finish == (
         "ON (D239: heat 30-95% toward the drop target from the FC anchor, drop at target "
-        "bean; raise cap env 225.0 °C; anchor aims at 178.5 °C unless the bean sets one)"
-        + EXPERIMENT_TAG
+        "bean; needs a drop target below 196.0 °C; raise cap env 225.0 °C; anchor aims at "
+        "178.5 °C unless the bean sets one)" + EXPERIMENT_TAG
     )
 
 

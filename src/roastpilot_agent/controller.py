@@ -3643,6 +3643,7 @@ class RoastController:
         # charged (PREHEATING → ROASTING_PRE_FIRST_CRACK) actuates the pre-FC
         # lever, and a tick that just hit FC does NOT (it falls to the advisor).
         # The advisory step below is a no-op in these phases (gated out).
+        self._maybe_alert_finish_target_at_guard()
         if self._finish_owns_levers():
             # D239 slice 3c (#1131): the predictive finish law owns heat from the
             # anchor through development; the pre-FC lever and the post-FC PI
@@ -8622,12 +8623,13 @@ class RoastController:
         """The run's expected first-crack bean temperature (#1135).
 
         The active profile's ``first_crack_bean_temp_c`` when it sets one,
-        otherwise :attr:`ControllerConfig.first_crack_target_bean_temp_c`.
+        otherwise :attr:`FcAnchorConfig.first_crack_bean_temp_c` (#1138: the
+        agent's own crack, not the trim trigger's 176 °C).
         """
         profile = self._profile
         if profile is not None and profile.first_crack_bean_temp_c is not None:
             return profile.first_crack_bean_temp_c
-        return self._config.first_crack_target_bean_temp_c
+        return self._config.fc_anchor.first_crack_bean_temp_c
 
     def _new_fc_anchor_tracker(self) -> FcAnchorTracker:
         """A tracker with this config's D239 anchor window (#1118).
@@ -8639,7 +8641,7 @@ class RoastController:
         """
         cfg = self._config.fc_anchor
         target = self._fc_target_bean_temp_c()
-        offset = target - self._config.first_crack_target_bean_temp_c
+        offset = target - cfg.first_crack_bean_temp_c
         freeze_bean_temp_c = min(
             target, max(cfg.open_min_bean_temp_c, cfg.freeze_bean_temp_c + offset)
         )
@@ -8669,6 +8671,30 @@ class RoastController:
         profile = self._profile
         guard = self._config.post_first_crack_control.ceiling_guard_temp_c
         return profile is not None and profile.target_drop_temp_c < guard
+
+    def _maybe_alert_finish_target_at_guard(self) -> None:
+        """Say, once per run, that the finish law will not engage (#1131).
+
+        With the law enabled, a profile whose drop target sits at or above the
+        ceiling guard leaves heat with the existing levers. The launch banner
+        cannot see the bean chosen later, so the run says so from charge
+        instead of staying silent. Observability only: nothing is actuated.
+        """
+        profile = self._profile
+        if (
+            not self._config.finish_control.enabled
+            or self._finish_disabled_for_run
+            or self._human_run is not None
+            or profile is None
+            or self._phase not in (RoastPhase.ROASTING_PRE_FIRST_CRACK, RoastPhase.DEVELOPMENT)
+            or self._finish_target_below_guard()
+        ):
+            return
+        self._finish_alert(
+            "finish_disabled_target_at_guard",
+            target_drop_temp_c=profile.target_drop_temp_c,
+            ceiling_guard_temp_c=self._config.post_first_crack_control.ceiling_guard_temp_c,
+        )
 
     def _finish_owns_levers(self) -> bool:
         """Whether the D239 predictive finish law owns heat and fan this tick.

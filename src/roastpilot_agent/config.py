@@ -1480,8 +1480,16 @@ class FcAnchorConfig(BaseModel):
     open_max_eta_seconds: float = Field(default=120.0, gt=0.0)
     #: The anchor freezes once the ETA is this short...
     freeze_eta_seconds: float = Field(default=45.0, gt=0.0)
-    #: ...or once the bean reaches this temperature.
-    freeze_bean_temp_c: float = Field(default=171.0, gt=0.0)
+    #: ...or once the bean reaches this temperature. Stated against
+    #: ``first_crack_bean_temp_c`` below (5 °C before it, as 171 was before
+    #: 176); a per-bean crack moves it by the same offset.
+    freeze_bean_temp_c: float = Field(default=175.0, gt=0.0)
+    #: The first-crack temperature the anchor aims at when the bean sets none
+    #: (#1138, owner 27 Nov). The agent's own summer runs cracked at a median
+    #: 182 °C on its probe, so 176 °C anchored about a minute early; 180 °C
+    #: hedges toward the flat-heat schedule the finish law runs pre-FC. The
+    #: pre-FC trim trigger keeps ``first_crack_target_bean_temp_c``.
+    first_crack_bean_temp_c: float = Field(default=180.0, ge=160.0, le=195.0)
     #: An observed first crack further than this from the anchor moves it once.
     reanchor_threshold_seconds: float = Field(default=30.0, gt=0.0)
     #: The shadow model uses the room reading only while it is at most this old.
