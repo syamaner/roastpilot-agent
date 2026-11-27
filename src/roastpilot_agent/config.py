@@ -1495,6 +1495,24 @@ class FcAnchorConfig(BaseModel):
     #: The shadow model uses the room reading only while it is at most this old.
     model_ambient_max_age_seconds: float = Field(default=90.0, gt=0.0, le=600.0)
 
+    @model_validator(mode="after")
+    def _check_freeze_before_crack(self) -> "FcAnchorConfig":
+        """The freeze point must come before the crack it anticipates (D242).
+
+        Returns:
+            The validated config.
+
+        Raises:
+            ValueError: If ``freeze_bean_temp_c`` is not below
+                ``first_crack_bean_temp_c``.
+        """
+        if self.freeze_bean_temp_c >= self.first_crack_bean_temp_c:
+            raise ValueError(
+                "fc_anchor.freeze_bean_temp_c must be below fc_anchor.first_crack_bean_temp_c "
+                f"({self.freeze_bean_temp_c} >= {self.first_crack_bean_temp_c})"
+            )
+        return self
+
 
 class FinishControlConfig(BaseModel):
     """The D239 predictive finish-tracking law (slice 3, #1131).

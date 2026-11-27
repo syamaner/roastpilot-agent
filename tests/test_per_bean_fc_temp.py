@@ -243,3 +243,13 @@ def test_new_run_leaving_starting_through_recovery_is_not_aimed_at_the_last_bean
     ctrl.transition_to(RoastPhase.ROASTING_PRE_FIRST_CRACK)
     assert ctrl._fc_target_bean_temp_c() == 180.0  # pyright: ignore[reportPrivateUsage]
     assert _freeze_temp(harness) == 175.0
+
+
+@pytest.mark.parametrize(("freeze", "crack", "ok"), [(175.0, 180.0, True), (180.0, 180.0, False)])
+def test_anchor_freeze_must_precede_its_crack(freeze: float, crack: float, ok: bool) -> None:
+    """D242: overriding one anchor temperature cannot put the freeze at the crack."""
+    if ok:
+        FcAnchorConfig(freeze_bean_temp_c=freeze, first_crack_bean_temp_c=crack)
+    else:
+        with pytest.raises(ValidationError, match="freeze_bean_temp_c must be below"):
+            FcAnchorConfig(freeze_bean_temp_c=freeze, first_crack_bean_temp_c=crack)

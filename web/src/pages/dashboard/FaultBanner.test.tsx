@@ -29,6 +29,29 @@ describe("FaultBanner", () => {
   it("renders nothing when there is no fault", () => {
     render(<FaultBanner fault={null} trail={[]} />);
     expect(screen.queryByTestId("fault-banner")).toBeNull();
+    expect(screen.queryByTestId("safety-notices")).toBeNull();
+  });
+
+  it("shows verdict-less alerts without a fault, once each (#1131)", () => {
+    render(
+      <FaultBanner
+        fault={null}
+        trail={[
+          { kind: "notice", alert: "finish_disabled_target_at_guard" },
+          TRAIL[0]!,
+          { kind: "notice", alert: "finish_disabled_target_at_guard" },
+          { kind: "notice", alert: "low_development" },
+        ]}
+      />,
+    );
+    expect(screen.queryByTestId("fault-banner")).toBeNull();
+    const rows = screen.getAllByTestId("safety-notice-row").map((r) => r.textContent);
+    expect(rows).toEqual(["finish disabled target at guard", "low development"]);
+  });
+
+  it("keeps evaluation-only trails off screen while there is no fault", () => {
+    render(<FaultBanner fault={null} trail={TRAIL} />);
+    expect(screen.queryByTestId("safety-notices")).toBeNull();
   });
 
   it("states what the safety layer did (the fault reason)", () => {
